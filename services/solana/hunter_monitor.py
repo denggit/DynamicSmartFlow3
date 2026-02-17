@@ -11,7 +11,6 @@
 
 import asyncio
 import json
-import logging
 import os
 import shutil
 import time
@@ -24,10 +23,9 @@ import websockets
 from config.settings import HELIUS_API_KEY
 from services.dexscreener.dex_scanner import DexScanner
 from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
+from utils.logger import get_logger
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("HunterMonitor")
+logger = get_logger(__name__)
 
 # 常量配置
 HUNTER_DATA_FILE = "data/hunters.json"
@@ -60,8 +58,8 @@ class HunterStorage:
                 with open(HUNTER_DATA_FILE, 'r', encoding='utf-8') as f:
                     self.hunters = json.load(f)
                 logger.info(f"📂 已加载 {len(self.hunters)} 名猎手数据")
-            except Exception as e:
-                logger.error(f"❌ 加载猎手数据失败: {e}")
+            except Exception:
+                logger.exception("❌ 加载猎手数据失败")
                 if os.path.exists(HUNTER_DATA_BACKUP):
                     shutil.copy(HUNTER_DATA_BACKUP, HUNTER_DATA_FILE)
                     self.load_hunters()
@@ -72,8 +70,8 @@ class HunterStorage:
                 shutil.copy(HUNTER_DATA_FILE, HUNTER_DATA_BACKUP)
             with open(HUNTER_DATA_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.hunters, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"❌ 保存猎手数据失败: {e}")
+        except Exception:
+            logger.exception("❌ 保存猎手数据失败")
 
     def update_last_active(self, address: str, timestamp: float):
         """实时更新猎手最后交易时间"""
@@ -162,8 +160,8 @@ class HunterMonitorController:
                 new_hunters = await self.sm_searcher.run_pipeline(self.dex_scanner)
                 if new_hunters:
                     self.storage.prune_and_update(new_hunters)
-            except Exception as e:
-                logger.error(f"❌ 挖掘异常: {e}")
+            except Exception:
+                logger.exception("❌ 挖掘异常")
             await asyncio.sleep(DISCOVERY_INTERVAL)
 
     # --- 线程 2: 监控 ---
@@ -196,8 +194,8 @@ class HunterMonitorController:
                             if set(self.storage.get_monitored_addresses()) != set(monitored_addrs):
                                 break
 
-            except Exception as e:
-                logger.warning(f"⚠️ WS 重连: {e}")
+            except Exception:
+                logger.exception("⚠️ WS 重连异常")
                 await asyncio.sleep(5)
 
     async def process_transaction_log(self, log_info):
@@ -223,7 +221,7 @@ class HunterMonitorController:
                     self.storage.update_last_active(hunter, time.time())
                     await self.analyze_action(hunter, tx)
         except Exception:
-            pass
+            logger.exception("process_transaction_log 异常")
 
     async def analyze_action(self, hunter, tx):
         parser = TransactionParser(hunter)
@@ -321,8 +319,8 @@ class HunterMonitorController:
                 self.storage.prune_and_update([])
                 logger.info("✅ 维护完成")
 
-            except Exception as e:
-                logger.error(f"❌ 维护失败: {e}")
+            except Exception:
+                logger.exception("❌ 维护失败")
 
             # 每天睡一次
             logger.info(f"💤 维护线程休眠 1 天...")
@@ -331,11 +329,12 @@ class HunterMonitorController:
 
 if __name__ == "__main__":
     async def mock_cb(sig):
-        print(f"🔥 信号: {sig['token_address']}")
+        logger.info("🔥 信号: %s", sig['token_address'])
 
 
     try:
-        if os.name == 'nt': asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        if os.name == 'nt':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(HunterMonitorController(mock_cb).start())
     except KeyboardInterrupt:
-        pass
+        logger.info("Monitor 被用户中断")

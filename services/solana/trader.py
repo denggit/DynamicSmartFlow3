@@ -10,7 +10,6 @@
 
 import asyncio
 import base64
-import logging
 from typing import Dict, List, Set, Optional, Tuple
 
 import httpx
@@ -28,8 +27,9 @@ from config.settings import (
     SOLANA_PRIVATE_KEY_BASE58, HELIUS_RPC_URL,
     JUPITER_QUOTE_API, JUPITER_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS
 )
+from utils.logger import get_logger
 
-logger = logging.getLogger("Trader")
+logger = get_logger(__name__)
 
 # 常量
 WSOL_MINT = "So11111111111111111111111111111111111111112"
@@ -66,8 +66,8 @@ class SolanaTrader:
             try:
                 self.keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY_BASE58)
                 logger.info(f"🤖 钱包已加载: {self.keypair.pubkey()}")
-            except Exception as e:
-                logger.error(f"❌ 私钥格式错误: {e}")
+            except Exception:
+                logger.exception("❌ 私钥格式错误")
                 self.keypair = None
 
         # 初始化 RPC 客户端
@@ -315,8 +315,8 @@ class SolanaTrader:
                 else:
                     return str(sig), out_amount_raw / LAMPORTS_PER_SOL
 
-            except Exception as e:
-                logger.error(f"Swap Exception: {e}")
+            except Exception:
+                logger.exception("Swap Exception")
                 return None, 0
 
     async def _get_decimals(self, mint_address: str) -> int:
@@ -327,7 +327,8 @@ class SolanaTrader:
             pubkey = Pubkey.from_string(mint_address)
             resp = await self.rpc_client.get_token_supply(pubkey)
             return resp.value.decimals
-        except:
+        except Exception:
+            logger.exception("获取 decimals 失败，使用默认 6")
             return 6  # 默认兜底
 
     # 辅助: 份额分配 (逻辑同前)

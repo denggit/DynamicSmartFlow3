@@ -14,7 +14,6 @@
 
 import asyncio
 import json
-import logging
 import time
 from collections import defaultdict
 from typing import Dict, List, Callable, Optional
@@ -24,10 +23,9 @@ import websockets
 
 from config.settings import HELIUS_API_KEY
 from services.helius.sm_searcher import TransactionParser
+from utils.logger import get_logger
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("HunterAgent")
+logger = get_logger(__name__)
 
 HELIUS_WSS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
@@ -182,8 +180,8 @@ class HunterAgentController:
                                 logger.info("🔄 监控列表变动，重启 WebSocket...")
                                 break
 
-            except Exception as e:
-                logger.error(f"❌ Agent 监控异常: {e}，5秒后重试")
+            except Exception:
+                logger.exception("❌ Agent 监控异常，5秒后重试")
                 await asyncio.sleep(5)
 
     async def process_log(self, log_info):
@@ -239,9 +237,8 @@ class HunterAgentController:
                         if token_addr in potential_tokens:
                             await self.analyze_action(hunter, token_addr, delta, tx, block_time)
 
-        except Exception as e:
-            # logger.error(f"日志处理失败: {e}")
-            pass
+        except Exception:
+            logger.exception("日志处理失败")
 
     def _calculate_balance_changes(self, tx_data, hunter_address):
         """从 RPC 格式的交易中计算 Token 余额变化"""
@@ -372,6 +369,6 @@ class HunterAgentController:
                         # 所以这里也取 amount
                     return total
                 return 0.0
-        except Exception as e:
-            logger.error(f"获取余额失败: {e}")
+        except Exception:
+            logger.exception("获取余额失败")
             return 0.0

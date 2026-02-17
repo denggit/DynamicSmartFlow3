@@ -4,12 +4,15 @@
 @Author     : Zijun Deng
 @Date       : 2/16/2026 10:06 PM
 @File       : dex_scanner.py
-@Description: 
+@Description: DexScreener 代币扫描与价格查询。
 """
 import asyncio
-from datetime import datetime
 
 import httpx
+
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class DexScanner:
@@ -27,8 +30,8 @@ class DexScanner:
                 response = await client.get(url, timeout=10.0)
                 if response.status_code == 200:
                     return response.json()
-            except Exception as e:
-                print(f"Error fetching profiles: {e}")
+            except Exception:
+                logger.exception("Error fetching profiles")
         return []
 
     async def get_token_pairs(self, token_address):
@@ -39,8 +42,8 @@ class DexScanner:
                 response = await client.get(url, timeout=5.0)
                 if response.status_code == 200:
                     return response.json().get('pairs', [])
-            except:
-                pass
+            except Exception:
+                logger.exception("get_token_pairs 请求异常")
         return []
 
     async def get_token_price(self, token_address: str) -> float:
@@ -59,12 +62,12 @@ class DexScanner:
                         best_pair = max(pairs, key=lambda x: float(x.get('liquidity', {}).get('usd', 0) or 0))
                         # priceNative: 1 Token = ? SOL
                         return float(best_pair.get('priceNative', 0))
-            except Exception as e:
-                print(f"Error fetching price for {token_address}: {e}")
+            except Exception:
+                logger.exception("Error fetching price for %s", token_address)
         return 0.0
 
     async def scan(self):
-        print(f"[{datetime.now()}] 正在扫描 Solana 潜力币...")
+        logger.info("正在扫描 Solana 潜力币...")
         raw_tokens = await self.fetch_latest_tokens()
 
         qualified_tokens = []
@@ -87,7 +90,11 @@ class DexScanner:
 
             # 过滤逻辑
             if liq >= self.min_liquidity and vol_1h >= self.min_vol_1h:
-                print(f"找到符合标准代币: {main_pair.get('baseToken', {}).get('symbol')} | 地址: {addr}")
+                logger.info(
+                    "找到符合标准代币: %s | 地址: %s",
+                    main_pair.get('baseToken', {}).get('symbol'),
+                    addr,
+                )
                 qualified_tokens.append({
                     "address": addr,
                     "symbol": main_pair.get('baseToken', {}).get('symbol'),
@@ -103,12 +110,11 @@ async def main():
     while True:
         results = await scanner.scan()
         if results:
-            print(f"\n--- 本轮结果 ({len(results)} 个) ---")
+            logger.info("本轮结果 (%s 个)", len(results))
             for r in results:
-                # 这里的输出就可以直接给你的下一个“聪明钱分析”模块了
-                print(r['address'])
+                logger.info("代币地址: %s", r['address'])
 
-        print("\n等待 5 分钟后进行下一轮扫描...")
+        logger.info("等待 5 分钟后进行下一轮扫描...")
         await asyncio.sleep(300)  # 5分钟轮询一次，完全不会触发限流
 
 

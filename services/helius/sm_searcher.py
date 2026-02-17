@@ -22,12 +22,11 @@ from typing import Dict, Tuple, Set
 import httpx
 
 from config.settings import HELIUS_API_KEY
+from utils.logger import get_logger
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = get_logger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-logger = logging.getLogger(__name__)
 
 SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
 
@@ -127,8 +126,8 @@ class SmartMoneySearcher:
                 with open(SCANNED_HISTORY_FILE, 'r') as f:
                     self.scanned_tokens = set(json.load(f))
                 logger.info(f"📂 已加载 {len(self.scanned_tokens)} 个历史扫描代币记录")
-            except Exception as e:
-                logger.warning(f"⚠️ 加载扫描历史失败: {e}")
+            except Exception:
+                logger.exception("⚠️ 加载扫描历史失败")
 
     def _save_scanned_token(self, token_address: str):
         if token_address in self.scanned_tokens: return
@@ -137,7 +136,7 @@ class SmartMoneySearcher:
             with open(SCANNED_HISTORY_FILE, 'w') as f:
                 json.dump(list(self.scanned_tokens), f)
         except Exception:
-            pass
+            logger.exception("保存扫描历史失败")
 
     async def _rpc_post(self, client, method, params):
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -170,9 +169,9 @@ class SmartMoneySearcher:
                     logger.warning(f"RPC 请求失败: {resp.status_code}")
 
             except (httpx.TimeoutException, httpx.NetworkError) as e:
-                logger.warning(f"⚠️ RPC 网络波动 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
-            except Exception as e:
-                logger.error(f"❌ RPC 未知错误: {e}")
+                logger.warning("⚠️ RPC 网络波动 (尝试 %s/%s): %s", attempt + 1, max_retries, e)
+            except Exception:
+                logger.exception("❌ RPC 未知错误")
                 return None
 
             # 指数退避：每次失败多睡一会儿 (1s -> 2s -> 4s)
@@ -202,7 +201,7 @@ class SmartMoneySearcher:
                 if resp.status_code == 200:
                     all_txs.extend(resp.json())
             except Exception:
-                pass
+                logger.exception("fetch_parsed_transactions 批量请求异常")
         return all_txs
 
     async def analyze_hunter_performance(self, client, hunter_address, exclude_token=None):
@@ -227,7 +226,8 @@ class SmartMoneySearcher:
                     projects[mint]["tokens"] += delta
                     if mint in buy_attrs: projects[mint]["buy_sol"] += buy_attrs[mint]
                     if mint in sell_attrs: projects[mint]["sell_sol"] += sell_attrs[mint]
-            except:
+            except Exception:
+                logger.debug("解析单笔交易跳过", exc_info=True)
                 continue
 
         valid_projects = []
@@ -271,7 +271,8 @@ class SmartMoneySearcher:
                 return True, created_at_sec, "OK"
             else:
                 return False, 0, "API Error"
-        except:
+        except Exception:
+            logger.exception("verify_token_age_via_dexscreener 请求异常")
             return False, 0, "Exception"
 
     async def search_alpha_hunters(self, token_address):
@@ -395,8 +396,8 @@ class SmartMoneySearcher:
                 try:
                     hunters = await self.search_alpha_hunters(addr)
                     if hunters: all_hunters.extend(hunters)
-                except Exception as e:
-                    logger.error(f"❌ 挖掘代币 {sym} 出错: {e}")
+                except Exception:
+                    logger.exception("❌ 挖掘代币 %s 出错", sym)
                 await asyncio.sleep(1)
         all_hunters.sort(key=lambda x: x.get('score', 0), reverse=True)
         return all_hunters
@@ -410,8 +411,9 @@ if __name__ == "__main__":
         searcher = SmartMoneySearcher()
         mock_scanner = DexScanner()
         results = await searcher.run_pipeline(mock_scanner)
-        print(f"\n====== 最终挖掘结果 ({len(results)}) ======")
-        for res in results: print(res)
+        logger.info("====== 最终挖掘结果 (%s) ======", len(results))
+        for res in results:
+            logger.info("%s", res)
 
 
     asyncio.run(main())

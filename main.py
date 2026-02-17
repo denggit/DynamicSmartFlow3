@@ -7,16 +7,15 @@
 @Description: 
 """
 import asyncio
-import logging
 
 from config.settings import PNL_CHECK_INTERVAL, HUNTER_ADD_THRESHOLD_SOL
 from services.dexscreener.dex_scanner import DexScanner
 from services.solana.hunter_agent import HunterAgentController
 from services.solana.hunter_monitor import HunterMonitorController
 from services.solana.trader import SolanaTrader
+from utils.logger import get_logger
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(message)s')
-logger = logging.getLogger("Main")
+logger = get_logger("Main")
 
 trader = SolanaTrader()
 agent = HunterAgentController()
@@ -114,8 +113,8 @@ async def pnl_monitor_loop():
                         await trader.check_pnl_and_stop_profit(token, price)
                     await asyncio.sleep(0.5)  # 防限流
 
-        except Exception as e:
-            logger.error(f"PnL Loop Error: {e}")
+        except Exception:
+            logger.exception("PnL Loop Error")
 
         await asyncio.sleep(PNL_CHECK_INTERVAL)
 
@@ -142,4 +141,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        logger.info("主程序被用户中断")
