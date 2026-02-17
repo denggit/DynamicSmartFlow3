@@ -30,23 +30,20 @@ def check_python():
 
 
 def check_packages():
-    """必需依赖是否已安装"""
+    """必需依赖是否已安装（包名 vs 导入名：python-dotenv -> dotenv）"""
     required = [
-        "solana",
-        "solders",
-        "httpx",
-        "websockets",
-        "python-dotenv",
-        "dotenv",
+        ("solana", "solana"),
+        ("solders", "solders"),
+        ("httpx", "httpx"),
+        ("websockets", "websockets"),
+        ("python-dotenv", "dotenv"),
     ]
     missing = []
-    for name in required:
-        # dotenv 包名是 python-dotenv，import 用 dotenv
-        import_name = "dotenv" if name == "dotenv" else name
+    for display_name, import_name in required:
         try:
             __import__(import_name)
         except ImportError:
-            missing.append(name if name != "dotenv" else "python-dotenv")
+            missing.append(display_name)
     if not missing:
         print(f"  {OK} 依赖包: solana, solders, httpx, websockets, python-dotenv")
         return True
@@ -129,34 +126,73 @@ def check_wallet():
 
 
 def check_network():
-    """关键 API 是否可达（Helius RPC、DexScreener、Jupiter）"""
+    """关键 API 是否可达（Helius RPC 用 POST JSON-RPC；DexScreener GET；Jupiter Quote 需带 x-api-key）"""
     import urllib.request
     import urllib.error
+    import json
 
     helius_keys = [k.strip() for k in os.getenv("HELIUS_API_KEY", "").strip().split(",") if k.strip()]
-    first_key = helius_keys[0] if helius_keys else ""
-    urls = [
-        ("Helius RPC", f"https://mainnet.helius-rpc.com/?api-key={first_key}" if first_key else None),
-        ("DexScreener", "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112"),
-        ("Jupiter Quote", "https://api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=So11111111111111111111111111111111111111112&amount=1000000&slippageBps=50"),
-    ]
+    first_helius = helius_keys[0] if helius_keys else ""
+    jup_keys = [k.strip() for k in os.getenv("JUP_API_KEY", "").strip().split(",") if k.strip()]
+    first_jup = jup_keys[0] if jup_keys else ""
+
     all_ok = True
-    for name, url in urls:
-        if not url:
-            continue
+
+    # 1. Helius RPC：必须 POST JSON-RPC，GET 会 404
+    if first_helius:
+        helius_url = f"https://mainnet.helius-rpc.com/?api-key={first_helius}"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "DSF3-HealthCheck/1.0"})
-            with urllib.request.urlopen(req, timeout=8) as _:
-                print(f"  {OK} {name} 可达")
+            data = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getHealth"}).encode("utf-8")
+            req = urllib.request.Request(
+                helius_url, data=data, method="POST",
+                headers={"Content-Type": "application/json", "User-Agent": "DSF3-HealthCheck/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                body = resp.read().decode()
+                if "result" in body or "ok" in body.lower():
+                    print(f"  {OK} Helius RPC 可达")
+                else:
+                    print(f"  {OK} Helius RPC 可达 (响应: {body[:80]}...)")
         except urllib.error.HTTPError as e:
-            if e.code == 400:
-                print(f"  {OK} {name} 可达 (API 返回 400 为参数问题，说明服务正常)")
-            else:
-                print(f"  {FAIL} {name} HTTP {e.code}")
-                all_ok = False
-        except Exception as e:
-            print(f"  {FAIL} {name} 不可达: {e}")
+            print(f"  {FAIL} Helius RPC HTTP {e.code}")
             all_ok = False
+        except Exception as e:
+            print(f"  {FAIL} Helius RPC 不可达: {e}")
+            all_ok = False
+    else:
+        print(f"  {WARN} 未配置 HELIUS_API_KEY，跳过 Helius RPC 检查")
+
+    # 2. DexScreener
+    try:
+        req = urllib.request.Request(
+            "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112",
+            headers={"User-Agent": "DSF3-HealthCheck/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as _:
+            print(f"  {OK} DexScreener 可达")
+    except Exception as e:
+        print(f"  {FAIL} DexScreener 不可达: {e}")
+        all_ok = False
+
+    # 3. Jupiter Quote：v1 需 x-api-key，未配置 key 时可能 401
+    jup_url = "https://api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=So11111111111111111111111111111111111111112&amount=1000000&slippageBps=50"
+    try:
+        headers = {"User-Agent": "DSF3-HealthCheck/1.0"}
+        if first_jup:
+            headers["x-api-key"] = first_jup
+        req = urllib.request.Request(jup_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as _:
+            print(f"  {OK} Jupiter Quote 可达")
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and not first_jup:
+            print(f"  {WARN} Jupiter Quote 返回 401，请配置 JUP_API_KEY 后重试")
+        else:
+            print(f"  {FAIL} Jupiter Quote HTTP {e.code}")
+            all_ok = False
+    except Exception as e:
+        print(f"  {FAIL} Jupiter Quote 不可达: {e}")
+        all_ok = False
+
     return all_ok
 
 
