@@ -9,48 +9,125 @@
 import asyncio
 import logging
 from services.solana.hunter_monitor import HunterMonitorController
+from services.solana.hunter_agent import HunterAgentController
+from services.solana.trader import SolanaTrader
+from services.dexscreener.dex_scanner import DexScanner
+from config.settings import PNL_CHECK_INTERVAL, HUNTER_ADD_THRESHOLD_SOL
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(message)s')
 logger = logging.getLogger("Main")
 
+trader = SolanaTrader()
+agent = HunterAgentController()
+price_scanner = DexScanner()  # 用于查价格
 
-# === 1. 定义你的信号接收处理函数 ===
-async def on_resonance_signal(signal_data):
+
+# =========================================
+# 事件回调处理
+# =========================================
+
+async def on_monitor_signal(signal):
     """
-    当 HunterMonitor 发现共振时，会自动调用这个方法
+    [Monitor -> Trader] 发现开仓信号
     """
-    token_address = signal_data['token_address']
-    total_score = signal_data['total_score']
-    hunters = signal_data['hunters']
+    token = signal['token_address']
+    hunters = signal['hunters']
+    total_score = signal['total_score']
 
-    print("\n" + "=" * 50)
-    print(f"🚨 [主程序] 收到买入信号！")
-    print(f"💎 标的代币: {token_address}")
-    print(f"kB 共振强度: {total_score} 分")
-    print(f"👥 跟随猎手: {[h['address'][:6] for h in hunters]}")
-    print("=" * 50 + "\n")
+    # 1. 查当前价格 (Trader 需要价格算买入量)
+    price = await price_scanner.get_token_price(token)
+    if not price:
+        logger.error(f"无法获取 {token} 价格，取消开仓")
+        return
 
-    # TODO: 在这里调用你的交易模块 (Trader)
-    # 例如:
-    # await trader.buy(token_address, amount_sol=0.5)
-    # logger.info(f"✅ 已自动执行买入: {token_address}")
+    # 2. Trader 开仓
+    await trader.execute_entry(token, hunters, total_score, price)
+
+    # 3. Agent 启动监控
+    hunter_addrs = [h['address'] for h in hunters]
+    await agent.start_tracking(token, hunter_addrs)
 
 
-# === 2. 启动程序 ===
+async def on_agent_signal(signal):
+    """
+    [Agent -> Trader] 发现猎手异动
+    """
+    msg_type = signal['type']
+    token = signal['token']
+    hunter_addr = signal['hunter']
+
+    # 查一次价格用于计算
+    price = await price_scanner.get_token_price(token)
+    if not price: return
+
+    if msg_type == 'HUNTER_SELL':
+        # 跟随卖出
+        await trader.execute_follow_sell(token, hunter_addr, signal['sell_ratio'], price)
+
+    elif msg_type == 'HUNTER_BUY':
+        # 判断加仓量
+        # Agent 发来的 add_amount 是 Token 数量
+        add_token_amount = signal['add_amount']
+        add_sol_value = add_token_amount * price
+
+        # 规则: 猎手加仓价值 > 1 SOL 时跟
+        if add_sol_value >= HUNTER_ADD_THRESHOLD_SOL:
+            # 构造猎手信息 (需要去 storage 查 score，这里简化处理)
+            # 假设我们只关心这是个"有效加仓"
+            hunter_info = {"address": hunter_addr, "score": 50}  # 这里的score最好从monitor拿
+
+            await trader.execute_add_position(token, hunter_info, "猎手大额加仓", price)
+
+            # 如果是新猎手，加入 Agent 监控
+            await agent.add_hunter_to_mission(token, hunter_addr)
+
+
+# =========================================
+# 后台任务: 价格轮询与止盈
+# =========================================
+
+async def pnl_monitor_loop():
+    """
+    定期轮询所有持仓代币的价格，检查是否触发止盈
+    """
+    logger.info("💸 启动 PnL 监控循环...")
+    while True:
+        try:
+            active_tokens = trader.get_active_tokens()
+            if active_tokens:
+                # 批量查价格 (DexScanner 需要实现 get_prices_batch 更好，这里循环查)
+                for token in active_tokens:
+                    price = await price_scanner.get_token_price(token)
+                    if price:
+                        await trader.check_pnl_and_stop_profit(token, price)
+                    await asyncio.sleep(0.5)  # 防限流
+
+        except Exception as e:
+            logger.error(f"PnL Loop Error: {e}")
+
+        await asyncio.sleep(PNL_CHECK_INTERVAL)
+
+
+# =========================================
+# 主入口
+# =========================================
+
 async def main():
-    # 初始化监控器，把上面的函数传进去
-    # 这里的 signal_callback 参数就是关键
-    monitor = HunterMonitorController(signal_callback=on_resonance_signal)
+    # 1. 绑定回调
+    monitor = HunterMonitorController(signal_callback=on_monitor_signal)
+    agent.signal_callback = on_agent_signal
 
-    logger.info("系统启动中...")
-
-    # 启动监控循环 (这会一直运行，不会退出)
-    await monitor.start()
+    # 2. 启动服务
+    # 使用 gather 并发运行
+    await asyncio.gather(
+        monitor.start(),  # 负责发现
+        agent.start(),  # 负责盯人
+        pnl_monitor_loop()  # 负责止盈
+    )
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("系统已停止")
+        pass

@@ -42,6 +42,29 @@ class DexScanner:
                 pass
         return []
 
+    async def get_token_price(self, token_address: str) -> float:
+        """
+        获取代币当前价格 (以 SOL 为单位)
+        注意：这里一定要取 priceNative，而不是 priceUsd
+        """
+        url = f"{self.base_url}/latest/dex/tokens/{token_address}"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url, timeout=5.0)
+                if response.status_code == 200:
+                    data = response.json()
+                    pairs = data.get('pairs', [])
+                    if pairs:
+                        # 取流动性最大的池子
+                        best_pair = max(pairs, key=lambda x: x.get('liquidity', {}).get('usd', 0))
+
+                        # === 关键修正 ===
+                        # priceNative 表示 1 Token = 多少 SOL
+                        return float(best_pair.get('priceNative', 0))
+            except Exception as e:
+                print(f"Error fetching price for {token_address}: {e}")
+        return 0.0
+
     async def scan(self):
         print(f"[{datetime.now()}] 正在扫描 Solana 潜力币...")
         raw_tokens = await self.fetch_latest_tokens()
