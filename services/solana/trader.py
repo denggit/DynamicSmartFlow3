@@ -23,7 +23,7 @@ from solders.transaction import VersionedTransaction
 from config.settings import (
     TRADING_MAX_SOL_PER_TOKEN, TRADING_MIN_BUY_SOL, TRADING_ADD_BUY_SOL,
     TRADING_SCORE_MULTIPLIER, TAKE_PROFIT_LEVELS,
-    MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO,
+    MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD,
     SOLANA_PRIVATE_KEY_BASE58, HELIUS_RPC_URL,
     JUPITER_QUOTE_API, JUPITER_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS
 )
@@ -158,14 +158,11 @@ class SolanaTrader:
         # [关键修复] UI Amount 转换
         token_got_ui = token_got_raw / (10 ** pos.decimals)
 
-        # 更新状态
+        # 更新状态与均价 (一次计算即可)
         new_total_tokens = pos.total_tokens + token_got_ui
         pos.average_price = (pos.total_tokens * pos.average_price + buy_sol) / new_total_tokens
-
         pos.total_cost_sol += buy_sol
         pos.total_tokens = new_total_tokens
-        current_value = (pos.total_tokens - token_got_ui) * pos.average_price
-        pos.average_price = (current_value + buy_sol) / pos.total_tokens
 
         # 份额分配
         hunter_addr = trigger_hunter['address']
@@ -177,13 +174,18 @@ class SolanaTrader:
             self._rebalance_shares_logic(pos, current_hunters_info)
 
     async def execute_follow_sell(self, token_address: str, hunter_addr: str, sell_ratio: float, current_price: float):
-        """跟随卖出逻辑"""
+        """跟随卖出逻辑。文档: 猎手卖出<5%不跟，跟随时我方至少卖该份额的 MIN_SELL_RATIO。"""
         if not self.keypair: return
         pos = self.positions.get(token_address)
         if not pos: return
 
         share = pos.shares.get(hunter_addr)
         if not share or share.token_amount <= 0: return
+
+        # 猎手微调（卖出比例过小）不跟，避免噪音
+        if sell_ratio < FOLLOW_SELL_THRESHOLD:
+            logger.debug("跟随卖出跳过: 猎手卖出比例 %.1f%% < 阈值 %.0f%%", sell_ratio * 100, FOLLOW_SELL_THRESHOLD * 100)
+            return
 
         actual_ratio = max(sell_ratio, MIN_SELL_RATIO)
         sell_amount_ui = share.token_amount * actual_ratio
@@ -211,13 +213,20 @@ class SolanaTrader:
         pos.total_tokens -= sell_amount_ui
         share.token_amount -= sell_amount_ui
         if is_dust or share.token_amount <= 0:
-            if hunter_addr in pos.shares: del pos.shares[hunter_addr]
+            if hunter_addr in pos.shares:
+                del pos.shares[hunter_addr]
+        # 若该币总持仓已归零，移除 position，便于主流程做 stop_tracking
+        if pos.total_tokens <= 0:
+            del self.positions[token_address]
 
     async def check_pnl_and_stop_profit(self, token_address: str, current_price_ui: float):
         """止盈逻辑"""
         if not self.keypair: return
         pos = self.positions.get(token_address)
         if not pos or pos.total_tokens <= 0: return
+        if pos.average_price <= 0:
+            logger.warning("止盈跳过: 均价异常 %.6f", pos.average_price)
+            return
 
         pnl_pct = (current_price_ui - pos.average_price) / pos.average_price
 
@@ -242,82 +251,63 @@ class SolanaTrader:
                         share.token_amount *= (1.0 - sell_pct)
                     pos.total_tokens -= sell_amount
                     pos.tp_hit_levels.add(level)
+                    if pos.total_tokens <= 0:
+                        del self.positions[token_address]
 
-        # ==========================================
-        # 2. Jupiter + Helius 真实交易实现 (修正版)
-        # ==========================================
+    async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
+                            is_sell: bool = False, token_decimals: int = 9) -> Tuple[Optional[str], float]:
+        """
+        通用 Swap 函数 (Jupiter v6 + Helius 广播，Auto 优先费)。
+        开仓/加仓/跟随卖出/止盈均调用此方法，必须为类方法不可嵌套。
+        """
+        try:
+            if not is_sell:
+                amount_int = int(amount_in_ui * LAMPORTS_PER_SOL)
+            else:
+                amount_int = int(amount_in_ui * (10 ** token_decimals))
 
-        async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
-                                is_sell: bool = False, token_decimals: int = 9) -> Tuple[Optional[str], float]:
-            """
-            通用 Swap 函数 (不使用 Jito，使用 Helius 标准广播 + Jupiter 自动优先费)
-            """
-            try:
-                # 1. 金额转换
-                if not is_sell:
-                    amount_int = int(amount_in_ui * LAMPORTS_PER_SOL)
-                else:
-                    amount_int = int(amount_in_ui * (10 ** token_decimals))
-
-                # 2. 获取 Quote
-                quote_params = {
-                    "inputMint": input_mint,
-                    "outputMint": output_mint,
-                    "amount": str(amount_int),
-                    "slippageBps": slippage_bps
-                }
-
-                quote_resp = await self.http_client.get(JUPITER_QUOTE_API, params=quote_params)
-                if quote_resp.status_code != 200:
-                    logger.error(f"Quote Error: {quote_resp.text}")
-                    return None, 0
-
-                quote_data = quote_resp.json()
-                out_amount_raw = int(quote_data.get("outAmount", 0))
-
-                # 3. 构建交易 (Swap)
-                swap_payload = {
-                    "userPublicKey": str(self.keypair.pubkey()),
-                    "quoteResponse": quote_data,
-                    "wrapAndUnwrapSol": True,
-                    # [关键修正] 使用 Jupiter 的 Auto 模式
-                    # 这会添加一个 ComputeBudgetInstruction，给网络交过路费，而不是给 Jito 交贿赂
-                    "prioritizationFeeLamports": PRIORITY_FEE_SETTINGS
-                }
-
-                swap_resp = await self.http_client.post(JUPITER_SWAP_API, json=swap_payload)
-                if swap_resp.status_code != 200:
-                    logger.error(f"Swap Build Error: {swap_resp.text}")
-                    return None, 0
-
-                swap_data = swap_resp.json()
-                swap_transaction_base64 = swap_data.get("swapTransaction")
-
-                # 4. 签名
-                raw_tx = base64.b64decode(swap_transaction_base64)
-                tx = VersionedTransaction.from_bytes(raw_tx)
-                signature = self.keypair.sign_message(tx.message.to_bytes_versioned(tx.message))
-                signed_tx = VersionedTransaction.populate(tx.message, [signature])
-
-                # 5. 发送交易 (Helius RPC)
-                # skip_preflight=True 是为了更快，让 Helius 帮我们重试
-                opts = TxOpts(skip_preflight=True, preflight_commitment=Confirmed)
-                sig = await self.rpc_client.send_raw_transaction(bytes(signed_tx), opts=opts)
-
-                logger.info(f"⏳ 交易已广播: {sig}")
-
-                # 简单等待 (实际可优化为 confirm_transaction)
-                await asyncio.sleep(5)
-
-                # 返回结果 (UI Amount)
-                if not is_sell:
-                    return str(sig), out_amount_raw
-                else:
-                    return str(sig), out_amount_raw / LAMPORTS_PER_SOL
-
-            except Exception:
-                logger.exception("Swap Exception")
+            quote_params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(amount_int),
+                "slippageBps": slippage_bps
+            }
+            quote_resp = await self.http_client.get(JUPITER_QUOTE_API, params=quote_params)
+            if quote_resp.status_code != 200:
+                logger.error("Quote Error: %s", quote_resp.text)
                 return None, 0
+
+            quote_data = quote_resp.json()
+            out_amount_raw = int(quote_data.get("outAmount", 0))
+
+            swap_payload = {
+                "userPublicKey": str(self.keypair.pubkey()),
+                "quoteResponse": quote_data,
+                "wrapAndUnwrapSol": True,
+                "prioritizationFeeLamports": PRIORITY_FEE_SETTINGS
+            }
+            swap_resp = await self.http_client.post(JUPITER_SWAP_API, json=swap_payload)
+            if swap_resp.status_code != 200:
+                logger.error("Swap Build Error: %s", swap_resp.text)
+                return None, 0
+
+            swap_data = swap_resp.json()
+            swap_transaction_base64 = swap_data.get("swapTransaction")
+            raw_tx = base64.b64decode(swap_transaction_base64)
+            tx = VersionedTransaction.from_bytes(raw_tx)
+            signature = self.keypair.sign_message(tx.message.to_bytes_versioned(tx.message))
+            signed_tx = VersionedTransaction.populate(tx.message, [signature])
+            opts = TxOpts(skip_preflight=True, preflight_commitment=Confirmed)
+            sig = await self.rpc_client.send_raw_transaction(bytes(signed_tx), opts=opts)
+            logger.info("⏳ 交易已广播: %s", sig)
+            await asyncio.sleep(5)
+
+            if not is_sell:
+                return str(sig), out_amount_raw
+            return str(sig), out_amount_raw / LAMPORTS_PER_SOL
+        except Exception:
+            logger.exception("Swap Exception")
+            return None, 0
 
     async def _get_decimals(self, mint_address: str) -> int:
         """获取代币精度"""

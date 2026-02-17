@@ -61,8 +61,11 @@ async def on_agent_signal(signal):
     if not price: return
 
     if msg_type == 'HUNTER_SELL':
-        # 跟随卖出
+        # 跟随卖出（内部会做 5% 阈值与最低 30% 跟随）
         await trader.execute_follow_sell(token, hunter_addr, signal['sell_ratio'], price)
+        # 若该币已全平，停止 Agent 对该币的监控
+        if token not in trader.positions:
+            await agent.stop_tracking(token)
 
     elif msg_type == 'HUNTER_BUY':
         # 判断加仓量
@@ -111,6 +114,9 @@ async def pnl_monitor_loop():
                     price = await price_scanner.get_token_price(token)
                     if price:
                         await trader.check_pnl_and_stop_profit(token, price)
+                        # 止盈全平后也停止 Agent 对该币的监控
+                        if token not in trader.positions:
+                            await agent.stop_tracking(token)
                     await asyncio.sleep(0.5)  # 防限流
 
         except Exception:

@@ -56,7 +56,8 @@ TAKE_PROFIT_LEVELS = [
 # 份额管理
 # 剩余份额价值不足 0.05 SOL 直接清仓
 MIN_SHARE_VALUE_SOL = 0.05  # 份额粉尘阈值 (低于此值该份额清仓)
-MIN_SELL_RATIO = 0.3  # 最低减仓比例
+MIN_SELL_RATIO = 0.3  # 跟随卖出时我方最低减仓比例 (如文档: 猎手卖10%我们也至少卖30%)
+FOLLOW_SELL_THRESHOLD = 0.05  # 猎手卖出比例低于此不跟 (微调忽略，文档: 大于5%才跟)
 
 # 系统循环配置
 PNL_CHECK_INTERVAL = 5  # 每 5 秒检查一次价格止盈
