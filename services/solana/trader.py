@@ -10,7 +10,11 @@
 
 import asyncio
 import base64
-from typing import Dict, List, Set, Optional, Tuple
+import json
+import os
+import time
+from pathlib import Path
+from typing import Dict, List, Set, Optional, Tuple, Callable, Any
 
 import httpx
 from solana.rpc.async_api import AsyncClient
@@ -25,7 +29,8 @@ from config.settings import (
     TRADING_SCORE_MULTIPLIER, TAKE_PROFIT_LEVELS,
     MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD,
     SOLANA_PRIVATE_KEY_BASE58, HELIUS_RPC_URL,
-    JUPITER_QUOTE_API, JUPITER_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS
+    JUPITER_QUOTE_API, JUPITER_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS,
+    BASE_DIR,
 )
 from utils.logger import get_logger
 
@@ -34,6 +39,7 @@ logger = get_logger(__name__)
 # 常量
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
+TRADER_STATE_PATH = BASE_DIR / "data" / "trader_state.json"
 
 
 class VirtualShare:
@@ -52,11 +58,14 @@ class Position:
         self.total_cost_sol = 0.0
         self.shares: Dict[str, VirtualShare] = {}
         self.tp_hit_levels: Set[float] = set()
+        self.entry_time: float = 0.0  # 首次开仓时间，用于邮件
+        self.trade_records: List[Dict] = []  # 每笔交易，用于清仓邮件
 
 
 class SolanaTrader:
     def __init__(self):
         self.positions: Dict[str, Position] = {}
+        self.on_position_closed_callback: Optional[Callable[[dict], None]] = None  # 清仓时回调，传 snapshot
 
         # 初始化钱包
         if not SOLANA_PRIVATE_KEY_BASE58:
@@ -119,13 +128,23 @@ class SolanaTrader:
             actual_price = current_price_ui
 
         # 4. 建仓 (传入 decimals)
-        pos = Position(token_address, actual_price, decimals)  # <--- 这里传入
+        pos = Position(token_address, actual_price, decimals)
         pos.total_cost_sol = buy_sol
         pos.total_tokens = token_amount_ui
+        pos.entry_time = time.time()
+        pos.trade_records.append({
+            "ts": pos.entry_time,
+            "type": "buy",
+            "sol_spent": buy_sol,
+            "sol_received": 0.0,
+            "token_amount": token_amount_ui,
+            "note": "首次开仓",
+            "pnl_sol": None,
+        })
 
         self.positions[token_address] = pos
-
         self._rebalance_shares_logic(pos, hunters)
+        self._save_state_safe()
         logger.info(f"✅ 开仓成功 | 均价: {actual_price:.6f} SOL | 持仓: {token_amount_ui:.2f}")
 
     async def execute_add_position(self, token_address: str, trigger_hunter: Dict, add_reason: str,
@@ -164,6 +183,15 @@ class SolanaTrader:
         pos.total_cost_sol += buy_sol
         pos.total_tokens = new_total_tokens
 
+        pos.trade_records.append({
+            "ts": time.time(),
+            "type": "buy",
+            "sol_spent": buy_sol,
+            "sol_received": 0.0,
+            "token_amount": token_got_ui,
+            "note": "加仓",
+            "pnl_sol": None,
+        })
         # 份额分配
         hunter_addr = trigger_hunter['address']
         if hunter_addr in pos.shares:
@@ -172,6 +200,7 @@ class SolanaTrader:
             pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), token_got_ui)
             current_hunters_info = [{"address": h, "score": s.score} for h, s in pos.shares.items()]
             self._rebalance_shares_logic(pos, current_hunters_info)
+        self._save_state_safe()
 
     async def execute_follow_sell(self, token_address: str, hunter_addr: str, sell_ratio: float, current_price: float):
         """跟随卖出逻辑。文档: 猎手卖出<5%不跟，跟随时我方至少卖该份额的 MIN_SELL_RATIO。"""
@@ -210,14 +239,26 @@ class SolanaTrader:
 
         if not tx_sig: return
 
+        cost_this_sell = sell_amount_ui * pos.average_price
+        pnl_sol = sol_got_ui - cost_this_sell
+        pos.trade_records.append({
+            "ts": time.time(),
+            "type": "sell",
+            "sol_spent": 0.0,
+            "sol_received": sol_got_ui,
+            "token_amount": sell_amount_ui,
+            "note": "跟随卖出",
+            "pnl_sol": pnl_sol,
+        })
         pos.total_tokens -= sell_amount_ui
         share.token_amount -= sell_amount_ui
         if is_dust or share.token_amount <= 0:
             if hunter_addr in pos.shares:
                 del pos.shares[hunter_addr]
-        # 若该币总持仓已归零，移除 position，便于主流程做 stop_tracking
         if pos.total_tokens <= 0:
+            self._emit_position_closed(token_address, pos)
             del self.positions[token_address]
+        self._save_state_safe()
 
     async def check_pnl_and_stop_profit(self, token_address: str, current_price_ui: float):
         """止盈逻辑"""
@@ -237,7 +278,7 @@ class SolanaTrader:
 
                 # === 真实卖出 ===
                 decimals = await self._get_decimals(token_address)
-                tx_sig, _ = await self._jupiter_swap(
+                tx_sig, sol_received = await self._jupiter_swap(
                     input_mint=token_address,
                     output_mint=WSOL_MINT,
                     amount_in_ui=sell_amount,
@@ -247,12 +288,25 @@ class SolanaTrader:
                 )
 
                 if tx_sig:
+                    cost_this_sell = sell_amount * pos.average_price
+                    pnl_sol = sol_received - cost_this_sell
+                    pos.trade_records.append({
+                        "ts": time.time(),
+                        "type": "sell",
+                        "sol_spent": 0.0,
+                        "sol_received": sol_received,
+                        "token_amount": sell_amount,
+                        "note": f"止盈{sell_pct * 100:.0f}%",
+                        "pnl_sol": pnl_sol,
+                    })
                     for share in pos.shares.values():
                         share.token_amount *= (1.0 - sell_pct)
                     pos.total_tokens -= sell_amount
                     pos.tp_hit_levels.add(level)
                     if pos.total_tokens <= 0:
+                        self._emit_position_closed(token_address, pos)
                         del self.positions[token_address]
+                self._save_state_safe()
 
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
                             is_sell: bool = False, token_decimals: int = 9) -> Tuple[Optional[str], float]:
@@ -340,6 +394,100 @@ class SolanaTrader:
                 ratio = h.get('score', 0) / total_score
                 new_shares[h['address']] = VirtualShare(h['address'], h.get('score', 0), total_tokens * ratio)
         pos.shares = new_shares
+
+    def _emit_position_closed(self, token_address: str, pos: Position) -> None:
+        """清仓时构造 snapshot 并触发回调（发邮件等）。"""
+        total_spent = sum(float(r.get("sol_spent") or 0) for r in pos.trade_records)
+        total_received = sum(float(r.get("sol_received") or 0) for r in pos.trade_records)
+        snapshot = {
+            "token_address": token_address,
+            "entry_time": pos.entry_time,
+            "trade_records": list(pos.trade_records),
+            "total_pnl_sol": total_received - total_spent,
+        }
+        if self.on_position_closed_callback:
+            try:
+                self.on_position_closed_callback(snapshot)
+            except Exception:
+                logger.exception("清仓回调执行异常")
+
+    # ==========================================
+    # 持仓持久化（程序挂掉后重启可恢复跟单状态）
+    # ==========================================
+
+    def _position_to_dict(self, pos: Position) -> Dict[str, Any]:
+        """将 Position 转为可 JSON 序列化的 dict。"""
+        return {
+            "token_address": pos.token_address,
+            "entry_time": pos.entry_time,
+            "average_price": pos.average_price,
+            "decimals": pos.decimals,
+            "total_tokens": pos.total_tokens,
+            "total_cost_sol": pos.total_cost_sol,
+            "tp_hit_levels": list(pos.tp_hit_levels),
+            "shares": {
+                addr: {"hunter": s.hunter, "score": s.score, "token_amount": s.token_amount}
+                for addr, s in pos.shares.items()
+            },
+            "trade_records": list(pos.trade_records),
+        }
+
+    def _dict_to_position(self, d: Dict[str, Any]) -> Position:
+        """从 dict 恢复 Position。"""
+        pos = Position(
+            d["token_address"],
+            float(d.get("average_price", 0)),
+            int(d.get("decimals", 9)),
+        )
+        pos.entry_time = float(d.get("entry_time", 0))
+        pos.total_tokens = float(d.get("total_tokens", 0))
+        pos.total_cost_sol = float(d.get("total_cost_sol", 0))
+        pos.tp_hit_levels = set(float(x) for x in d.get("tp_hit_levels", []))
+        for addr, s in (d.get("shares") or {}).items():
+            pos.shares[addr] = VirtualShare(
+                s.get("hunter", addr),
+                float(s.get("score", 0)),
+                float(s.get("token_amount", 0)),
+            )
+        pos.trade_records = list(d.get("trade_records") or [])
+        return pos
+
+    def _save_state_safe(self) -> None:
+        """将当前持仓写入本地文件，失败只打日志。"""
+        try:
+            TRADER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "positions": {
+                    token: self._position_to_dict(pos)
+                    for token, pos in self.positions.items()
+                    if pos.total_tokens > 0
+                }
+            }
+            with open(TRADER_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.exception("保存持仓状态失败")
+
+    def save_state(self) -> None:
+        """公开方法：持久化当前持仓到 data/trader_state.json。"""
+        self._save_state_safe()
+
+    def load_state(self) -> None:
+        """从 data/trader_state.json 恢复持仓，启动时调用。"""
+        if not TRADER_STATE_PATH.exists():
+            return
+        try:
+            with open(TRADER_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            positions_data = data.get("positions") or {}
+            for token, pd in positions_data.items():
+                pos = self._dict_to_position(pd)
+                if pos.total_tokens > 0:
+                    self.positions[token] = pos
+            if self.positions:
+                logger.info("📂 已从本地恢复 %s 个持仓", len(self.positions))
+        except Exception:
+            logger.exception("加载持仓状态失败")
 
     def get_active_tokens(self) -> List[str]:
         return [t for t, p in self.positions.items() if p.total_tokens > 0]
