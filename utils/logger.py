@@ -9,11 +9,15 @@
               - 按日期分目录: logs/YYYY-MM-DD/
               - 每个功能模块对应独立日志文件: <module>.log
               - 每日零点后自动写入新日期目录，不依赖程序启动时间
+              - 关键模块的 ERROR/exception 触发告警邮件，1 小时一封、整合该时段内所有错误
 """
 
 import logging
+import threading
+import time
 from datetime import date
 from pathlib import Path
+from typing import List, Optional
 
 # 项目根目录 (utils 的父级)
 _BASE_DIR = Path(__file__).resolve().parent.parent
@@ -21,6 +25,73 @@ LOGS_ROOT = _BASE_DIR / "logs"
 
 # 已创建的 logger 实例，避免重复添加 handler
 _logger_handlers: dict = {}
+
+# 严重错误邮件：1 小时最多发一封，整合该时段内所有 ERROR/exception
+_CRITICAL_EMAIL_COOLDOWN_SEC = 3600  # 1 小时
+_critical_error_buffer: List[dict] = []
+_buffer_lock = threading.Lock()
+_flush_timer: Optional[threading.Timer] = None
+
+# 触发严重错误邮件的 logger 名称（跟单/交易/风控/主流程等）
+_CRITICAL_LOGGER_NAMES = frozenset({
+    "Main",
+    "services.solana.trader",
+    "services.solana.hunter_agent",
+    "services.solana.hunter_monitor",
+    "services.helius.sm_searcher",
+    "services.risk_control",
+    "services.dexscreener.dex_scanner",
+})
+
+
+def _send_buffered_critical_errors() -> None:
+    """
+    将当前缓冲区的所有错误整合为一封邮件发送，并清空缓冲区。
+    由定时器在 1 小时后调用，或在加锁后手动调用。
+    """
+    global _critical_error_buffer, _flush_timer
+    with _buffer_lock:
+        to_send = list(_critical_error_buffer)
+        _critical_error_buffer.clear()
+        _flush_timer = None
+    if not to_send:
+        return
+    try:
+        lines = [
+            "本邮件汇总过去 1 小时内所有 ERROR/exception 记录（按时间排序）。",
+            "",
+            "=" * 60,
+        ]
+        for i, entry in enumerate(to_send, 1):
+            lines.append("")
+            lines.append(f"-------- 错误 #{i} | {entry.get('time', '')} --------")
+            lines.append(f"模块: {entry.get('name', '')}")
+            lines.append(f"级别: {entry.get('level', '')}")
+            lines.append("消息:")
+            lines.append(entry.get("message", ""))
+            exc = entry.get("exc", "").strip()
+            if exc:
+                lines.append("堆栈:")
+                lines.append(exc)
+        content = "\n".join(lines)
+        subject = f"过去 1 小时共 {len(to_send)} 条错误"
+        from services.notification import send_critical_error_email
+        send_critical_error_email(subject, content)
+    except Exception:
+        pass  # 避免告警逻辑自身抛错影响主流程
+
+
+def _schedule_flush_if_first() -> None:
+    """若当前缓冲区只有一条（刚写入），则启动 1 小时后发送的定时器。"""
+    global _flush_timer
+    with _buffer_lock:
+        if len(_critical_error_buffer) != 1:
+            return
+        if _flush_timer is not None:
+            _flush_timer.cancel()
+        _flush_timer = threading.Timer(_CRITICAL_EMAIL_COOLDOWN_SEC, _send_buffered_critical_errors)
+        _flush_timer.daemon = True
+        _flush_timer.start()
 
 
 def _module_name_to_file_name(name: str) -> str:
@@ -81,6 +152,36 @@ class DateDirFileHandler(logging.FileHandler):
             self.handleError(record)
 
 
+class CriticalErrorEmailHandler(logging.Handler):
+    """
+    当收到 ERROR/CRITICAL 时将记录写入缓冲区。
+    每 1 小时最多发一封邮件，整合该时段内所有错误（时间 + 模块 + 消息 + 堆栈）。
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno < logging.ERROR:
+            return
+        try:
+            time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.created))
+            exc_text = ""
+            if record.exc_info and record.exc_info[0] is not None and self.formatter:
+                exc_text = self.formatter.formatException(record.exc_info)
+            entry = {
+                "time": time_str,
+                "name": record.name,
+                "level": record.levelname,
+                "message": record.getMessage(),
+                "exc": exc_text,
+            }
+            with _buffer_lock:
+                _critical_error_buffer.append(entry)
+                need_schedule = len(_critical_error_buffer) == 1
+            if need_schedule:
+                _schedule_flush_if_first()
+        except Exception:
+            self.handleError(record)
+
+
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     """
     获取按日期与模块分文件的 Logger。
@@ -105,4 +206,12 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
         handler.setFormatter(formatter)
         logger.propagate = False
         logger.addHandler(handler)
+
+        # 关键业务模块：ERROR/exception 写入缓冲区，每 1 小时发一封整合邮件
+        if name in _CRITICAL_LOGGER_NAMES:
+            email_handler = CriticalErrorEmailHandler(level=logging.ERROR)
+            email_handler.setFormatter(
+                logging.Formatter("%(asctime)s\n%(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+            )
+            logger.addHandler(email_handler)
     return logger

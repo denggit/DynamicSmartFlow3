@@ -62,6 +62,15 @@ def send_email_in_thread(subject: str, content: str, attachment_path: str = None
     t.start()
 
 
+def send_critical_error_email(subject: str, content: str) -> None:
+    """
+    严重错误告警邮件（跟单/程序异常时触发）。独立线程发送，不阻塞。
+    标题会加 [严重错误] 前缀，便于区分。
+    """
+    full_subject = "🚨 严重错误 - " + (subject or "程序异常")
+    send_email_in_thread(full_subject, content)
+
+
 # --------------- 业务邮件内容构造（供 main/trader 回调使用） ---------------
 
 def build_first_entry_content(
