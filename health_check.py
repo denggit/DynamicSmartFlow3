@@ -19,6 +19,14 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
+# Windows 控制台使用 UTF-8，以便正常输出 emoji
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # 尽早加载 .env（后续步骤依赖）
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(ROOT) / ".env")
