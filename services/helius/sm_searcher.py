@@ -377,7 +377,7 @@ class SmartMoneySearcher:
                         verified_hunters.append(candidate)
                         logger.info(
                             f"    ✅ 锁定猎手 {addr}.. | 利润: {candidate['total_profit']} | 评分: {final_score}")
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)
 
             self._save_scanned_token(token_address)
             return verified_hunters
