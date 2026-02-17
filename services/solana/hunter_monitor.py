@@ -20,7 +20,7 @@ from typing import Dict, List, Callable, Optional
 import websockets
 
 # 导入配置和依赖模块
-from config.settings import HELIUS_API_KEY
+from config.settings import helius_key_pool
 from services.dexscreener.dex_scanner import DexScanner
 from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
 from utils.logger import get_logger
@@ -35,7 +35,6 @@ MAINTENANCE_INTERVAL = 86400  # 维护间隔 1天 (大幅降低频率)
 POOL_SIZE_LIMIT = 50  # 地址库上限
 ZOMBIE_THRESHOLD = 86400 * 10  # 10天不交易视为僵尸 (清理标准)
 AUDIT_EXPIRATION = 86400 * 15  # 体检有效期 15天 (重算分数标准)
-HELIUS_WSS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
 
 class HunterStorage:
@@ -174,7 +173,7 @@ class HunterMonitorController:
                     await asyncio.sleep(10)
                     continue
 
-                async with websockets.connect(HELIUS_WSS_URL) as ws:
+                async with websockets.connect(helius_key_pool.get_wss_url()) as ws:
                     payload = {
                         "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
                         "params": [{"mentions": monitored_addrs}, {"commitment": "confirmed"}]
@@ -203,9 +202,12 @@ class HunterMonitorController:
         try:
             from httpx import AsyncClient
             async with AsyncClient() as client:
-                url = f"https://api.helius.xyz/v0/transactions/?api-key={HELIUS_API_KEY}"
+                url = helius_key_pool.get_http_endpoint()
                 resp = await client.post(url, json={"transactions": [signature]}, timeout=10)
-                if resp.status_code != 200: return
+                if resp.status_code == 429 and helius_key_pool.size > 1:
+                    helius_key_pool.mark_current_failed()
+                if resp.status_code != 200:
+                    return
                 txs = resp.json()
                 if not txs: return
                 tx = txs[0]

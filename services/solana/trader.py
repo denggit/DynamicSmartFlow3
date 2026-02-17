@@ -28,9 +28,9 @@ from config.settings import (
     TRADING_MAX_SOL_PER_TOKEN, TRADING_MIN_BUY_SOL, TRADING_ADD_BUY_SOL,
     TRADING_SCORE_MULTIPLIER, TAKE_PROFIT_LEVELS,
     MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD,
-    SOLANA_PRIVATE_KEY_BASE58, HELIUS_RPC_URL,
-    JUPITER_QUOTE_API, JUPITER_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS,
-    BASE_DIR,
+    SOLANA_PRIVATE_KEY_BASE58,
+    JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS,
+    BASE_DIR, helius_key_pool, jup_key_pool,
 )
 from utils.logger import get_logger
 
@@ -79,9 +79,28 @@ class SolanaTrader:
                 logger.exception("❌ 私钥格式错误")
                 self.keypair = None
 
-        # 初始化 RPC 客户端
-        self.rpc_client = AsyncClient(HELIUS_RPC_URL, commitment=Confirmed)
+        # Helius / Jupiter 各自独立 Key 池，谁不可用谁自己换下一个
+        self._helius_pool = helius_key_pool
+        self._jup_pool = jup_key_pool
+        self.rpc_client = AsyncClient(helius_key_pool.get_rpc_url(), commitment=Confirmed)
         self.http_client = httpx.AsyncClient(timeout=10.0)
+
+    def _jup_headers(self) -> dict:
+        """Jupiter 请求头，若有 JUP Key 则带上。"""
+        key = self._jup_pool.get_api_key()
+        if not key:
+            return {}
+        return {"x-api-key": key}
+
+    async def _recreate_rpc_client(self) -> None:
+        """当前 Helius key 不可用时，仅切换 Helius 池内下一个并重建 RPC 客户端。"""
+        try:
+            await self.rpc_client.close()
+        except Exception:
+            pass
+        self._helius_pool.mark_current_failed()
+        self.rpc_client = AsyncClient(self._helius_pool.get_rpc_url(), commitment=Confirmed)
+        logger.info("🔄 已切换 Helius Key，重建 RPC 客户端")
 
     async def close(self):
         await self.rpc_client.close()
@@ -311,57 +330,75 @@ class SolanaTrader:
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
                             is_sell: bool = False, token_decimals: int = 9) -> Tuple[Optional[str], float]:
         """
-        通用 Swap 函数 (Jupiter v6 + Helius 广播，Auto 优先费)。
-        开仓/加仓/跟随卖出/止盈均调用此方法，必须为类方法不可嵌套。
+        通用 Swap 函数 (Jupiter v1 + Helius 广播)。Helius/Jupiter 各自独立切 key，不可用时只切自己的池。
         """
-        try:
-            if not is_sell:
-                amount_int = int(amount_in_ui * LAMPORTS_PER_SOL)
-            else:
-                amount_int = int(amount_in_ui * (10 ** token_decimals))
+        for attempt in range(2):
+            try:
+                if not is_sell:
+                    amount_int = int(amount_in_ui * LAMPORTS_PER_SOL)
+                else:
+                    amount_int = int(amount_in_ui * (10 ** token_decimals))
 
-            quote_params = {
-                "inputMint": input_mint,
-                "outputMint": output_mint,
-                "amount": str(amount_int),
-                "slippageBps": slippage_bps
-            }
-            quote_resp = await self.http_client.get(JUPITER_QUOTE_API, params=quote_params)
-            if quote_resp.status_code != 200:
-                logger.error("Quote Error: %s", quote_resp.text)
+                quote_params = {
+                    "inputMint": input_mint,
+                    "outputMint": output_mint,
+                    "amount": str(amount_int),
+                    "slippageBps": slippage_bps
+                }
+                quote_resp = await self.http_client.get(
+                    JUP_QUOTE_API, params=quote_params, headers=self._jup_headers()
+                )
+                if quote_resp.status_code == 429:
+                    self._jup_pool.mark_current_failed()
+                    if attempt < 1:
+                        continue
+                if quote_resp.status_code != 200:
+                    logger.error("Quote Error: %s", quote_resp.text)
+                    return None, 0
+
+                quote_data = quote_resp.json()
+                out_amount_raw = int(quote_data.get("outAmount", 0))
+
+                swap_payload = {
+                    "userPublicKey": str(self.keypair.pubkey()),
+                    "quoteResponse": quote_data,
+                    "wrapAndUnwrapSol": True,
+                    "prioritizationFeeLamports": PRIORITY_FEE_SETTINGS
+                }
+                swap_resp = await self.http_client.post(
+                    JUP_SWAP_API, json=swap_payload, headers=self._jup_headers()
+                )
+                if swap_resp.status_code == 429:
+                    self._jup_pool.mark_current_failed()
+                    if attempt < 1:
+                        continue
+                if swap_resp.status_code != 200:
+                    logger.error("Swap Build Error: %s", swap_resp.text)
+                    return None, 0
+
+                swap_data = swap_resp.json()
+                swap_transaction_base64 = swap_data.get("swapTransaction") or swap_data.get("transaction")
+                raw_tx = base64.b64decode(swap_transaction_base64)
+                tx = VersionedTransaction.from_bytes(raw_tx)
+                signature = self.keypair.sign_message(tx.message.to_bytes_versioned(tx.message))
+                signed_tx = VersionedTransaction.populate(tx.message, [signature])
+                opts = TxOpts(skip_preflight=True, preflight_commitment=Confirmed)
+                sig = await self.rpc_client.send_raw_transaction(bytes(signed_tx), opts=opts)
+                logger.info("⏳ 交易已广播: %s", sig)
+                await asyncio.sleep(5)
+
+                if not is_sell:
+                    return str(sig), out_amount_raw
+                return str(sig), out_amount_raw / LAMPORTS_PER_SOL
+            except Exception as e:
+                err_msg = str(e).lower()
+                if attempt == 0 and self._helius_pool.size >= 1 and ("rate" in err_msg or "429" in err_msg or "limit" in err_msg or "credit" in err_msg):
+                    logger.warning("Helius 限流/额度用尽，切换 Key 并重试: %s", e)
+                    await self._recreate_rpc_client()
+                    continue
+                logger.exception("Swap Exception")
                 return None, 0
-
-            quote_data = quote_resp.json()
-            out_amount_raw = int(quote_data.get("outAmount", 0))
-
-            swap_payload = {
-                "userPublicKey": str(self.keypair.pubkey()),
-                "quoteResponse": quote_data,
-                "wrapAndUnwrapSol": True,
-                "prioritizationFeeLamports": PRIORITY_FEE_SETTINGS
-            }
-            swap_resp = await self.http_client.post(JUPITER_SWAP_API, json=swap_payload)
-            if swap_resp.status_code != 200:
-                logger.error("Swap Build Error: %s", swap_resp.text)
-                return None, 0
-
-            swap_data = swap_resp.json()
-            swap_transaction_base64 = swap_data.get("swapTransaction")
-            raw_tx = base64.b64decode(swap_transaction_base64)
-            tx = VersionedTransaction.from_bytes(raw_tx)
-            signature = self.keypair.sign_message(tx.message.to_bytes_versioned(tx.message))
-            signed_tx = VersionedTransaction.populate(tx.message, [signature])
-            opts = TxOpts(skip_preflight=True, preflight_commitment=Confirmed)
-            sig = await self.rpc_client.send_raw_transaction(bytes(signed_tx), opts=opts)
-            logger.info("⏳ 交易已广播: %s", sig)
-            await asyncio.sleep(5)
-
-            if not is_sell:
-                return str(sig), out_amount_raw
-            return str(sig), out_amount_raw / LAMPORTS_PER_SOL
-        except Exception:
-            logger.exception("Swap Exception")
-            return None, 0
+        return None, 0
 
     async def _get_decimals(self, mint_address: str) -> int:
         """获取代币精度"""

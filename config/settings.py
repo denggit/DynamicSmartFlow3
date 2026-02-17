@@ -7,6 +7,7 @@
 @Description: 
 """
 import os
+import threading
 from pathlib import Path
 
 # 获取项目根目录
@@ -17,13 +18,66 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=ENV_PATH)
 
-# --- API Keys ---
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+# --- Helius / Jupiter API Key 池（各自独立：谁不可用谁自己换下一个，用尽后回到第一个重试）---
+_raw_helius = os.getenv("HELIUS_API_KEY", "") or ""
+_raw_jup = os.getenv("JUP_API_KEY", "") or ""
+HELIUS_API_KEYS = [k.strip() for k in _raw_helius.split(",") if k.strip()]
+JUP_API_KEYS = [k.strip() for k in _raw_jup.split(",") if k.strip()]
 
-# --- 基础配置 ---
-WSS_ENDPOINT = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-HTTP_ENDPOINT = f"https://api.helius.xyz/v0/transactions/?api-key={HELIUS_API_KEY}"
-HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+class _KeyPool:
+    """单类 Key 池：不可用时切下一个，最后一个用尽后回到第一个重试。"""
+
+    def __init__(self, keys: list, name: str = ""):
+        self._keys = list(keys) if keys else []
+        self._index = 0
+        self._lock = threading.Lock()
+        self._name = name
+
+    def get_api_key(self) -> str:
+        with self._lock:
+            if not self._keys:
+                return ""
+            return self._keys[self._index % len(self._keys)]
+
+    def mark_current_failed(self) -> None:
+        """当前 key 不可用，切换到下一个；已是最后一个则回到第一个。"""
+        with self._lock:
+            if not self._keys:
+                return
+            self._index = (self._index + 1) % max(len(self._keys), 1)
+
+    @property
+    def size(self) -> int:
+        return len(self._keys)
+
+
+class HeliusKeyPool(_KeyPool):
+    """Helius Key 池，并提供 RPC/WSS/HTTP URL。"""
+
+    def __init__(self, keys: list):
+        super().__init__(keys, "Helius")
+
+    def get_rpc_url(self) -> str:
+        key = self.get_api_key()
+        return f"https://mainnet.helius-rpc.com/?api-key={key}" if key else ""
+
+    def get_wss_url(self) -> str:
+        key = self.get_api_key()
+        return f"wss://mainnet.helius-rpc.com/?api-key={key}" if key else ""
+
+    def get_http_endpoint(self) -> str:
+        key = self.get_api_key()
+        return f"https://api.helius.xyz/v0/transactions/?api-key={key}" if key else ""
+
+
+helius_key_pool = HeliusKeyPool(HELIUS_API_KEYS)
+jup_key_pool = _KeyPool(JUP_API_KEYS, "Jupiter")
+
+HELIUS_API_KEY = helius_key_pool.get_api_key()
+WSS_ENDPOINT = helius_key_pool.get_wss_url()
+HTTP_ENDPOINT = helius_key_pool.get_http_endpoint()
+HELIUS_RPC_URL = helius_key_pool.get_rpc_url()
 
 # --- 邮箱配置 ---
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
@@ -36,9 +90,9 @@ BOT_NAME = os.getenv("BOT_NAME", "DSF3")  # 邮件标题前缀
 # --- 日报配置 ---
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "8"))  # 每日几点发日报 (0-23)
 
-# Jupiter API (免费版)
-JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap"
+# Jupiter API (v1)
+JUP_QUOTE_API = "https://api.jup.ag/swap/v1/quote"
+JUP_SWAP_API = "https://api.jup.ag/swap/v1/swap"
 
 # 交易参数
 SLIPPAGE_BPS = 200  # 滑点 2% (200 bps)

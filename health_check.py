@@ -75,7 +75,8 @@ def check_env_vars():
         print(f"  {FAIL} 加载 .env 失败: {e}")
         return False
 
-    helius = os.getenv("HELIUS_API_KEY", "").strip()
+    helius_raw = os.getenv("HELIUS_API_KEY", "").strip()
+    helius_keys = [k.strip() for k in helius_raw.split(",") if k.strip()]
     sol_key = os.getenv("SOLANA_PRIVATE_KEY", "").strip()
     email_ok = all([
         os.getenv("EMAIL_SENDER"),
@@ -84,10 +85,11 @@ def check_env_vars():
     ])
 
     all_ok = True
-    if helius:
-        print(f"  {OK} HELIUS_API_KEY 已配置")
+    if helius_keys:
+        n = len(helius_keys)
+        print(f"  {OK} HELIUS_API_KEY 已配置" + (f"（共 {n} 个 Key 池）" if n > 1 else ""))
     else:
-        print(f"  {FAIL} HELIUS_API_KEY 未配置（必填）")
+        print(f"  {FAIL} HELIUS_API_KEY 未配置（必填，可逗号分隔多个）")
         all_ok = False
 
     if sol_key:
@@ -99,6 +101,13 @@ def check_env_vars():
         print(f"  {OK} 邮件配置完整 (EMAIL_SENDER/PASSWORD/RECEIVER)")
     else:
         print(f"  {WARN} 邮件未完整配置，将不发送开仓/清仓/日报邮件")
+
+    jup_raw = os.getenv("JUP_API_KEY", "").strip()
+    jup_keys = [k.strip() for k in jup_raw.split(",") if k.strip()]
+    if jup_keys:
+        print(f"  {OK} JUP_API_KEY 已配置" + (f"（共 {len(jup_keys)} 个）" if len(jup_keys) > 1 else "（可选）"))
+    else:
+        print(f"  {WARN} JUP_API_KEY 未配置（可选，Jupiter 限流时可逗号分隔多个）")
 
     return all_ok
 
@@ -124,11 +133,12 @@ def check_network():
     import urllib.request
     import urllib.error
 
-    helius_key = os.getenv("HELIUS_API_KEY", "").strip()
+    helius_keys = [k.strip() for k in os.getenv("HELIUS_API_KEY", "").strip().split(",") if k.strip()]
+    first_key = helius_keys[0] if helius_keys else ""
     urls = [
-        ("Helius RPC", f"https://mainnet.helius-rpc.com/?api-key={helius_key}" if helius_key else None),
+        ("Helius RPC", f"https://mainnet.helius-rpc.com/?api-key={first_key}" if first_key else None),
         ("DexScreener", "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112"),
-        ("Jupiter Quote", "https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=So11111111111111111111111111111111111111112&amount=1000000&slippageBps=50"),
+        ("Jupiter Quote", "https://api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=So11111111111111111111111111111111111111112&amount=1000000&slippageBps=50"),
     ]
     all_ok = True
     for name, url in urls:
@@ -153,7 +163,7 @@ def check_network():
 def check_project_imports():
     """项目核心模块是否能正常导入"""
     try:
-        from config.settings import HELIUS_API_KEY, SOLANA_PRIVATE_KEY_BASE58
+        from config.settings import helius_key_pool, SOLANA_PRIVATE_KEY_BASE58
         from services.dexscreener.dex_scanner import DexScanner
         from services.solana.trader import SolanaTrader
         from services import risk_control

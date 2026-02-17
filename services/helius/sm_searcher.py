@@ -21,7 +21,7 @@ from typing import Dict, Tuple, Set
 
 import httpx
 
-from config.settings import HELIUS_API_KEY
+from config.settings import helius_key_pool
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -103,8 +103,13 @@ class TokenAttributionCalculator:
 
 class SmartMoneySearcher:
     def __init__(self):
-        self.api_key = HELIUS_API_KEY
-        self.rpc_url = f"https://mainnet.helius-rpc.com/?api-key={self.api_key}"
+        self._pool = helius_key_pool
+        self._update_urls()
+
+    def _update_urls(self):
+        """从 Key 池更新当前 RPC / API URL。"""
+        self.api_key = self._pool.get_api_key()
+        self.rpc_url = self._pool.get_rpc_url()
         self.base_api_url = "https://api.helius.xyz/v0"
 
         # 初筛参数
@@ -158,13 +163,17 @@ class SmartMoneySearcher:
                         # 如果是限流错误 (429)，记录并重试
                         err_msg = data.get("error", {}).get("message", "")
                         if "Rate limit" in err_msg or "429" in str(resp.status_code):
-                            logger.warning(f"⚠️ RPC 限流 (尝试 {attempt + 1}/{max_retries}): {err_msg}")
+                            logger.warning("⚠️ RPC 限流 (尝试 %s/%s)，切换 Key: %s", attempt + 1, max_retries, err_msg)
+                            self._pool.mark_current_failed()
+                            self._update_urls()
                         else:
                             # 其他业务错误直接返回 None
                             # logger.warning(f"RPC 业务错误: {err_msg}")
                             return None
                 elif resp.status_code == 429:
-                    logger.warning(f"⚠️ RPC HTTP 429 限流 (尝试 {attempt + 1}/{max_retries})")
+                    logger.warning("⚠️ RPC HTTP 429 限流 (尝试 %s/%s)，切换 Key", attempt + 1, max_retries)
+                    self._pool.mark_current_failed()
+                    self._update_urls()
                 else:
                     logger.warning(f"RPC 请求失败: {resp.status_code}")
 
@@ -190,16 +199,19 @@ class SmartMoneySearcher:
 
     async def fetch_parsed_transactions(self, client, signatures):
         if not signatures: return []
-        url = f"{self.base_api_url}/transactions?api-key={self.api_key}"
         chunk_size = 90
         all_txs = []
         for i in range(0, len(signatures), chunk_size):
             batch = signatures[i:i + chunk_size]
             payload = {"transactions": [s['signature'] for s in batch]}
+            url = f"{self.base_api_url}/transactions?api-key={self.api_key}"
             try:
                 resp = await client.post(url, json=payload, timeout=30.0)
                 if resp.status_code == 200:
                     all_txs.extend(resp.json())
+                elif resp.status_code == 429 and self._pool.size > 1:
+                    self._pool.mark_current_failed()
+                    self._update_urls()
             except Exception:
                 logger.exception("fetch_parsed_transactions 批量请求异常")
         return all_txs

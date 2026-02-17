@@ -21,14 +21,11 @@ from typing import Dict, List, Callable, Optional
 import httpx
 import websockets
 
-from config.settings import HELIUS_API_KEY
+from config.settings import helius_key_pool
 from services.helius.sm_searcher import TransactionParser
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-HELIUS_WSS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
 
 class TokenMission:
@@ -154,7 +151,7 @@ class HunterAgentController:
                     await asyncio.sleep(5)
                     continue
 
-                async with websockets.connect(HELIUS_WSS_URL) as ws:
+                async with websockets.connect(helius_key_pool.get_wss_url()) as ws:
                     logger.info(f"👀 Agent 已连接，正在监视 {len(monitored_hunters)} 名猎手的持仓变动...")
 
                     # 订阅 logs
@@ -195,12 +192,15 @@ class HunterAgentController:
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    f"{HELIUS_RPC_URL}",  # 使用 RPC 接口或 API 接口
+                    helius_key_pool.get_rpc_url(),
                     json={"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
                           "params": [signature, {"maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}]},
                     timeout=10
                 )
-                if resp.status_code != 200: return
+                if resp.status_code == 429 and helius_key_pool.size > 1:
+                    helius_key_pool.mark_current_failed()
+                if resp.status_code != 200:
+                    return
                 data = resp.json()
                 if "result" not in data or not data["result"]: return
                 tx = data["result"]
@@ -354,7 +354,9 @@ class HunterAgentController:
                         {"encoding": "jsonParsed"}
                     ]
                 }
-                resp = await client.post(HELIUS_RPC_URL, json=payload, timeout=5)
+                resp = await client.post(helius_key_pool.get_rpc_url(), json=payload, timeout=5)
+                if resp.status_code == 429 and helius_key_pool.size > 1:
+                    helius_key_pool.mark_current_failed()
                 data = resp.json()
 
                 if "result" in data and data["result"]["value"]:
