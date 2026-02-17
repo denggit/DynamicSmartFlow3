@@ -5,10 +5,9 @@
 @Author  : Zijun Deng
 @Date    : 2/16/2026
 @File    : sm_searcher.py
-@Description: Smart Money Searcher V4 - 严选版
-              1. 时间窗口放宽：5s - 15m
-              2. 评分逻辑优化：引入总盈亏(PnL)判定，防止误杀低胜率大神
-              3. 持仓处理：对小额未卖出订单更宽容
+@Description: Smart Money Searcher V5.1 - Hybrid Model
+              1. 筛选标准：回归 V4 (盈利优先)
+              2. 评分系统：应用 V5 (胜率/时机/亏损) 用于后续优胜劣汰
 """
 
 import asyncio
@@ -107,9 +106,9 @@ class SmartMoneySearcher:
         self.rpc_url = f"https://mainnet.helius-rpc.com/?api-key={self.api_key}"
         self.base_api_url = "https://api.helius.xyz/v0"
 
-        # --- 宽松后的初筛参数 ---
-        self.min_delay_sec = 5  # 从30s降到5s，放过手快的人类
-        self.max_delay_sec = 900  # 15分钟
+        # --- 参数配置 ---
+        self.min_delay_sec = 5  # 最小延迟
+        self.max_delay_sec = 900  # 最大延迟
 
         self.audit_tx_limit = 500
         self.target_project_count = 10
@@ -145,11 +144,8 @@ class SmartMoneySearcher:
 
     async def analyze_hunter_performance(self, client, hunter_address):
         """
-        [深度审计 - 宽松版]
-        逻辑调整：
-        1. 计算 Total Profit (总盈亏)
-        2. 计算 Profit Factor (总赚 / 总亏)
-        3. 只要 总赚 > 总亏，哪怕胜率低也通过
+        [深度审计]
+        返回: win_rate, worst_roi, total_profit
         """
         sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
         if not sigs: return None
@@ -160,7 +156,6 @@ class SmartMoneySearcher:
         calc = TokenAttributionCalculator()
         projects = defaultdict(lambda: {"buy_sol": 0.0, "sell_sol": 0.0, "tokens": 0.0})
 
-        # 内存重建账本
         txs.sort(key=lambda x: x.get('timestamp', 0))
         for tx in txs:
             try:
@@ -175,49 +170,33 @@ class SmartMoneySearcher:
             except:
                 continue
 
-        # 统计战绩
         valid_projects = []
         for mint, data in projects.items():
-            # 过滤超小额 (少于 0.05 SOL 的可能只是测试或粉尘)
             if data["buy_sol"] > 0.05:
-                # 宽松逻辑：如果卖出为0，且买入成本也很低(< 0.1)，可能是彩票，不计入亏损
-                # 但如果买了很多没卖，就是亏损
-
                 net_profit = data["sell_sol"] - data["buy_sol"]
                 roi = (net_profit / data["buy_sol"]) * 100
-
-                # 状态标记
-                is_settled = data["sell_sol"] > 0.001
-
                 valid_projects.append({
                     "profit": net_profit,
                     "roi": roi,
                     "cost": data["buy_sol"],
-                    "revenue": data["sell_sol"],
-                    "is_settled": is_settled
                 })
 
         if not valid_projects: return None
 
-        # 取最近 10-15 个项目
-        recent_projects = valid_projects[-15:]  # 列表已经是按时间构建的，取最后即最近
+        recent_projects = valid_projects[-15:]
 
-        total_revenue = sum(p["revenue"] for p in recent_projects)
-        total_cost = sum(p["cost"] for p in recent_projects)
-        total_net_profit = total_revenue - total_cost
-
-        # 胜率计算 (只算已结清的或者是大亏的)
-        # 宽松定义：赚了就是赢
+        total_profit = sum(p["profit"] for p in recent_projects)
         wins = [p for p in recent_projects if p["profit"] > 0]
         win_rate = len(wins) / len(recent_projects)
 
-        avg_roi = sum(p["roi"] for p in recent_projects) / len(recent_projects)
+        # 计算 Worst ROI (最大亏损代理)
+        worst_roi = min([p["roi"] for p in recent_projects]) if recent_projects else 0
+        worst_roi = max(-100, worst_roi)  # Cap at -100%
 
         return {
             "win_rate": win_rate,
-            "avg_roi": avg_roi,
-            "total_profit": total_net_profit,
-            "total_cost": total_cost,
+            "worst_roi": worst_roi,
+            "total_profit": total_profit,
             "count": len(recent_projects)
         }
 
@@ -239,10 +218,9 @@ class SmartMoneySearcher:
                 block_time = tx.get('timestamp', 0)
                 delay = block_time - start_time
 
-                if delay < self.min_delay_sec: continue  # 过滤 <5s 的顶级Bot
+                if delay < self.min_delay_sec: continue
                 if delay > self.max_delay_sec: break
 
-                # 简单识别买家
                 spender = None
                 max_spend = 0
                 for nt in tx.get('nativeTransfers', []):
@@ -254,7 +232,6 @@ class SmartMoneySearcher:
                 if not spender or spender in seen_buyers: continue
                 spend_sol = max_spend / 1e9
 
-                # 范围放宽：0.1 SOL - 50 SOL
                 if 0.1 <= spend_sol <= 50.0:
                     seen_buyers.add(spender)
                     hunters_candidates.append({
@@ -263,52 +240,60 @@ class SmartMoneySearcher:
                         "cost": spend_sol
                     })
 
-            logger.info(f"  [初筛] 发现 {len(hunters_candidates)} 个候选人 (Delay > {self.min_delay_sec}s)")
+            logger.info(f"  [初筛] 发现 {len(hunters_candidates)} 个候选人")
 
-            # 3. 深度审计
+            # 3. 深度审计 & 评分
             verified_hunters = []
             for candidate in hunters_candidates:
                 addr = candidate["address"]
                 stats = await self.analyze_hunter_performance(client, addr)
 
                 if stats:
-                    # === 核心筛选逻辑 (V4 严选版) ===
+                    # === 评分计算 (仅作为 Tag，不作为 Filter) ===
+                    # 1. Hit Rate Score (30%)
+                    score_hit_rate = stats["win_rate"]
+
+                    # 2. Entry Score (40%)
+                    delay = candidate["entry_delay"]
+                    score_entry = max(0, 1 - (delay / self.max_delay_sec))
+
+                    # 3. Drawdown Score (30%)
+                    score_drawdown = 1 - abs(stats["worst_roi"] / 100)
+                    score_drawdown = max(0, min(1, score_drawdown))
+
+                    final_score = (score_hit_rate * 30) + (score_entry * 40) + (score_drawdown * 30)
+                    final_score = round(final_score, 1)
+
+                    # === 准入逻辑 (回归 V4) ===
                     is_qualified = False
 
-                    # 硬指标：总账必须是赚钱的！(排除掉那些赢小输大的)
-                    if stats["total_profit"] > 0.1:  # 至少赚了 0.1 SOL (排除粉尘干扰)
-
-                        # 在赚钱的前提下，再看风格：
-
-                        # 风格 A: 稳健型 (胜率尚可，且没有大亏过)
+                    # 基础线：总账必须赚钱
+                    if stats["total_profit"] > 0.1:
+                        # 路径 A: 胜率及格 (稳健)
                         if stats["win_rate"] >= 0.4:
                             is_qualified = True
-
-                        # 风格 B: 暴击型 (胜率低没关系，只要总利润够高，说明抓住了大金狗)
-                        # 例如：胜率 20%，但总赚 5 SOL，说明盈亏比极高
+                        # 路径 B: 暴击大赚 (赔率)
                         elif stats["total_profit"] >= 2.0:
                             is_qualified = True
 
-                    # 只有合格的才录入
                     if is_qualified:
-                        score = stats["total_profit"] * 20 + stats["win_rate"] * 50
                         candidate.update({
-                            "score": round(score, 1),
+                            "score": final_score,  # 存下分数，方便以后排序替换
                             "win_rate": f"{stats['win_rate']:.1%}",
-                            "avg_roi": f"{stats['avg_roi']:.1f}%",
+                            "worst_roi": f"{stats['worst_roi']:.1f}%",
                             "total_profit": f"{stats['total_profit']:.2f} SOL",
-                            "history_count": stats["count"]
+                            "scores_detail": f"H:{score_hit_rate:.2f}/E:{score_entry:.2f}/D:{score_drawdown:.2f}"
                         })
                         verified_hunters.append(candidate)
                         logger.info(
-                            f"    ✅ 锁定猎手 {addr[:6]}.. | 利润: {candidate['total_profit']} | 胜率: {candidate['win_rate']}")
+                            f"    ✅ 锁定猎手 {addr[:6]}.. | 利润: {candidate['total_profit']} | 评分: {final_score}")
 
-                await asyncio.sleep(0.2)  # 稍微快一点
+                await asyncio.sleep(0.2)
 
             return verified_hunters
 
     async def run_pipeline(self, dex_scanner_instance):
-        logger.info("启动 Alpha 猎手挖掘 (V4 严选版)...")
+        logger.info("启动 Alpha 猎手挖掘 (V5.1 混合版)...")
         hot_tokens = await dex_scanner_instance.scan()
         all_hunters = []
 
@@ -322,6 +307,7 @@ class SmartMoneySearcher:
                     all_hunters.extend(hunters)
                 await asyncio.sleep(1)
 
+        # 最终按分数排序，方便你手动或自动做替换
         all_hunters.sort(key=lambda x: x.get('score', 0), reverse=True)
         return all_hunters
 
