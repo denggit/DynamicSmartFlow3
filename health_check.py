@@ -184,7 +184,9 @@ def check_network():
         with urllib.request.urlopen(req, timeout=8) as _:
             print(f"  {OK} Jupiter Quote 可达")
     except urllib.error.HTTPError as e:
-        if e.code == 401 and not first_jup:
+        if e.code == 400:
+            print(f"  {OK} Jupiter Quote 可达 (API 返回 400 为参数/规则限制，说明服务正常)")
+        elif e.code == 401 and not first_jup:
             print(f"  {WARN} Jupiter Quote 返回 401，请配置 JUP_API_KEY 后重试")
         else:
             print(f"  {FAIL} Jupiter Quote HTTP {e.code}")
