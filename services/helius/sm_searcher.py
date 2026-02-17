@@ -3,32 +3,39 @@
 
 """
 @Author  : Zijun Deng
-@Date    : 2/16/2026
+@Date    : 2/17/2026
 @File    : sm_searcher.py
-@Description: Smart Money Searcher V5.1 - Hybrid Model
-              1. 筛选标准：回归 V4 (盈利优先)
-              2. 评分系统：应用 V5 (胜率/时机/亏损) 用于后续优胜劣汰
+@Description: Smart Money Searcher V6 - Golden Window Edition
+              1. [策略调整] 放弃挖掘老币，只挖掘上市 15分钟 - 3小时 的代币
+              2. [成本控制] 因为币比较新，回溯翻页次数极少 (通常<5次)，大幅节省 API
+              3. [去重逻辑] 保持 scanned_tokens.json 避免重复劳动
 """
 
 import asyncio
 import logging
+import json
+import os
+import time
 from collections import defaultdict
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Optional, Set
 
 import httpx
 
-# 导入配置
 from config.settings import HELIUS_API_KEY
 
-# 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
 
-# === 轻量级交易解析器 ===
+# === 核心策略参数 ===
+MIN_TOKEN_AGE_SEC = 900  # 最少上市 15分钟 (排除纯土狗/貔貅)
+MAX_TOKEN_AGE_SEC = 10800  # 最多上市 3小时 (太老的币数据太深，不挖了)
+MAX_BACKTRACK_PAGES = 10  # 最多回溯10页 (1万笔交易)，对于3小时内的币通常足够
+
 
 class TransactionParser:
     def __init__(self, target_wallet: str):
@@ -41,14 +48,12 @@ class TransactionParser:
         wsol_change = 0.0
         token_changes = defaultdict(float)
 
-        # 1. Native SOL
         for nt in tx.get('nativeTransfers', []):
             if nt.get('fromUserAccount') == self.target_wallet:
                 native_sol_change -= nt.get('amount', 0) / 1e9
             if nt.get('toUserAccount') == self.target_wallet:
                 native_sol_change += nt.get('amount', 0) / 1e9
 
-        # 2. Token & WSOL
         for tt in tx.get('tokenTransfers', []):
             mint = tt.get('mint', '')
             amt = tt.get('tokenAmount', 0)
@@ -63,7 +68,6 @@ class TransactionParser:
                 if tt.get('toUserAccount') == self.target_wallet:
                     token_changes[mint] += amt
 
-        # 3. Merge
         sol_change = 0.0
         if abs(native_sol_change) < 1e-9:
             sol_change = wsol_change
@@ -85,12 +89,12 @@ class TokenAttributionCalculator:
         buys = {m: a for m, a in token_changes.items() if a > 0}
         sells = {m: abs(a) for m, a in token_changes.items() if a < 0}
 
-        if sol_change < 0:  # Buy
+        if sol_change < 0:
             total = sum(buys.values())
             if total > 0:
                 cost_per = abs(sol_change) / total
                 for m, a in buys.items(): buy_attrs[m] = cost_per * a
-        elif sol_change > 0:  # Sell
+        elif sol_change > 0:
             total = sum(sells.values())
             if total > 0:
                 gain_per = sol_change / total
@@ -98,20 +102,42 @@ class TokenAttributionCalculator:
         return buy_attrs, sell_attrs
 
 
-# === 主逻辑 ===
-
 class SmartMoneySearcher:
     def __init__(self):
         self.api_key = HELIUS_API_KEY
         self.rpc_url = f"https://mainnet.helius-rpc.com/?api-key={self.api_key}"
         self.base_api_url = "https://api.helius.xyz/v0"
 
-        # --- 参数配置 ---
-        self.min_delay_sec = 5  # 最小延迟
-        self.max_delay_sec = 900  # 最大延迟
-
+        # 初筛参数
+        self.min_delay_sec = 5
+        self.max_delay_sec = 900  # 15分钟
         self.audit_tx_limit = 500
-        self.target_project_count = 10
+
+        self.scanned_tokens: Set[str] = set()
+        self._load_scanned_history()
+
+    def _ensure_data_dir(self):
+        if not os.path.exists("data"):
+            os.makedirs("data")
+
+    def _load_scanned_history(self):
+        self._ensure_data_dir()
+        if os.path.exists(SCANNED_HISTORY_FILE):
+            try:
+                with open(SCANNED_HISTORY_FILE, 'r') as f:
+                    self.scanned_tokens = set(json.load(f))
+                logger.info(f"📂 已加载 {len(self.scanned_tokens)} 个历史扫描代币记录")
+            except Exception as e:
+                logger.warning(f"⚠️ 加载扫描历史失败: {e}")
+
+    def _save_scanned_token(self, token_address: str):
+        if token_address in self.scanned_tokens: return
+        self.scanned_tokens.add(token_address)
+        try:
+            with open(SCANNED_HISTORY_FILE, 'w') as f:
+                json.dump(list(self.scanned_tokens), f)
+        except Exception:
+            pass
 
     async def _rpc_post(self, client, method, params):
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -120,11 +146,14 @@ class SmartMoneySearcher:
             if resp.status_code == 200:
                 return resp.json().get("result")
         except Exception as e:
-            logger.error(f"RPC {method} failed: {e}")
+            logger.exception(f"RPC {method} failed: {e}")
         return None
 
-    async def get_signatures(self, client, address, limit=100):
-        return await self._rpc_post(client, "getSignaturesForAddress", [address, {"limit": limit}])
+    async def get_signatures(self, client, address, limit=100, before=None):
+        params = [address, {"limit": limit}]
+        if before:
+            params[1]["before"] = before
+        return await self._rpc_post(client, "getSignaturesForAddress", params)
 
     async def fetch_parsed_transactions(self, client, signatures):
         if not signatures: return []
@@ -138,15 +167,11 @@ class SmartMoneySearcher:
                 resp = await client.post(url, json=payload, timeout=30.0)
                 if resp.status_code == 200:
                     all_txs.extend(resp.json())
-            except Exception as e:
-                logger.warning(f"Parse tx batch failed: {e}")
+            except Exception:
+                pass
         return all_txs
 
-    async def analyze_hunter_performance(self, client, hunter_address):
-        """
-        [深度审计]
-        返回: win_rate, worst_roi, total_profit
-        """
+    async def analyze_hunter_performance(self, client, hunter_address, exclude_token=None):
         sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
         if not sigs: return None
         txs = await self.fetch_parsed_transactions(client, sigs)
@@ -163,6 +188,7 @@ class SmartMoneySearcher:
                 if not token_changes: continue
                 buy_attrs, sell_attrs = calc.calculate_attribution(sol_change, token_changes)
                 for mint, delta in token_changes.items():
+                    if exclude_token and mint == exclude_token: continue
                     if abs(delta) < 1e-9: continue
                     projects[mint]["tokens"] += delta
                     if mint in buy_attrs: projects[mint]["buy_sol"] += buy_attrs[mint]
@@ -175,51 +201,97 @@ class SmartMoneySearcher:
             if data["buy_sol"] > 0.05:
                 net_profit = data["sell_sol"] - data["buy_sol"]
                 roi = (net_profit / data["buy_sol"]) * 100
-                valid_projects.append({
-                    "profit": net_profit,
-                    "roi": roi,
-                    "cost": data["buy_sol"],
-                })
+                valid_projects.append({"profit": net_profit, "roi": roi, "cost": data["buy_sol"]})
 
         if not valid_projects: return None
 
-        recent_projects = valid_projects[-15:]
+        recent = valid_projects[-15:]
+        total_profit = sum(p["profit"] for p in recent)
+        wins = [p for p in recent if p["profit"] > 0]
+        win_rate = len(wins) / len(recent)
+        worst_roi = max(-100, min([p["roi"] for p in recent])) if recent else 0
 
-        total_profit = sum(p["profit"] for p in recent_projects)
-        wins = [p for p in recent_projects if p["profit"] > 0]
-        win_rate = len(wins) / len(recent_projects)
+        return {"win_rate": win_rate, "worst_roi": worst_roi, "total_profit": total_profit, "count": len(recent)}
 
-        # 计算 Worst ROI (最大亏损代理)
-        worst_roi = min([p["roi"] for p in recent_projects]) if recent_projects else 0
-        worst_roi = max(-100, worst_roi)  # Cap at -100%
+    async def verify_token_age_via_dexscreener(self, client, token_address):
+        """返回: (is_valid_window, start_time, reason)"""
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+        try:
+            resp = await client.get(url, timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                pairs = data.get('pairs', [])
+                if not pairs: return False, 0, "No Pairs"
 
-        return {
-            "win_rate": win_rate,
-            "worst_roi": worst_roi,
-            "total_profit": total_profit,
-            "count": len(recent_projects)
-        }
+                created_at_ms = min([p.get('pairCreatedAt', float('inf')) for p in pairs])
+                if created_at_ms == float('inf'): return False, 0, "No Creation Time"
+
+                created_at_sec = created_at_ms / 1000
+                age = time.time() - created_at_sec
+
+                if age < MIN_TOKEN_AGE_SEC:
+                    return False, created_at_sec, f"Too Young ({age / 60:.1f}m)"
+                if age > MAX_TOKEN_AGE_SEC:
+                    return False, created_at_sec, f"Too Old ({age / 3600:.1f}h)"
+
+                return True, created_at_sec, "OK"
+            else:
+                return False, 0, "API Error"
+        except:
+            return False, 0, "Exception"
 
     async def search_alpha_hunters(self, token_address):
-        hunters_candidates = []
+        if token_address in self.scanned_tokens: return []
 
         async with httpx.AsyncClient() as client:
-            # 1. 找早期买家
-            sigs = await self.get_signatures(client, token_address, limit=100)
-            if not sigs: return []
-            sigs.sort(key=lambda x: x.get('blockTime', 0))
-            if not sigs: return []
-            start_time = sigs[0].get('blockTime')
-            txs = await self.fetch_parsed_transactions(client, sigs)
+            # 1. 严格的年龄检查 (15m - 3h)
+            is_valid, start_time, reason = await self.verify_token_age_via_dexscreener(client, token_address)
+            if not is_valid:
+                logger.info(f"⏭️ 跳过代币 {token_address}: {reason}")
+                return []
 
-            # 2. 初筛
+            logger.info(f"🔍 锁定黄金窗口代币 (年龄 {time.time() - start_time:.0f}s)，开始高效回溯...")
+
+            # 2. 回溯翻页 (因为只挖3小时内的币，翻页压力很小)
+            target_time_window = start_time + self.max_delay_sec
+            current_before = None
+            found_early_txs = []
+
+            for page in range(MAX_BACKTRACK_PAGES):
+                sigs = await self.get_signatures(client, token_address, limit=1000, before=current_before)
+                if not sigs: break
+
+                batch_oldest = sigs[-1].get('blockTime', 0)
+                current_before = sigs[-1]['signature']
+
+                if batch_oldest <= target_time_window:
+                    logger.info(f"  🎯 第{page + 1}页触达开盘区间")
+                    for s in sigs:
+                        t = s.get('blockTime', 0)
+                        if start_time <= t <= target_time_window:
+                            found_early_txs.append(s)
+                    break
+                else:
+                    logger.info(
+                        f"  📖 第{page + 1}页 (时间: {time.strftime('%H:%M', time.gmtime(batch_oldest))}) -> 继续回溯")
+
+            if not found_early_txs:
+                logger.warning(f"⚠️ 翻了{MAX_BACKTRACK_PAGES}页未触底，放弃")
+                self._save_scanned_token(token_address)
+                return []
+
+            # 3. 解析交易 (同前)
+            found_early_txs.sort(key=lambda x: x.get('blockTime', 0))
+            target_txs = found_early_txs[:100]
+            txs = await self.fetch_parsed_transactions(client, target_txs)
+
+            hunters_candidates = []
             seen_buyers = set()
+
             for tx in txs:
                 block_time = tx.get('timestamp', 0)
                 delay = block_time - start_time
-
                 if delay < self.min_delay_sec: continue
-                if delay > self.max_delay_sec: break
 
                 spender = None
                 max_spend = 0
@@ -231,54 +303,38 @@ class SmartMoneySearcher:
 
                 if not spender or spender in seen_buyers: continue
                 spend_sol = max_spend / 1e9
-
                 if 0.1 <= spend_sol <= 50.0:
                     seen_buyers.add(spender)
-                    hunters_candidates.append({
-                        "address": spender,
-                        "entry_delay": delay,
-                        "cost": spend_sol
-                    })
+                    hunters_candidates.append({"address": spender, "entry_delay": delay, "cost": spend_sol})
 
             logger.info(f"  [初筛] 发现 {len(hunters_candidates)} 个候选人")
 
-            # 3. 深度审计 & 评分
+            # 4. 深度审计
             verified_hunters = []
             for candidate in hunters_candidates:
                 addr = candidate["address"]
-                stats = await self.analyze_hunter_performance(client, addr)
+                stats = await self.analyze_hunter_performance(client, addr, exclude_token=token_address)
 
                 if stats:
-                    # === 评分计算 (仅作为 Tag，不作为 Filter) ===
-                    # 1. Hit Rate Score (30%)
                     score_hit_rate = stats["win_rate"]
-
-                    # 2. Entry Score (40%)
                     delay = candidate["entry_delay"]
                     score_entry = max(0, 1 - (delay / self.max_delay_sec))
-
-                    # 3. Drawdown Score (30%)
                     score_drawdown = 1 - abs(stats["worst_roi"] / 100)
                     score_drawdown = max(0, min(1, score_drawdown))
 
                     final_score = (score_hit_rate * 30) + (score_entry * 40) + (score_drawdown * 30)
                     final_score = round(final_score, 1)
 
-                    # === 准入逻辑 (回归 V4) ===
                     is_qualified = False
-
-                    # 基础线：总账必须赚钱
                     if stats["total_profit"] > 0.1:
-                        # 路径 A: 胜率及格 (稳健)
                         if stats["win_rate"] >= 0.4:
                             is_qualified = True
-                        # 路径 B: 暴击大赚 (赔率)
                         elif stats["total_profit"] >= 2.0:
                             is_qualified = True
 
                     if is_qualified:
                         candidate.update({
-                            "score": final_score,  # 存下分数，方便以后排序替换
+                            "score": final_score,
                             "win_rate": f"{stats['win_rate']:.1%}",
                             "worst_roi": f"{stats['worst_roi']:.1f}%",
                             "total_profit": f"{stats['total_profit']:.2f} SOL",
@@ -286,28 +342,28 @@ class SmartMoneySearcher:
                         })
                         verified_hunters.append(candidate)
                         logger.info(
-                            f"    ✅ 锁定猎手 {addr[:6]}.. | 利润: {candidate['total_profit']} | 评分: {final_score}")
-
+                            f"    ✅ 锁定猎手 {addr}.. | 利润: {candidate['total_profit']} | 评分: {final_score}")
                 await asyncio.sleep(0.2)
 
+            self._save_scanned_token(token_address)
             return verified_hunters
 
     async def run_pipeline(self, dex_scanner_instance):
-        logger.info("启动 Alpha 猎手挖掘 (V5.1 混合版)...")
+        logger.info("启动 Alpha 猎手挖掘 (V6 黄金窗口版)...")
         hot_tokens = await dex_scanner_instance.scan()
         all_hunters = []
-
         if hot_tokens:
             for token in hot_tokens:
                 addr = token.get('address')
                 sym = token.get('symbol')
+                if addr in self.scanned_tokens: continue
                 logger.info(f"=== 正在挖掘: {sym} ===")
-                hunters = await self.search_alpha_hunters(addr)
-                if hunters:
-                    all_hunters.extend(hunters)
+                try:
+                    hunters = await self.search_alpha_hunters(addr)
+                    if hunters: all_hunters.extend(hunters)
+                except Exception as e:
+                    logger.error(f"❌ 挖掘代币 {sym} 出错: {e}")
                 await asyncio.sleep(1)
-
-        # 最终按分数排序，方便你手动或自动做替换
         all_hunters.sort(key=lambda x: x.get('score', 0), reverse=True)
         return all_hunters
 
@@ -320,10 +376,8 @@ if __name__ == "__main__":
         searcher = SmartMoneySearcher()
         mock_scanner = DexScanner()
         results = await searcher.run_pipeline(mock_scanner)
-
         print(f"\n====== 最终挖掘结果 ({len(results)}) ======")
-        for res in results:
-            print(res)
+        for res in results: print(res)
 
 
     asyncio.run(main())

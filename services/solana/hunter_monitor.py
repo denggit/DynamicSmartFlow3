@@ -32,7 +32,7 @@ logger = logging.getLogger("HunterMonitor")
 # 常量配置
 HUNTER_DATA_FILE = "data/hunters.json"
 HUNTER_DATA_BACKUP = "data/hunters_backup.json"
-DISCOVERY_INTERVAL = 600  # 挖掘间隔 10分钟
+DISCOVERY_INTERVAL = 900  # 挖掘间隔 15分钟
 MAINTENANCE_INTERVAL = 86400  # 维护间隔 1天 (大幅降低频率)
 POOL_SIZE_LIMIT = 50  # 地址库上限
 ZOMBIE_THRESHOLD = 86400 * 10  # 10天不交易视为僵尸 (清理标准)
