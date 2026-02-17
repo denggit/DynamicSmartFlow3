@@ -141,12 +141,46 @@ class SmartMoneySearcher:
 
     async def _rpc_post(self, client, method, params):
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        try:
-            resp = await client.post(self.rpc_url, json=payload, timeout=10.0)
-            if resp.status_code == 200:
-                return resp.json().get("result")
-        except Exception as e:
-            logger.exception(f"RPC {method} failed: {e}")
+
+        # === [新增] 重试机制 (最多试 3 次) ===
+        max_retries = 3
+        base_delay = 1.0
+
+        for attempt in range(max_retries):
+            try:
+                # [优化] 增加 timeout 到 30秒，防止深翻页时超时
+                resp = await client.post(self.rpc_url, json=payload, timeout=30.0)
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if "result" in data:
+                        return data["result"]
+                    elif "error" in data:
+                        # 如果是限流错误 (429)，记录并重试
+                        err_msg = data.get("error", {}).get("message", "")
+                        if "Rate limit" in err_msg or "429" in str(resp.status_code):
+                            logger.warning(f"⚠️ RPC 限流 (尝试 {attempt + 1}/{max_retries}): {err_msg}")
+                        else:
+                            # 其他业务错误直接返回 None
+                            # logger.warning(f"RPC 业务错误: {err_msg}")
+                            return None
+                elif resp.status_code == 429:
+                    logger.warning(f"⚠️ RPC HTTP 429 限流 (尝试 {attempt + 1}/{max_retries})")
+                else:
+                    logger.warning(f"RPC 请求失败: {resp.status_code}")
+
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                logger.warning(f"⚠️ RPC 网络波动 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
+            except Exception as e:
+                logger.error(f"❌ RPC 未知错误: {e}")
+                return None
+
+            # 指数退避：每次失败多睡一会儿 (1s -> 2s -> 4s)
+            if attempt < max_retries - 1:
+                sleep_time = base_delay * (2 ** attempt)
+                await asyncio.sleep(sleep_time)
+
+        logger.error(f"❌ RPC {method} 最终失败，已重试 {max_retries} 次")
         return None
 
     async def get_signatures(self, client, address, limit=100, before=None):
