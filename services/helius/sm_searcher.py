@@ -12,12 +12,12 @@
 """
 
 import asyncio
-import logging
 import json
+import logging
 import os
 import time
 from collections import defaultdict
-from typing import Dict, Tuple, List, Optional, Set
+from typing import Dict, Tuple, Set
 
 import httpx
 

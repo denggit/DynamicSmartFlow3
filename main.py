@@ -8,11 +8,12 @@
 """
 import asyncio
 import logging
-from services.solana.hunter_monitor import HunterMonitorController
-from services.solana.hunter_agent import HunterAgentController
-from services.solana.trader import SolanaTrader
-from services.dexscreener.dex_scanner import DexScanner
+
 from config.settings import PNL_CHECK_INTERVAL, HUNTER_ADD_THRESHOLD_SOL
+from services.dexscreener.dex_scanner import DexScanner
+from services.solana.hunter_agent import HunterAgentController
+from services.solana.hunter_monitor import HunterMonitorController
+from services.solana.trader import SolanaTrader
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(message)s')
 logger = logging.getLogger("Main")
@@ -67,8 +68,19 @@ async def on_agent_signal(signal):
     elif msg_type == 'HUNTER_BUY':
         # 判断加仓量
         # Agent 发来的 add_amount 是 Token 数量
-        add_token_amount = signal['add_amount']
-        add_sol_value = add_token_amount * price
+        add_amount_raw = signal['add_amount_raw']
+
+        # 我们需要 decimals 才能算出 SOL 价值
+        # 可以从 trader.positions 里拿 (如果我们持仓的话)
+        pos = trader.positions.get(token)
+        if pos:
+            decimals = pos.decimals
+        else:
+            # 如果没持仓(极少见)，需要去查
+            decimals = 6  # 假设
+
+        add_amount_ui = add_amount_raw / (10 ** decimals)
+        add_sol_value = add_amount_ui * price
 
         # 规则: 猎手加仓价值 > 1 SOL 时跟
         if add_sol_value >= HUNTER_ADD_THRESHOLD_SOL:

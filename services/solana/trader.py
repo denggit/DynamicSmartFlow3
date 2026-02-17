@@ -8,20 +8,18 @@
               2. [新增] Jupiter + Helius 真实 Swap 逻辑
 """
 
-import logging
 import asyncio
 import base64
-import json
-import time
+import logging
 from typing import Dict, List, Set, Optional, Tuple
 
 import httpx
-from solders.keypair import Keypair
-from solders.transaction import VersionedTransaction
-from solders.pubkey import Pubkey
 from solana.rpc.async_api import AsyncClient
-from solana.rpc.types import TxOpts
 from solana.rpc.commitment import Confirmed
+from solana.rpc.types import TxOpts
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction
 
 from config.settings import (
     TRADING_MAX_SOL_PER_TOKEN, TRADING_MIN_BUY_SOL, TRADING_ADD_BUY_SOL,
@@ -46,9 +44,10 @@ class VirtualShare:
 
 
 class Position:
-    def __init__(self, token_address: str, entry_price: float):
+    def __init__(self, token_address: str, entry_price: float, decimals: int = 9):
         self.token_address = token_address
         self.average_price = entry_price
+        self.decimals = decimals
         self.total_tokens = 0.0
         self.total_cost_sol = 0.0
         self.shares: Dict[str, VirtualShare] = {}
@@ -83,19 +82,25 @@ class SolanaTrader:
     # 1. 核心交易接口 (逻辑层)
     # ==========================================
 
-    async def execute_entry(self, token_address: str, hunters: List[Dict], total_score: float, current_price: float):
-        # ... (前置检查逻辑不变) ...
+    async def execute_entry(self, token_address: str, hunters: List[Dict], total_score: float, current_price_ui: float):
         if not self.keypair: return
         if token_address in self.positions: return
+
+        # 1. 获取精度 (这是关键)
+        decimals = await self._get_decimals(token_address)
+        # 如果获取失败返回 0，我们强制设为 9 (SOL) 或 6 (USDC)，这里设为 9 更通用
+        if decimals == 0:
+            logger.warning(f"⚠️ 无法获取 {token_address} 精度，默认使用 9")
+            decimals = 9
 
         buy_sol = total_score * TRADING_SCORE_MULTIPLIER
         buy_sol = max(buy_sol, TRADING_MIN_BUY_SOL)
         buy_sol = min(buy_sol, TRADING_MAX_SOL_PER_TOKEN)
 
-        logger.info(f"🚀 [准备开仓] {token_address} | 计划买入: {buy_sol:.3f} SOL")
+        logger.info(f"🚀 [准备开仓] {token_address} | 计划: {buy_sol:.3f} SOL")
 
-        # 使用 Auto 费率
-        tx_sig, token_amount = await self._jupiter_swap(
+        # 2. 执行买入 (返回 Raw Amount)
+        tx_sig, token_amount_raw = await self._jupiter_swap(
             input_mint=WSOL_MINT,
             output_mint=token_address,
             amount_in_ui=buy_sol,
@@ -104,14 +109,25 @@ class SolanaTrader:
 
         if not tx_sig: return
 
-        # ... (后续建仓逻辑不变) ...
-        actual_price = buy_sol / token_amount if token_amount > 0 else current_price
-        pos = Position(token_address, actual_price)
+        # 3. 转换 UI Amount
+        token_amount_ui = token_amount_raw / (10 ** decimals)
+
+        # 计算均价
+        if token_amount_ui > 0:
+            actual_price = buy_sol / token_amount_ui
+        else:
+            actual_price = current_price_ui
+
+        # 4. 建仓 (传入 decimals)
+        pos = Position(token_address, actual_price, decimals)  # <--- 这里传入
         pos.total_cost_sol = buy_sol
-        pos.total_tokens = token_amount
+        pos.total_tokens = token_amount_ui
+
         self.positions[token_address] = pos
+
         self._rebalance_shares_logic(pos, hunters)
-        logger.info(f"✅ 开仓成功: {tx_sig} | 持仓: {token_amount:.2f}")
+        logger.info(f"✅ 开仓成功 | 均价: {actual_price:.6f} SOL | 持仓: {token_amount_ui:.2f}")
+
     async def execute_add_position(self, token_address: str, trigger_hunter: Dict, add_reason: str,
                                    current_price: float):
         """加仓逻辑"""
@@ -130,7 +146,7 @@ class SolanaTrader:
         logger.info(f"➕ [准备加仓] {token_address} | 金额: {buy_sol:.3f} SOL")
 
         # === 真实买入 ===
-        tx_sig, token_got = await self._jupiter_swap(
+        tx_sig, token_got_raw = await self._jupiter_swap(
             input_mint=WSOL_MINT,
             output_mint=token_address,
             amount_in_ui=buy_sol,
@@ -139,18 +155,24 @@ class SolanaTrader:
 
         if not tx_sig: return
 
+        # [关键修复] UI Amount 转换
+        token_got_ui = token_got_raw / (10 ** pos.decimals)
+
         # 更新状态
+        new_total_tokens = pos.total_tokens + token_got_ui
+        pos.average_price = (pos.total_tokens * pos.average_price + buy_sol) / new_total_tokens
+
         pos.total_cost_sol += buy_sol
-        pos.total_tokens += token_got
-        current_value = (pos.total_tokens - token_got) * pos.average_price
+        pos.total_tokens = new_total_tokens
+        current_value = (pos.total_tokens - token_got_ui) * pos.average_price
         pos.average_price = (current_value + buy_sol) / pos.total_tokens
 
         # 份额分配
         hunter_addr = trigger_hunter['address']
         if hunter_addr in pos.shares:
-            pos.shares[hunter_addr].token_amount += token_got
+            pos.shares[hunter_addr].token_amount += token_got_ui
         else:
-            pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), token_got)
+            pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), token_got_ui)
             current_hunters_info = [{"address": h, "score": s.score} for h, s in pos.shares.items()]
             self._rebalance_shares_logic(pos, current_hunters_info)
 
@@ -164,40 +186,40 @@ class SolanaTrader:
         if not share or share.token_amount <= 0: return
 
         actual_ratio = max(sell_ratio, MIN_SELL_RATIO)
-        sell_amount = share.token_amount * actual_ratio
+        sell_amount_ui = share.token_amount * actual_ratio
 
-        remaining = share.token_amount - sell_amount
+        remaining = share.token_amount - sell_amount_ui
         is_dust = False
         if (remaining * current_price) < MIN_SHARE_VALUE_SOL:
-            sell_amount = share.token_amount
+            sell_amount_ui = share.token_amount
             is_dust = True
 
-        logger.info(f"📉 [准备卖出] {token_address} | 数量: {sell_amount:.2f}")
+        logger.info(f"📉 [准备卖出] {token_address} | 数量: {sell_amount_ui:.2f}")
 
         # === 真实卖出 ===
-        tx_sig, _ = await self._jupiter_swap(
+        tx_sig, sol_got_ui = await self._jupiter_swap(
             input_mint=token_address,
             output_mint=WSOL_MINT,
-            amount_in_ui=sell_amount,  # 这里要小心，jupiter 需要整数 amount? 待会处理
+            amount_in_ui=sell_amount_ui,
             slippage_bps=SLIPPAGE_BPS,
-            is_sell=True,  # 标记为卖出，因为 amount 处理不同
-            token_decimals=await self._get_decimals(token_address)  # 需要获取精度
+            is_sell=True,
+            token_decimals=pos.decimals  # 传入正确的精度
         )
 
         if not tx_sig: return
 
-        pos.total_tokens -= sell_amount
-        share.token_amount -= sell_amount
+        pos.total_tokens -= sell_amount_ui
+        share.token_amount -= sell_amount_ui
         if is_dust or share.token_amount <= 0:
             if hunter_addr in pos.shares: del pos.shares[hunter_addr]
 
-    async def check_pnl_and_stop_profit(self, token_address: str, current_price: float):
+    async def check_pnl_and_stop_profit(self, token_address: str, current_price_ui: float):
         """止盈逻辑"""
         if not self.keypair: return
         pos = self.positions.get(token_address)
         if not pos or pos.total_tokens <= 0: return
 
-        pnl_pct = (current_price - pos.average_price) / pos.average_price
+        pnl_pct = (current_price_ui - pos.average_price) / pos.average_price
 
         for level, sell_pct in TAKE_PROFIT_LEVELS:
             if pnl_pct >= level and level not in pos.tp_hit_levels:
@@ -296,6 +318,7 @@ class SolanaTrader:
             except Exception as e:
                 logger.error(f"Swap Exception: {e}")
                 return None, 0
+
     async def _get_decimals(self, mint_address: str) -> int:
         """获取代币精度"""
         # 可以缓存这个结果

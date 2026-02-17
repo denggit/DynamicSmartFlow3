@@ -7,8 +7,9 @@
 @Description: 
 """
 import asyncio
-import httpx
 from datetime import datetime
+
+import httpx
 
 
 class DexScanner:
@@ -44,8 +45,7 @@ class DexScanner:
 
     async def get_token_price(self, token_address: str) -> float:
         """
-        获取代币当前价格 (以 SOL 为单位)
-        注意：这里一定要取 priceNative，而不是 priceUsd
+        获取代币当前价格 (以 SOL 为单位, priceNative)
         """
         url = f"{self.base_url}/latest/dex/tokens/{token_address}"
         async with httpx.AsyncClient() as client:
@@ -55,11 +55,9 @@ class DexScanner:
                     data = response.json()
                     pairs = data.get('pairs', [])
                     if pairs:
-                        # 取流动性最大的池子
-                        best_pair = max(pairs, key=lambda x: x.get('liquidity', {}).get('usd', 0))
-
-                        # === 关键修正 ===
-                        # priceNative 表示 1 Token = 多少 SOL
+                        # 找流动性最好的池子
+                        best_pair = max(pairs, key=lambda x: float(x.get('liquidity', {}).get('usd', 0) or 0))
+                        # priceNative: 1 Token = ? SOL
                         return float(best_pair.get('priceNative', 0))
             except Exception as e:
                 print(f"Error fetching price for {token_address}: {e}")

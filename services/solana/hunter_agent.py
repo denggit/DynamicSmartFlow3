@@ -21,7 +21,6 @@ from typing import Dict, List, Callable, Optional
 
 import httpx
 import websockets
-from websockets.exceptions import ConnectionClosed
 
 from config.settings import HELIUS_API_KEY
 from services.helius.sm_searcher import TransactionParser
@@ -333,7 +332,7 @@ class HunterAgentController:
                     "type": "HUNTER_BUY",
                     "token": token,
                     "hunter": hunter,
-                    "add_amount": delta,
+                    "add_amount_raw": delta,
                     "new_balance": new_bal,
                     "timestamp": timestamp
                 }
