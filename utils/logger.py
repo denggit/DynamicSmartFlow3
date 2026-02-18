@@ -12,6 +12,7 @@
 """
 
 import logging
+import sys
 import threading
 import time
 from datetime import date
@@ -198,16 +199,24 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     if not logger.handlers and name not in _logger_handlers:
         logger.setLevel(level)
         _logger_handlers[name] = True
-        file_name = _logger_name_to_file_name(name)
-        handler = DateDirFileHandler(file_name, LOGS_ROOT)
-        handler.setLevel(level)
         formatter = logging.Formatter(
             "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-        handler.setFormatter(formatter)
         logger.propagate = False
-        logger.addHandler(handler)
+
+        # 文件：按日期目录写入
+        file_name = _logger_name_to_file_name(name)
+        file_handler = DateDirFileHandler(file_name, LOGS_ROOT)
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+        # 控制台：同时输出到命令行
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setLevel(level)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
         # 关键业务模块：ERROR/exception 写入缓冲区，每 1 小时发一封整合邮件
         if name in _CRITICAL_LOGGER_NAMES:
