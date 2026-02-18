@@ -20,6 +20,7 @@ from typing import Dict, List, Callable, Optional
 
 import httpx
 import websockets
+from websockets.exceptions import InvalidStatusCode
 
 from config.settings import helius_key_pool
 from services.helius.sm_searcher import TransactionParser
@@ -177,6 +178,13 @@ class HunterAgentController:
                                 logger.info("🔄 监控列表变动，重启 WebSocket...")
                                 break
 
+            except InvalidStatusCode as e:
+                if e.status_code == 429:
+                    helius_key_pool.mark_current_failed()
+                    logger.warning("⚠️ Helius WebSocket 429 限流，已切换 Key，5 秒后重试")
+                else:
+                    logger.exception("❌ WS 连接被拒绝: HTTP %s", e.status_code)
+                await asyncio.sleep(5)
             except Exception:
                 logger.exception("❌ Agent 监控异常，5秒后重试")
                 await asyncio.sleep(5)

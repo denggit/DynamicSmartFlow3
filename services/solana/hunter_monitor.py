@@ -18,6 +18,7 @@ from collections import defaultdict
 from typing import Dict, List, Callable, Optional
 
 import websockets
+from websockets.exceptions import InvalidStatusCode
 
 # 导入配置和依赖模块
 from config.settings import helius_key_pool
@@ -193,6 +194,13 @@ class HunterMonitorController:
                             if set(self.storage.get_monitored_addresses()) != set(monitored_addrs):
                                 break
 
+            except InvalidStatusCode as e:
+                if e.status_code == 429:
+                    helius_key_pool.mark_current_failed()
+                    logger.warning("⚠️ Helius WebSocket 429 限流，已切换 Key，5 秒后重试")
+                else:
+                    logger.exception("⚠️ WS 连接被拒绝: HTTP %s", e.status_code)
+                await asyncio.sleep(5)
             except Exception:
                 logger.exception("⚠️ WS 重连异常")
                 await asyncio.sleep(5)
