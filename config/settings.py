@@ -110,6 +110,9 @@ TRADING_SCORE_MULTIPLIER = 0.001  # 总分 * 倍数 = 买入SOL
 # 猎手加仓跟随阈值
 HUNTER_ADD_THRESHOLD_SOL = 1.0  # 猎手加仓超过 1 SOL 我们才跟
 
+# 止损：亏损超过此比例直接全仓清仓
+STOP_LOSS_PCT = 0.5  # 亏损 50% 止损
+
 # 止盈策略 (触发倍数, 卖出比例)
 # 1.5 = 收益率 150% (即 2.5倍)
 TAKE_PROFIT_LEVELS = [

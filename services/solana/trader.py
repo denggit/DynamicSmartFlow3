@@ -27,7 +27,7 @@ from solders.transaction import VersionedTransaction
 
 from config.settings import (
     TRADING_MAX_SOL_PER_TOKEN, TRADING_MIN_BUY_SOL, TRADING_ADD_BUY_SOL,
-    TRADING_SCORE_MULTIPLIER, TAKE_PROFIT_LEVELS,
+    TRADING_SCORE_MULTIPLIER, TAKE_PROFIT_LEVELS, STOP_LOSS_PCT,
     MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD,
     SOLANA_PRIVATE_KEY_BASE58,
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS,
@@ -305,7 +305,7 @@ class SolanaTrader:
         self._save_state_safe()
 
     async def check_pnl_and_stop_profit(self, token_address: str, current_price_ui: float):
-        """止盈逻辑"""
+        """止盈与止损逻辑：亏损超 50% 全仓止损，盈利达标则分批止盈。"""
         if not self.keypair: return
         pos = self.positions.get(token_address)
         if not pos or pos.total_tokens <= 0: return
@@ -314,6 +314,37 @@ class SolanaTrader:
             return
 
         pnl_pct = (current_price_ui - pos.average_price) / pos.average_price
+
+        if pnl_pct <= -STOP_LOSS_PCT:
+            sell_amount = pos.total_tokens
+            logger.info(f"🛑 [止损触发] {token_address} (亏损 {pnl_pct * 100:.0f}%) | 全仓清仓 {sell_amount:.2f}")
+
+            decimals = await self._get_decimals(token_address)
+            tx_sig, sol_received = await self._jupiter_swap(
+                input_mint=token_address,
+                output_mint=WSOL_MINT,
+                amount_in_ui=sell_amount,
+                slippage_bps=SLIPPAGE_BPS,
+                is_sell=True,
+                token_decimals=decimals
+            )
+
+            if tx_sig:
+                cost_this_sell = sell_amount * pos.average_price
+                pnl_sol = sol_received - cost_this_sell
+                pos.trade_records.append({
+                    "ts": time.time(),
+                    "type": "sell",
+                    "sol_spent": 0.0,
+                    "sol_received": sol_received,
+                    "token_amount": sell_amount,
+                    "note": "止损50%",
+                    "pnl_sol": pnl_sol,
+                })
+                self._emit_position_closed(token_address, pos)
+                del self.positions[token_address]
+            self._save_state_safe()
+            return
 
         for level, sell_pct in TAKE_PROFIT_LEVELS:
             if pnl_pct >= level and level not in pos.tp_hit_levels:
