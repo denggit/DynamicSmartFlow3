@@ -206,6 +206,7 @@ class HunterMonitorController:
                     logger.info(f"📤 已发送订阅请求 ({len(monitored_addrs)} 地址)，进入接收循环")
                     # 不等待确认，直接收消息：首条可能是订阅 ack(id=1) 或 logsNotification，主循环里会忽略非 logsNotification
                     sub_was_unconfirmed = True  # 首次收到交易推送时打「订阅已正常」
+                    idle_60s_count = 0  # 连续 60s 无推送次数，用于定期打存活日志
 
                     # 主循环：仅处理 logsNotification，其它消息（如订阅 ack）直接跳过
                     while True:
@@ -216,6 +217,7 @@ class HunterMonitorController:
                                 # 可能是订阅 ack (id=1) 或其它，打一条便于确认连接正常
                                 logger.info("收到 WebSocket 消息: method=%s id=%s", data.get("method"), data.get("id"))
                                 continue
+                            idle_60s_count = 0  # 收到推送，重置空闲计数
                             res = data["params"]["result"]
                             sig = (res.get("value") or {}).get("signature")
                             if not sig:
@@ -228,7 +230,11 @@ class HunterMonitorController:
                             await self.process_transaction_log(res)
                         except asyncio.TimeoutError:
                             await ws.ping()
-                            logger.debug("监控心跳 (60s 内无新消息)")
+                            idle_60s_count += 1
+                            # 每 10 分钟打一条存活日志，便于区分「程序在等」和「程序挂了」
+                            if idle_60s_count >= 10:
+                                logger.info("监控运行中 | 已 %d 分钟无新推送（猎手有交易时会有日志）", idle_60s_count)
+                                idle_60s_count = 0
                             # 检查列表变更
                             if set(self.storage.get_monitored_addresses()) != set(monitored_addrs):
                                 break
