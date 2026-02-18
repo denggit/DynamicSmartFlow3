@@ -11,6 +11,7 @@
 import asyncio
 import base64
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -28,7 +29,7 @@ from solders.transaction import VersionedTransaction
 from config.settings import (
     TRADING_MAX_SOL_PER_TOKEN, TRADING_MIN_BUY_SOL, TRADING_ADD_BUY_SOL,
     TRADING_SCORE_MULTIPLIER, TAKE_PROFIT_LEVELS, STOP_LOSS_PCT,
-    MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD,
+    MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
     SOLANA_PRIVATE_KEY_BASE58,
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS,
     BASE_DIR, helius_key_pool, jup_key_pool,
@@ -130,6 +131,44 @@ class SolanaTrader:
     async def close(self):
         await self.rpc_client.close()
         await self.http_client.aclose()
+
+    async def _fetch_own_token_balance(self, token_mint: str) -> Optional[float]:
+        """
+        获取我方钱包在链上的 Token 余额（UI 单位）。
+        用于卖出前校验：内部状态可能因各种原因与链上不一致，需以链上为准 cap 卖出数量。
+        """
+        if not self.keypair:
+            return None
+        try:
+            owner_b58 = str(self.keypair.pubkey())
+            payload = {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    owner_b58,
+                    {"mint": token_mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            }
+            resp = await self.http_client.post(
+                self._helius_pool.get_rpc_url(), json=payload, timeout=5
+            )
+            if resp.status_code == 429 and self._helius_pool.size > 1:
+                self._helius_pool.mark_current_failed()
+            data = resp.json()
+            if "result" in data and data["result"]["value"]:
+                total_ui = 0.0
+                for acc in data["result"]["value"]:
+                    info = acc["account"]["data"]["parsed"]["info"]
+                    tamt = info.get("tokenAmount") or {}
+                    ui = tamt.get("uiAmount")
+                    if ui is not None:
+                        total_ui += float(ui)
+                return total_ui if total_ui > 0 else None
+            return 0.0  # 无持仓
+        except Exception:
+            logger.debug("获取链上 Token 余额失败", exc_info=True)
+            return None
 
     # ==========================================
     # 1. 核心交易接口 (逻辑层)
@@ -269,6 +308,29 @@ class SolanaTrader:
             sell_amount_ui = share.token_amount
             is_dust = True
 
+        sell_amount_ui = min(sell_amount_ui, share.token_amount)
+
+        # 链上余额为准：查到多少卖多少（粉尘清仓、部分卖出均直接以链上为准）
+        chain_bal = await self._fetch_own_token_balance(token_address)
+        if chain_bal is not None:
+            if sell_amount_ui > chain_bal:
+                logger.warning(
+                    "⚠️ 状态与链上不一致: 计划卖 %.2f 但链上仅 %.2f，以链上为准",
+                    sell_amount_ui, chain_bal
+                )
+                sell_amount_ui = min(sell_amount_ui, chain_bal)
+            if chain_bal < pos.total_tokens * 0.99:
+                # 同步内部状态，避免后续卖出继续出错
+                old_total = pos.total_tokens
+                pos.total_tokens = chain_bal
+                if old_total > 0:
+                    ratio = chain_bal / old_total
+                    for s in pos.shares.values():
+                        s.token_amount *= ratio
+        if sell_amount_ui <= 0:
+            logger.warning("链上无持仓或余额为 0，跳过卖出")
+            return
+
         logger.info(f"📉 [准备卖出] {token_address} | 数量: {sell_amount_ui:.2f}")
 
         # === 真实卖出 ===
@@ -316,7 +378,13 @@ class SolanaTrader:
         pnl_pct = (current_price_ui - pos.average_price) / pos.average_price
 
         if pnl_pct <= -STOP_LOSS_PCT:
-            sell_amount = pos.total_tokens
+            chain_bal = await self._fetch_own_token_balance(token_address)
+            sell_amount = chain_bal if chain_bal is not None else pos.total_tokens * SELL_BUFFER
+            if chain_bal is not None and chain_bal < pos.total_tokens * 0.99:
+                logger.warning("⚠️ 止损前状态与链上不一致: 内部 %.2f vs 链上 %.2f", pos.total_tokens, chain_bal)
+            if sell_amount <= 0:
+                logger.warning("链上无持仓，跳过止损")
+                return
             logger.info(f"🛑 [止损触发] {token_address} (亏损 {pnl_pct * 100:.0f}%) | 全仓清仓 {sell_amount:.2f}")
 
             decimals = await self._get_decimals(token_address)
@@ -348,7 +416,15 @@ class SolanaTrader:
 
         for level, sell_pct in TAKE_PROFIT_LEVELS:
             if pnl_pct >= level and level not in pos.tp_hit_levels:
-                sell_amount = pos.total_tokens * sell_pct
+                sell_amount = pos.total_tokens * sell_pct  # 分批止盈，检查到多少卖多少
+                chain_bal = await self._fetch_own_token_balance(token_address)
+                if chain_bal is not None:
+                    sell_amount = min(sell_amount, chain_bal)  # 以链上为准，不预留 buffer
+                    if chain_bal < pos.total_tokens * 0.99:
+                        logger.warning("⚠️ 止盈前状态与链上不一致: 内部 %.2f vs 链上 %.2f", pos.total_tokens, chain_bal)
+                if sell_amount <= 0:
+                    logger.warning("链上无持仓，跳过止盈")
+                    continue
                 logger.info(f"💰 [止盈触发] {token_address} (+{pnl_pct * 100:.0f}%) | 卖出 {sell_amount:.2f}")
 
                 # === 真实卖出 ===
@@ -395,7 +471,8 @@ class SolanaTrader:
                 if not is_sell:
                     amount_int = int(amount_in_ui * LAMPORTS_PER_SOL)
                 else:
-                    amount_int = int(amount_in_ui * (10 ** token_decimals))
+                    # 卖出使用 floor，避免浮点转 int 时多出 1 raw unit 导致链上超卖失败
+                    amount_int = math.floor(amount_in_ui * (10 ** token_decimals))
 
                 # 与 SmartFlow3 一致：添加 onlyDirectRoutes / asLegacyTransaction 以提高路由兼容性
                 quote_params = {
