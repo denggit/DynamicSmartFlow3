@@ -84,8 +84,15 @@ async def test_configuration():
     return True
 
 
+def _is_helius_429(e: Exception) -> bool:
+    """判断异常是否为 Helius RPC/HTTP 429 限流。"""
+    if hasattr(e, "response") and getattr(e.response, "status_code", None) == 429:
+        return True
+    return "429" in str(e).lower() or "too many requests" in str(e).lower()
+
+
 async def test_rpc_and_jupiter():
-    """[2/7] 真实 RPC 连接 + Jupiter 询价（与主程序一致路径）。"""
+    """[2/7] 真实 RPC 连接 + Jupiter 询价；Helius 429 时自动切换 Key 重试。"""
     logger.info("🔗 [2/%d] 测试 RPC 连接 & Jupiter 询价...", TOTAL_STEPS)
     try:
         from config.settings import (
@@ -97,19 +104,39 @@ async def test_rpc_and_jupiter():
         from services.solana.trader import SolanaTrader
         from solders.keypair import Keypair
 
-        trader = SolanaTrader()
-        if not trader.keypair:
-            logger.error("❌ 无法加载钱包，请检查 SOLANA_PRIVATE_KEY")
+        max_rpc_tries = max(helius_key_pool.size, 1)
+        balance_sol = None
+        trader = None
+
+        for attempt in range(max_rpc_tries):
+            if trader is not None:
+                await trader.close()
+            trader = SolanaTrader()
+            if not trader.keypair:
+                logger.error("❌ 无法加载钱包，请检查 SOLANA_PRIVATE_KEY")
+                await trader.close()
+                return False
+
+            rpc_url = helius_key_pool.get_rpc_url()
+            logger.info("正在连接 RPC: %s... (尝试 %d/%d)", rpc_url[:40] + "..", attempt + 1, max_rpc_tries)
+            try:
+                balance_resp = await trader.rpc_client.get_balance(trader.keypair.pubkey())
+                balance_sol = balance_resp.value / 1_000_000_000
+                logger.info("✅ RPC 连接成功 | 当前余额: %.4f SOL", balance_sol)
+                break
+            except Exception as rpc_err:
+                if _is_helius_429(rpc_err) and helius_key_pool.size >= 1:
+                    helius_key_pool.mark_current_failed()
+                    logger.warning("⚠️ Helius RPC 429，已切换 Key 重试")
+                    continue
+                raise
+
+        if balance_sol is None:
+            logger.error("❌ RPC 在切换所有 Key 后仍失败")
             await trader.close()
             return False
 
-        rpc_url = helius_key_pool.get_rpc_url()
-        logger.info("正在连接 RPC: %s...", rpc_url[:40] + "..")
-        balance_resp = await trader.rpc_client.get_balance(trader.keypair.pubkey())
-        balance_sol = balance_resp.value / 1_000_000_000
-        logger.info("✅ RPC 连接成功 | 当前余额: %.4f SOL", balance_sol)
-
-        # Jupiter v1 询价：0.1 SOL -> USDC
+        # Jupiter v1 询价：0.1 SOL -> USDC（Jupiter 429 也支持多 Key 重试）
         USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
         amount_lamports = int(0.1 * 1_000_000_000)
         params = {
@@ -119,11 +146,18 @@ async def test_rpc_and_jupiter():
             "slippageBps": 50,
         }
         headers = {"User-Agent": "DSF3-HealthCheck/1.0"}
-        jup_key = jup_key_pool.get_api_key()
-        if jup_key:
-            headers["x-api-key"] = jup_key
-
-        quote_resp = await trader.http_client.get(JUP_QUOTE_API, params=params, headers=headers)
+        max_jup_tries = max(jup_key_pool.size, 1)
+        quote_resp = None
+        for attempt in range(max_jup_tries):
+            jup_key = jup_key_pool.get_api_key()
+            if jup_key:
+                headers["x-api-key"] = jup_key
+            quote_resp = await trader.http_client.get(JUP_QUOTE_API, params=params, headers=headers)
+            if quote_resp.status_code == 429 and jup_key_pool.size >= 1:
+                jup_key_pool.mark_current_failed()
+                logger.warning("⚠️ Jupiter 429，已切换 Key 重试")
+                continue
+            break
         await trader.close()
 
         if quote_resp.status_code == 429:
@@ -194,40 +228,56 @@ async def test_trader_state():
 
 
 async def test_websocket_and_helius_api():
-    """[5/7] WebSocket 连接与 Helius HTTP API（地址交易列表）。"""
+    """[5/7] WebSocket 连接与 Helius HTTP API；429 时自动切换 Key 重试。"""
     logger.info("🔌 [5/%d] 测试 WebSocket & Helius API...", TOTAL_STEPS)
     try:
         from config.settings import (
-            WSS_ENDPOINT,
+            helius_key_pool,
             HELIUS_API_KEY,
             SOLANA_PRIVATE_KEY_BASE58,
         )
         import websockets
+        from websockets.exceptions import InvalidStatusCode
 
-        if not WSS_ENDPOINT:
-            logger.error("❌ WSS_ENDPOINT 为空（需配置 HELIUS_API_KEY）")
+        if not helius_key_pool.get_wss_url():
+            logger.error("❌ WSS 为空（需配置 HELIUS_API_KEY）")
             return False
 
-        # 1. WebSocket 连接与简单订阅
-        logger.info("正在连接 WebSocket: %s...", WSS_ENDPOINT[:50] + "..")
-        try:
-            async with websockets.connect(WSS_ENDPOINT, ping_interval=20, ping_timeout=10) as ws:
-                logger.info("✅ WebSocket 连接成功")
-                # 可选：发送 slotSubscribe 确认通道畅通（不依赖钱包）
-                sub_msg = {"jsonrpc": "2.0", "id": 1, "method": "slotSubscribe"}
-                await ws.send(json.dumps(sub_msg))
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
-                    data = json.loads(msg)
-                    if "result" in data or "error" in data:
-                        logger.info("✅ WebSocket 订阅响应正常")
-                except asyncio.TimeoutError:
-                    logger.info("✅ WebSocket 已连接（订阅响应超时可接受）")
-        except websockets.exceptions.InvalidURI as e:
-            logger.error("❌ WebSocket URI 无效: %s", e)
-            return False
-        except Exception as e:
-            logger.error("❌ WebSocket 连接失败: %s", e)
+        # 1. WebSocket 连接：429 时切换 Key 重试
+        max_ws_tries = max(helius_key_pool.size, 1)
+        ws_ok = False
+        for attempt in range(max_ws_tries):
+            wss_url = helius_key_pool.get_wss_url()
+            logger.info("正在连接 WebSocket: %s... (尝试 %d/%d)", wss_url[:50] + "..", attempt + 1, max_ws_tries)
+            try:
+                async with websockets.connect(wss_url, ping_interval=20, ping_timeout=10) as ws:
+                    logger.info("✅ WebSocket 连接成功")
+                    sub_msg = {"jsonrpc": "2.0", "id": 1, "method": "slotSubscribe"}
+                    await ws.send(json.dumps(sub_msg))
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
+                        data = json.loads(msg)
+                        if "result" in data or "error" in data:
+                            logger.info("✅ WebSocket 订阅响应正常")
+                    except asyncio.TimeoutError:
+                        logger.info("✅ WebSocket 已连接（订阅响应超时可接受）")
+                    ws_ok = True
+                    break
+            except InvalidStatusCode as e:
+                if e.status_code == 429 and helius_key_pool.size >= 1:
+                    helius_key_pool.mark_current_failed()
+                    logger.warning("⚠️ Helius WebSocket 429，已切换 Key 重试")
+                    continue
+                logger.error("❌ WebSocket 连接被拒绝: HTTP %s", e.status_code)
+                break
+            except websockets.exceptions.InvalidURI as e:
+                logger.error("❌ WebSocket URI 无效: %s", e)
+                break
+            except Exception as e:
+                logger.error("❌ WebSocket 连接失败: %s", e)
+                break
+
+        if not ws_ok:
             return False
 
         # 2. Helius HTTP API：地址交易（若有钱包）
