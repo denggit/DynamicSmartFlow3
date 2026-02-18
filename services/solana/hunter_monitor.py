@@ -224,9 +224,7 @@ class HunterMonitorController:
                     if sub_ok:
                         logger.info(f"👀 监控就绪，监听 {len(monitored_addrs)} 个猎手")
                     else:
-                        helius_key_pool.mark_current_failed()
-                        logger.warning("⚠️ 订阅确认超时，已切换 Key，稍后重连 (共 %d 个猎手)", len(monitored_addrs))
-                        continue  # 跳出本轮 connect，外层 while 会重试并用新 Key 重连
+                        logger.warning("⚠️ 订阅确认超时，继续尝试接收 (共 %d 个猎手)", len(monitored_addrs))
 
                     # 主循环：与 SmartFlow3 一致，仅处理 logsNotification，避免误处理其他类型导致异常
                     while True:
