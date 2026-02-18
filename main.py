@@ -103,7 +103,7 @@ async def on_monitor_signal(signal):
 
     # 4. 首次跟单邮件（新线程发送，不阻塞）
     entry_time_str = datetime.fromtimestamp(pos.entry_time).strftime("%Y-%m-%d %H:%M:%S")
-    hunters_summary = ", ".join(f"{h.get('address', '')[:8]}..({h.get('score', 0)})" for h in hunters[:5])
+    hunters_summary = ", ".join(f"{h.get('address', '')}..({h.get('score', 0)})" for h in hunters[:5])
     notification.send_first_entry_email(
         token_address=token,
         entry_time=entry_time_str,

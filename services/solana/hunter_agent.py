@@ -57,7 +57,7 @@ class TokenMission:
         if hunter_address not in self.hunter_states:
             self.hunter_states[hunter_address] = initial_balance
             logger.info(
-                f"➕ [任务 {self.token_address[:6]}] 新增监控猎手: {hunter_address[:6]} (初始持仓: {initial_balance:.2f})")
+                f"➕ [任务 {self.token_address[:6]}] 新增监控猎手: {hunter_address} (初始持仓: {initial_balance:.2f})")
 
     def update_balance(self, hunter_address: str, delta_amount: float):
         """更新余额并返回 (旧余额, 新余额)"""
@@ -200,7 +200,7 @@ class HunterAgentController:
                                 ratio = (sell_amount / old_bal) if old_bal > 0 else 1.0
                                 new_bal = mission.hunter_states[hunter]
                                 trade_logger.info(
-                                    f"📉 [Agent 同步] 猎手 {hunter[:6]} 卖出 {token_address[:6]} | "
+                                    f"📉 [Agent 同步] 猎手 {hunter} 卖出 {token_address[:6]} | "
                                     f"数量: {sell_amount:.2f} | 比例: {ratio:.1%} (剩 {new_bal:.2f}) [漏订阅兜底]"
                                 )
                                 if self.signal_callback:
@@ -379,7 +379,7 @@ class HunterAgentController:
                 ratio = 1.0  # 异常情况，视为全卖
 
             trade_logger.info(
-                f"📉 [Agent] 猎手 {hunter[:6]} 卖出 {token[:6]} | 数量: {sell_amount:.2f} | 比例: {ratio:.1%} (剩 {new_bal:.2f})")
+                f"📉 [Agent] 猎手 {hunter} 卖出 {token[:6]} | 数量: {sell_amount:.2f} | 比例: {ratio:.1%} (剩 {new_bal:.2f})")
 
             # 触发回调
             if self.signal_callback:
@@ -405,7 +405,7 @@ class HunterAgentController:
                 increase_ratio = 1.0  # 建仓
 
             trade_logger.info(
-                f"📈 [Agent] 猎手 {hunter[:6]} 加仓 {token[:6]} | 数量: +{delta:.2f} | 增幅: {increase_ratio:.1%}")
+                f"📈 [Agent] 猎手 {hunter} 加仓 {token[:6]} | 数量: +{delta:.2f} | 增幅: {increase_ratio:.1%}")
 
             if self.signal_callback:
                 signal = {

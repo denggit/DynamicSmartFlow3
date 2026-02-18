@@ -114,7 +114,7 @@ class HunterStorage:
                 zombies.append(addr)
 
         for z in zombies:
-            logger.info(f"💀 清理僵尸地址 (10天未动): {z[:6]}..")
+            logger.info(f"💀 清理僵尸地址 (10天未动): {z}..")
             del self.hunters[z]
 
         # 2. 处理新猎手
@@ -133,7 +133,7 @@ class HunterStorage:
 
                 if len(self.hunters) < POOL_SIZE_LIMIT:
                     self.hunters[addr] = h
-                    logger.info(f"🆕 新猎手入库: {addr[:6]} (分:{h['score']})")
+                    logger.info(f"🆕 新猎手入库: {addr} (分:{h['score']})")
                 else:
                     # 库满 PK
                     sorted_hunters = sorted(self.hunters.items(), key=lambda x: x[1].get('score', 0))
@@ -367,7 +367,7 @@ class HunterMonitorController:
                                 continue
                             if not self._is_real_trade_light(tx):
                                 continue
-                            logger.info("本笔涉及 %d 名猎手: %s", len(active_hunters), [h[:8] for h in list(active_hunters)[:5]])
+                            logger.info("本笔涉及 %d 名猎手: %s", len(active_hunters), [h for h in list(active_hunters)[:5]])
                             for hunter in active_hunters:
                                 self.storage.update_last_active(hunter, time.time())
                                 await self._process_one_tx(hunter, tx)
@@ -393,11 +393,11 @@ class HunterMonitorController:
                 continue
             if sol_change < 0 and delta > 0:
                 self.active_holdings[mint][hunter] = time.time()
-                trade_logger.info(f"📥 买入: {hunter[:6]} -> {mint}")
+                trade_logger.info(f"📥 买入: {hunter} -> {mint}")
             elif sol_change > 0 and delta < 0:
                 if hunter in self.active_holdings[mint]:
                     del self.active_holdings[mint][hunter]
-                trade_logger.info(f"📤 卖出: {hunter[:6]} -> {mint}")
+                trade_logger.info(f"📤 卖出: {hunter} -> {mint}")
             await self.check_resonance(mint)
 
     async def analyze_action(self, hunter, tx):
@@ -409,11 +409,11 @@ class HunterMonitorController:
 
             if sol_change < 0 and delta > 0:  # BUY
                 self.active_holdings[mint][hunter] = time.time()
-                trade_logger.info(f"📥 买入: {hunter[:6]} -> {mint}")
+                trade_logger.info(f"📥 买入: {hunter} -> {mint}")
             elif sol_change > 0 and delta < 0:  # SELL
                 if hunter in self.active_holdings[mint]:
                     del self.active_holdings[mint][hunter]
-                    trade_logger.info(f"📤 卖出: {hunter[:6]} -> {mint}")
+                    trade_logger.info(f"📤 卖出: {hunter} -> {mint}")
 
             await self.check_resonance(mint)
 
@@ -472,7 +472,7 @@ class HunterMonitorController:
                     for addr in frequent_removed:
                         if addr in self.storage.hunters:
                             del self.storage.hunters[addr]
-                            logger.info("🚫 踢出频繁交易猎手 %s.. (平均间隔<5分钟)", addr[:8])
+                            logger.info("🚫 踢出频繁交易猎手 %s.. (平均间隔<5分钟)", addr)
                     if frequent_removed:
                         current_hunters = list(self.storage.hunters.items())
 
@@ -481,7 +481,7 @@ class HunterMonitorController:
 
                         # 核心逻辑：超过 15 天才重新打分
                         if (now - last_audit) > AUDIT_EXPIRATION:
-                            logger.info(f"🩺 猎手 {addr[:6]} 超过15天未体检，正在重新审计...")
+                            logger.info(f"🩺 猎手 {addr} 超过15天未体检，正在重新审计...")
 
                             # 重新跑一遍分析
                             new_stats = await self.sm_searcher.analyze_hunter_performance(client, addr)
@@ -494,9 +494,9 @@ class HunterMonitorController:
                                 # 惩罚机制：如果以前很牛，现在亏钱了，分数归零等待淘汰
                                 if new_stats['total_profit'] < 0:
                                     info['score'] = 0
-                                    logger.warning(f"📉 猎手 {addr[:6]} 表现恶化 (负盈利)，分数归零")
+                                    logger.warning(f"📉 猎手 {addr} 表现恶化 (负盈利)，分数归零")
                                 else:
-                                    logger.info(f"✅ 猎手 {addr[:6]} 体检完成，状态良好")
+                                    logger.info(f"✅ 猎手 {addr} 体检完成，状态良好")
 
                             needs_audit_count += 1
                             await asyncio.sleep(2)  # 慢慢跑，不着急
