@@ -37,7 +37,7 @@ MAX_BACKTRACK_PAGES = 10  # 最多回溯10页 (1万笔交易)，对于3小时内
 
 # 频繁交易过滤：平均间隔 < 5 分钟的地址不纳入/踢出猎手池（只统计「真实交易」）
 RECENT_TX_COUNT_FOR_FREQUENCY = 100
-MIN_AVG_TX_INTERVAL_SEC = 180
+MIN_AVG_TX_INTERVAL_SEC = 300
 
 # 与 SmartFlow3 一致：只把「真实买卖」算作交易，忽略 SOL/USDC/USDT 等
 IGNORE_MINTS = {
