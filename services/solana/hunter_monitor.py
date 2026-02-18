@@ -203,37 +203,18 @@ class HunterMonitorController:
                         "params": [{"mentions": monitored_addrs}, {"commitment": LOGS_COMMITMENT}]
                     }
                     await ws.send(json.dumps(payload))
-                    logger.info(f"📤 已发送订阅请求 ({len(monitored_addrs)} 地址)，等待确认...")
-                    # 与 SmartFlow3 一致：等待订阅确认或首条通知（最多约 5 秒）
-                    sub_ok = False
-                    for _ in range(10):
-                        try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=0.5)
-                            data = json.loads(msg)
-                            if data.get("id") == 1 and "result" in data:
-                                sub_ok = True
-                                logger.info(f"✅ 订阅成功，订阅ID: {data['result']}")
-                                break
-                            if data.get("method") == "logsNotification":
-                                sub_ok = True
-                                logger.info("✅ 已收到交易通知，订阅已生效")
-                                await self.process_transaction_log(data["params"]["result"])
-                                break
-                        except asyncio.TimeoutError:
-                            continue
-                    if sub_ok:
-                        logger.info(f"👀 监控就绪，监听 {len(monitored_addrs)} 个猎手")
-                    else:
-                        logger.warning("⚠️ 订阅确认超时，继续尝试接收 (共 %d 个猎手)", len(monitored_addrs))
-                    # 若曾超时，首次收到推送时打一条「已正常」方便确认
-                    sub_was_unconfirmed = not sub_ok
+                    logger.info(f"📤 已发送订阅请求 ({len(monitored_addrs)} 地址)，进入接收循环")
+                    # 不等待确认，直接收消息：首条可能是订阅 ack(id=1) 或 logsNotification，主循环里会忽略非 logsNotification
+                    sub_was_unconfirmed = True  # 首次收到交易推送时打「订阅已正常」
 
-                    # 主循环：与 SmartFlow3 一致，仅处理 logsNotification，避免误处理其他类型导致异常
+                    # 主循环：仅处理 logsNotification，其它消息（如订阅 ack）直接跳过
                     while True:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=60)
                             data = json.loads(msg)
                             if data.get("method") != "logsNotification":
+                                # 可能是订阅 ack (id=1) 或其它，打一条便于确认连接正常
+                                logger.info("收到 WebSocket 消息: method=%s id=%s", data.get("method"), data.get("id"))
                                 continue
                             res = data["params"]["result"]
                             sig = (res.get("value") or {}).get("signature")
@@ -243,9 +224,11 @@ class HunterMonitorController:
                             if sub_was_unconfirmed:
                                 logger.info("✅ 订阅已正常，已收到交易推送")
                                 sub_was_unconfirmed = False
+                            logger.info("收到交易推送: %s..", sig[:20])
                             await self.process_transaction_log(res)
                         except asyncio.TimeoutError:
                             await ws.ping()
+                            logger.debug("监控心跳 (60s 内无新消息)")
                             # 检查列表变更
                             if set(self.storage.get_monitored_addresses()) != set(monitored_addrs):
                                 break
@@ -305,6 +288,7 @@ class HunterMonitorController:
 
             # 与 SmartFlow3 一致：非真实交易（无 token 买卖 / 无 meaningful native）直接跳过，不参与统计
             if not tx_has_real_trade(tx):
+                logger.debug("本笔非真实交易，跳过: %s..", signature[:16])
                 return
 
             # 从交易中收集参与账户：Helius 可能无 accountData，用 feePayer + 各类 transfer 的 from/to
@@ -329,6 +313,10 @@ class HunterMonitorController:
                         tx_accounts.add(a)
 
             active_hunters = set(self.storage.get_monitored_addresses()).intersection(tx_accounts)
+            if not active_hunters:
+                logger.debug("本笔无监控猎手参与，跳过: %s..", signature[:16])
+                return
+            logger.info("本笔涉及 %d 名猎手: %s", len(active_hunters), [h[:8] for h in list(active_hunters)[:5]])
 
             for hunter in active_hunters:
                 self.storage.update_last_active(hunter, time.time())
