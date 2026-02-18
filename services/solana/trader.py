@@ -37,6 +37,22 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """
+    检测是否为 429 / 限流类错误。SolanaRpcException 的 __cause__ 为 HTTPStatusError，
+    str(e) 可能不含 429，需同时检查 __cause__。
+    """
+    parts = [str(e).lower()]
+    cause = getattr(e, "__cause__", None)
+    if cause:
+        parts.append(str(cause).lower())
+    combined = " ".join(parts)
+    return any(
+        x in combined for x in ("429", "too many requests", "rate", "limit", "credit")
+    )
+
+
 # 常量
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -87,11 +103,13 @@ class SolanaTrader:
         self.http_client = httpx.AsyncClient(timeout=10.0)
 
     def _jup_headers(self) -> dict:
-        """Jupiter 请求头，若有 JUP Key 则带上。"""
+        """Jupiter 请求头，与 SmartFlow3 一致；若有 JUP Key 则带上 x-api-key。"""
         key = self._jup_pool.get_api_key()
+        base = {"Accept": "application/json", "Content-Type": "application/json"}
         if not key:
-            return {}
-        return {"x-api-key": key}
+            return base
+        base["x-api-key"] = key
+        return base
 
     async def _recreate_rpc_client(self) -> None:
         """当前 Helius key 不可用时，仅切换 Helius 池内下一个并重建 RPC 客户端。"""
@@ -331,27 +349,35 @@ class SolanaTrader:
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
                             is_sell: bool = False, token_decimals: int = 9) -> Tuple[Optional[str], float]:
         """
-        通用 Swap 函数 (Jupiter v1 + Helius 广播)。Helius/Jupiter 各自独立切 key，不可用时只切自己的池。
+        通用 Swap 函数 (Jupiter v1 + Helius 广播)。Helius/Jupiter 各自独立切 key，
+        遇 429 时先 backoff 等待再切换 key 重试。
         """
-        for attempt in range(2):
+        max_attempts = max(3, self._helius_pool.size)
+        for attempt in range(max_attempts):
             try:
                 if not is_sell:
                     amount_int = int(amount_in_ui * LAMPORTS_PER_SOL)
                 else:
                     amount_int = int(amount_in_ui * (10 ** token_decimals))
 
+                # 与 SmartFlow3 一致：添加 onlyDirectRoutes / asLegacyTransaction 以提高路由兼容性
                 quote_params = {
                     "inputMint": input_mint,
                     "outputMint": output_mint,
                     "amount": str(amount_int),
-                    "slippageBps": slippage_bps
+                    "slippageBps": slippage_bps,
+                    "onlyDirectRoutes": "false",
+                    "asLegacyTransaction": "false",
                 }
                 quote_resp = await self.http_client.get(
                     JUP_QUOTE_API, params=quote_params, headers=self._jup_headers()
                 )
                 if quote_resp.status_code == 429:
                     self._jup_pool.mark_current_failed()
-                    if attempt < 1:
+                    if attempt < max_attempts - 1:
+                        backoff_sec = 5 + attempt * 3  # 5s, 8s, 11s...
+                        logger.warning("Jupiter Quote 429，%ds 后重试 (attempt %d/%d)", backoff_sec, attempt + 1, max_attempts)
+                        await asyncio.sleep(backoff_sec)
                         continue
                 if quote_resp.status_code != 200:
                     logger.error("Quote Error: %s", quote_resp.text)
@@ -360,18 +386,22 @@ class SolanaTrader:
                 quote_data = quote_resp.json()
                 out_amount_raw = int(quote_data.get("outAmount", 0))
 
+                # 与 SmartFlow3 完全一致：仅使用 computeUnitPriceMicroLamports
                 swap_payload = {
                     "userPublicKey": str(self.keypair.pubkey()),
                     "quoteResponse": quote_data,
                     "wrapAndUnwrapSol": True,
-                    "prioritizationFeeLamports": PRIORITY_FEE_SETTINGS
+                    "computeUnitPriceMicroLamports": "auto",
                 }
                 swap_resp = await self.http_client.post(
                     JUP_SWAP_API, json=swap_payload, headers=self._jup_headers()
                 )
                 if swap_resp.status_code == 429:
                     self._jup_pool.mark_current_failed()
-                    if attempt < 1:
+                    if attempt < max_attempts - 1:
+                        backoff_sec = 5 + attempt * 3
+                        logger.warning("Jupiter Swap Build 429，%ds 后重试 (attempt %d/%d)", backoff_sec, attempt + 1, max_attempts)
+                        await asyncio.sleep(backoff_sec)
                         continue
                 if swap_resp.status_code != 200:
                     logger.error("Swap Build Error: %s", swap_resp.text)
@@ -379,22 +409,27 @@ class SolanaTrader:
 
                 swap_data = swap_resp.json()
                 swap_transaction_base64 = swap_data.get("swapTransaction") or swap_data.get("transaction")
+                if not swap_transaction_base64:
+                    logger.error("Swap 响应缺少 swapTransaction: %s", swap_data)
+                    return None, 0
                 raw_tx = base64.b64decode(swap_transaction_base64)
                 tx = VersionedTransaction.from_bytes(raw_tx)
                 signature = self.keypair.sign_message(to_bytes_versioned(tx.message))
                 signed_tx = VersionedTransaction.populate(tx.message, [signature])
-                opts = TxOpts(skip_preflight=True, preflight_commitment=Confirmed)
-                sig = await self.rpc_client.send_raw_transaction(bytes(signed_tx), opts=opts)
-                logger.info("⏳ 交易已广播: %s", sig)
+                opts = TxOpts(skip_preflight=True, max_retries=3)
+                result = await self.rpc_client.send_transaction(signed_tx, opts=opts)
+                sig_str = str(getattr(result, "value", result))
+                logger.info("⏳ 交易已广播: %s", sig_str)
                 await asyncio.sleep(5)
 
                 if not is_sell:
-                    return str(sig), out_amount_raw
-                return str(sig), out_amount_raw / LAMPORTS_PER_SOL
+                    return sig_str, out_amount_raw
+                return sig_str, out_amount_raw / LAMPORTS_PER_SOL
             except Exception as e:
-                err_msg = str(e).lower()
-                if attempt == 0 and self._helius_pool.size >= 1 and ("rate" in err_msg or "429" in err_msg or "limit" in err_msg or "credit" in err_msg):
-                    logger.warning("Helius 限流/额度用尽，切换 Key 并重试: %s", e)
+                if attempt < max_attempts - 1 and self._helius_pool.size >= 1 and _is_rate_limit_error(e):
+                    backoff_sec = 8 + attempt * 4  # send_raw_transaction 429 需较长等待
+                    logger.warning("Helius RPC 限流 (send_raw_transaction)，%ds backoff 后切换 Key 重试: %s", backoff_sec, e)
+                    await asyncio.sleep(backoff_sec)
                     await self._recreate_rpc_client()
                     continue
                 logger.exception("Swap Exception")
@@ -402,21 +437,20 @@ class SolanaTrader:
         return None, 0
 
     async def _get_decimals(self, mint_address: str) -> int:
-        """获取代币精度，429 时切换 Key 重试。"""
-        for _ in range(max(2, self._helius_pool.size)):
-            try:
-                pubkey = Pubkey.from_string(mint_address)
-                resp = await self.rpc_client.get_token_supply(pubkey)
-                return resp.value.decimals
-            except Exception as e:
-                err_str = str(e).lower()
-                if "429" in err_str or "rate" in err_str or "limit" in err_str:
-                    await self._recreate_rpc_client()
-                    await asyncio.sleep(1)
-                    continue
-                logger.exception("获取 decimals 失败，使用默认 9")
-                return 9  # 默认 9，meme 常见精度
-        return 9
+        """
+        获取代币精度。Pump.fun 代币多为 6 位，遇 429/限流时不再重试，
+        直接返回默认值以免进一步消耗额度。
+        """
+        try:
+            pubkey = Pubkey.from_string(mint_address)
+            resp = await self.rpc_client.get_token_supply(pubkey)
+            return resp.value.decimals
+        except Exception as e:
+            if _is_rate_limit_error(e):
+                logger.warning("获取 decimals 遇限流，使用默认 6 (pump 常见): %s", e)
+            else:
+                logger.exception("获取 decimals 失败，使用默认 6")
+            return 6  # pump.fun 代币常见精度
 
     def _rebalance_shares_logic(self, pos: Position, hunters: List[Dict]):
         """
