@@ -470,7 +470,7 @@ class HunterMonitorController:
         total_score = sum(scores)
 
         HIGH_SCORE_THRESHOLD = 80  # 80 分以上为高分猎手
-        MIN_TOTAL_SCORE_C1 = 100  # c1 条件：两人及以上时，总分数需 >= 100
+        MIN_TOTAL_SCORE_C1 = 120  # c1 条件：两人及以上时，总分数需 >= 120
         c1 = count >= 2 and total_score >= MIN_TOTAL_SCORE_C1  # 两个猎手持仓且总分>=100
         c2 = count >= 1 and any(s >= HIGH_SCORE_THRESHOLD for s in scores)  # 一个高分猎手持仓
 
