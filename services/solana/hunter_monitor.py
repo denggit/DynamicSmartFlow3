@@ -45,8 +45,8 @@ DISCOVERY_INTERVAL_WHEN_FULL_SEC = 43200  # 猎手池已满(50)时，挖掘间�
 # 与 SmartFlow3 一致：拉取交易详情时重试（WebSocket 推送时 Helius 可能尚未索引）
 FETCH_TX_MAX_RETRIES = 3
 FETCH_TX_RETRY_DELAY_BASE = 2  # 第 i 次重试前等待 2+i 秒
-# 订阅使用 processed 可更早收到通知（与 SmartFlow3 一致）
-LOGS_COMMITMENT = "processed"
+# 使用 Helius transactionSubscribe（按账户包含），支持多地址；logsSubscribe 的 mentions 仅支持单地址且易漏 Swap
+TRANSACTION_COMMITMENT = "processed"
 
 
 class HunterStorage:
@@ -198,36 +198,46 @@ class HunterMonitorController:
                     close_timeout=None,
                     max_size=None,
                 ) as ws:
+                    # Helius transactionSubscribe：按 accountInclude 推送，任意猎手参与的交易都会推（支持多地址）
+                    # logsSubscribe 的 mentions 仅支持单地址且 Swap 常不把地址写进日志，会漏单
                     payload = {
-                        "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-                        "params": [{"mentions": monitored_addrs}, {"commitment": LOGS_COMMITMENT}]
+                        "jsonrpc": "2.0", "id": 1, "method": "transactionSubscribe",
+                        "params": [
+                            {"accountInclude": monitored_addrs},
+                            {
+                                "commitment": TRANSACTION_COMMITMENT,
+                                "encoding": "jsonParsed",
+                                "transactionDetails": "signatures",
+                                "maxSupportedTransactionVersion": 0,
+                            }
+                        ]
                     }
                     await ws.send(json.dumps(payload))
-                    logger.info(f"📤 已发送订阅请求 ({len(monitored_addrs)} 地址)，进入接收循环")
-                    # 不等待确认，直接收消息：首条可能是订阅 ack(id=1) 或 logsNotification，主循环里会忽略非 logsNotification
-                    sub_was_unconfirmed = True  # 首次收到交易推送时打「订阅已正常」
-                    idle_60s_count = 0  # 连续 60s 无推送次数，用于定期打存活日志
+                    logger.info(f"📤 已发送 transactionSubscribe ({len(monitored_addrs)} 地址)，进入接收循环")
+                    sub_was_unconfirmed = True
+                    idle_60s_count = 0
 
-                    # 主循环：仅处理 logsNotification，其它消息（如订阅 ack）直接跳过
+                    # 主循环：处理 transactionNotification（Helius 按账户推送）
                     while True:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=60)
                             data = json.loads(msg)
-                            if data.get("method") != "logsNotification":
-                                # 可能是订阅 ack (id=1) 或其它，打一条便于确认连接正常
+                            if data.get("method") != "transactionNotification":
                                 logger.info("收到 WebSocket 消息: method=%s id=%s", data.get("method"), data.get("id"))
                                 continue
-                            idle_60s_count = 0  # 收到推送，重置空闲计数
-                            res = data["params"]["result"]
-                            sig = (res.get("value") or {}).get("signature")
+                            idle_60s_count = 0
+                            res = data.get("params") or {}
+                            result = res.get("result") or {}
+                            sig = result.get("signature")
                             if not sig:
-                                logger.warning("logsNotification 缺少 signature")
+                                logger.warning("transactionNotification 缺少 signature")
                                 continue
                             if sub_was_unconfirmed:
                                 logger.info("✅ 订阅已正常，已收到交易推送")
                                 sub_was_unconfirmed = False
                             logger.info("收到交易推送: %s..", sig[:20])
-                            await self.process_transaction_log(res)
+                            # 复用原有处理：只传 signature 结构，后续会拉 Helius 解析后的详情
+                            await self.process_transaction_log({"value": {"signature": sig}})
                         except asyncio.TimeoutError:
                             await ws.ping()
                             idle_60s_count += 1
