@@ -29,6 +29,11 @@ logger = get_logger(__name__)
 # 猎手交易单独写入 monitor.log，便于查看时间与交易币种
 trade_logger = get_logger("trade")
 
+# 与 SmartFlow3 一致：定时同步持仓，防止漏订阅导致错过猎手卖出
+SYNC_POSITIONS_INTERVAL_SEC = 30  # 每 30 秒拉一次链上余额做兜底
+SYNC_MIN_DELTA_RATIO = 0.01  # 变化比例小于 1% 视为误差，不触发信号
+SYNC_PROTECTION_AFTER_START_SEC = 60  # 任务启动后 60 秒内不同步，避免链上延迟误判
+
 
 class TokenMission:
     """
@@ -81,9 +86,9 @@ class HunterAgentController:
         self.hunter_map = defaultdict(set)
 
     async def start(self):
-        """启动 Agent 监控线程"""
+        """启动 Agent：WebSocket 监控 + 定时持仓同步（防漏订阅）"""
         logger.info("🕵️‍♂️ 启动 Hunter Agent (跟单管家)...")
-        await self.monitor_loop()
+        await asyncio.gather(self.monitor_loop(), self.sync_positions_loop())
 
     # === 1. 任务管理接口 (供主程序调用) ===
 
@@ -139,6 +144,60 @@ class HunterAgentController:
                     self.hunter_map[hunter].remove(token_address)
                     if not self.hunter_map[hunter]:
                         del self.hunter_map[hunter]
+
+    async def sync_positions_loop(self):
+        """
+        定时拉取猎手链上持仓，与本地状态对比；若发现已卖出但我们未收到订阅，补发 HUNTER_SELL。
+        与 SmartFlow3 的 monitor_sync_positions 思路一致，防止漏订阅错过跟卖。
+        """
+        logger.info("🛡️ 持仓同步防漏单线程已启动 (每 %s 秒检查一次)...", SYNC_POSITIONS_INTERVAL_SEC)
+        while True:
+            try:
+                await asyncio.sleep(SYNC_POSITIONS_INTERVAL_SEC)
+                missions = list(self.active_missions.items())
+                if not missions:
+                    continue
+
+                now = time.time()
+                for token_address, mission in missions:
+                    if (now - mission.start_time) < SYNC_PROTECTION_AFTER_START_SEC:
+                        continue
+                    for hunter in list(mission.hunter_states.keys()):
+                        try:
+                            real_balance = await self._fetch_token_balance(hunter, token_address)
+                            if real_balance is None:
+                                continue
+                            old_bal = mission.hunter_states[hunter]
+                            delta = real_balance - old_bal
+                            if abs(delta) < 1e-9:
+                                continue
+                            # 发现减仓（可能漏了订阅）
+                            if delta < 0 and abs(delta) >= old_bal * SYNC_MIN_DELTA_RATIO:
+                                mission.hunter_states[hunter] = max(0.0, real_balance)
+                                sell_amount = abs(delta)
+                                ratio = (sell_amount / old_bal) if old_bal > 0 else 1.0
+                                new_bal = mission.hunter_states[hunter]
+                                trade_logger.info(
+                                    f"📉 [Agent 同步] 猎手 {hunter[:6]} 卖出 {token_address[:6]} | "
+                                    f"数量: {sell_amount:.2f} | 比例: {ratio:.1%} (剩 {new_bal:.2f}) [漏订阅兜底]"
+                                )
+                                if self.signal_callback:
+                                    signal = {
+                                        "type": "HUNTER_SELL",
+                                        "token": token_address,
+                                        "hunter": hunter,
+                                        "sell_ratio": ratio,
+                                        "remaining_balance": new_bal,
+                                        "timestamp": now,
+                                    }
+                                    await self._trigger_callback(signal)
+                            elif delta > 0:
+                                mission.hunter_states[hunter] = real_balance
+                        except Exception:
+                            logger.debug("同步单猎手余额异常", exc_info=True)
+                        await asyncio.sleep(0.3)
+            except Exception:
+                logger.exception("sync_positions_loop 异常")
 
     # === 2. 核心监控逻辑 ===
 
