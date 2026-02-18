@@ -314,7 +314,7 @@ class SmartMoneySearcher:
             return None
         # 频繁交易过滤：只统计「真实交易」，最近 100 笔真实买卖平均间隔 < 5 分钟则剔除
         if _is_frequent_trader_by_real_txs(txs, hunter_address):
-            logger.info("⏭️ 剔除频繁交易地址 %s.. (真实交易平均间隔<5分钟)", hunter_address[:8])
+            logger.info("⏭️ 剔除频繁交易地址 %s.. (真实交易平均间隔<5分钟)", hunter_address)
             return None
         if not txs: return None
 
