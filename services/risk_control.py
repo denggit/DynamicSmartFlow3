@@ -72,7 +72,7 @@ async def check_is_safe_token(token_mint: str) -> bool:
                 if "buy" in name.lower() and "tax" in name.lower():
                     # 若有具体数值可解析则再判断，这里仅做名称提示
                     pass
-            logger.info("✅ 风控通过 (Score: %s): %s", score, token_mint[:16] + "..")
+            logger.info("✅ 风控通过 (Score: %s): %s", score, token_mint)
             return True
 
     except Exception as e:

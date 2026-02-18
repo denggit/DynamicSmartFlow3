@@ -86,7 +86,7 @@ async def on_monitor_signal(signal):
 
     # 1. 风控：避免貔貅/不能卖/高税
     if not await risk_control.check_is_safe_token(token):
-        logger.warning("风控未通过，跳过开仓: %s", token[:16] + "..")
+        logger.warning("风控未通过，跳过开仓: %s", token)
         return
 
     # 2. 价格
@@ -210,7 +210,7 @@ async def restore_agent_from_trader() -> None:
         hunter_addrs = list(pos.shares.keys())
         if hunter_addrs:
             await agent.start_tracking(token_address, hunter_addrs)
-            logger.info("🔄 恢复监控: %s (%s 名猎手)", token_address[:16] + "..", len(hunter_addrs))
+            logger.info("🔄 恢复监控: %s (%s 名猎手)", token_address, len(hunter_addrs))
 
 
 async def main():
