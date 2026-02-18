@@ -156,12 +156,14 @@ class HunterMonitorController:
         self,
         signal_callback: Optional[Callable] = None,
         tracked_tokens_getter: Optional[Callable[[], Set[str]]] = None,
+        position_check: Optional[Callable[[str], bool]] = None,
     ):
         self.storage = HunterStorage()
         self.dex_scanner = DexScanner()
         self.sm_searcher = SmartMoneySearcher()
         self.signal_callback = signal_callback
         self.tracked_tokens_getter = tracked_tokens_getter  # 主程序注入，返回正在跟仓的 token 集合
+        self.position_check = position_check  # 主程序注入，(token) -> 是否已有仓位；有则不再触发共振
 
         # 实时持仓状态池
         self.active_holdings = defaultdict(dict)
@@ -468,10 +470,13 @@ class HunterMonitorController:
         total_score = sum(scores)
 
         HIGH_SCORE_THRESHOLD = 80  # 80 分以上为高分猎手
-        c1 = count >= 2  # 两个猎手持仓
+        MIN_TOTAL_SCORE_C1 = 100  # c1 条件：两人及以上时，总分数需 >= 100
+        c1 = count >= 2 and total_score >= MIN_TOTAL_SCORE_C1  # 两个猎手持仓且总分>=100
         c2 = count >= 1 and any(s >= HIGH_SCORE_THRESHOLD for s in scores)  # 一个高分猎手持仓
 
         if c1 or c2:
+            if self.position_check and self.position_check(mint):
+                return
             trade_logger.info(f"🚨 共振触发: {mint} (人数:{count}, 分:{total_score})")
             if self.signal_callback:
                 signal = {

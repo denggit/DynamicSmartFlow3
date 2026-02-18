@@ -225,6 +225,7 @@ async def main():
     monitor = HunterMonitorController(
         signal_callback=on_monitor_signal,
         tracked_tokens_getter=get_tracked_tokens,
+        position_check=lambda t: t in trader.positions,
     )
     monitor.set_agent(agent)  # 跟仓信号由 Monitor 统一推送，避免 Agent 自建 WS 漏单
     agent.signal_callback = on_agent_signal
