@@ -5,8 +5,9 @@
 @Date       : 2/18/2026
 @File       : logger.py
 @Description: 统一日志工具
-              - 日志写入项目根目录 logs/ 下，按日期单文件: logs/YYYY-MM-DD.log（所有模块共用一个文件）
-              - 每日零点后自动切到新日期文件，不依赖程序启动时间
+              - 日志按日期分目录: logs/YYYY-MM-DD/，主程序 main.log，其他按模块分文件
+              - 猎手交易监控单独写入 monitor.log，便于查看什么时间、交易哪个币
+              - 每日零点后自动切到新日期目录，不依赖程序启动时间
               - 关键模块的 ERROR/exception 触发告警邮件，1 小时一封、整合该时段内所有错误
 """
 
@@ -92,26 +93,44 @@ def _schedule_flush_if_first() -> None:
         _flush_timer.start()
 
 
-class DateFileHandler(logging.FileHandler):
+def _logger_name_to_file_name(name: str) -> str:
     """
-    按日期单文件写入的 FileHandler：所有模块共用一个文件 logs/YYYY-MM-DD.log。
-    每次 emit 时检查当前日期，若日期变化则切换到新日期文件。
+    Logger 名称 -> 日志文件名（不含扩展名）。
+    主程序 Main -> main.log；猎手交易专用 trade -> monitor.log；其余取最后一段。
+    """
+    if not name or name == "root":
+        return "app"
+    if name == "Main":
+        return "main"
+    if name == "trade":
+        return "monitor"
+    parts = name.split(".")
+    return parts[-1].lower() if parts else "app"
+
+
+class DateDirFileHandler(logging.FileHandler):
+    """
+    按日期目录 + 文件名写入: logs/YYYY-MM-DD/<file_name>.log。
+    每次 emit 时检查当前日期，若日期变化则切换到新日期目录下的文件。
     """
 
-    def __init__(self, logs_root: Path):
+    def __init__(self, file_name: str, logs_root: Path):
         """
-        :param logs_root: 日志根目录，其下直接存放 YYYY-MM-DD.log
+        :param file_name: 文件名（不含 .log），如 main、monitor、trader
+        :param logs_root: 日志根目录，其下按日期建子目录 YYYY-MM-DD
         """
+        self._file_name = file_name
         self._logs_root = Path(logs_root)
         self._current_date = date.today()
         self._current_path = Path(self._compute_path())
         super().__init__(str(self._current_path), encoding="utf-8")
 
     def _compute_path(self) -> str:
-        """根据当前日期计算日志文件路径（单文件 per 日），并确保目录存在。"""
+        """根据当前日期计算路径 logs/YYYY-MM-DD/<file_name>.log，并确保目录存在。"""
         today = date.today()
-        self._logs_root.mkdir(parents=True, exist_ok=True)
-        path = self._logs_root / f"{today.isoformat()}.log"
+        date_dir = self._logs_root / today.isoformat()
+        date_dir.mkdir(parents=True, exist_ok=True)
+        path = date_dir / f"{self._file_name}.log"
         return str(path)
 
     def _ensure_stream(self):
@@ -167,19 +186,20 @@ class CriticalErrorEmailHandler(logging.Handler):
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     """
-    获取按日期单文件写入的 Logger（所有模块写入同一天文件 logs/YYYY-MM-DD.log）。
-    同一 name 多次调用返回同一实例，且只挂一次 DateFileHandler。
+    获取按日期目录分文件的 Logger：logs/YYYY-MM-DD/<file_name>.log。
+    主程序用 get_logger("Main") -> main.log；猎手交易用 get_logger("trade") -> monitor.log。
+    同一 name 多次调用返回同一实例，且只挂一次 DateDirFileHandler。
 
-    :param name: 通常传 __name__，或模块标识如 "Main", "Trader"
+    :param name: 通常传 __name__，或 "Main"、"trade"
     :param level: 日志级别
     :return: 配置好的 Logger
     """
     logger = logging.getLogger(name)
     if not logger.handlers and name not in _logger_handlers:
         logger.setLevel(level)
-        # 避免重复添加
         _logger_handlers[name] = True
-        handler = DateFileHandler(LOGS_ROOT)
+        file_name = _logger_name_to_file_name(name)
+        handler = DateDirFileHandler(file_name, LOGS_ROOT)
         handler.setLevel(level)
         formatter = logging.Formatter(
             "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",

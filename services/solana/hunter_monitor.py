@@ -18,7 +18,6 @@ from collections import defaultdict
 from typing import Dict, List, Callable, Optional
 
 import websockets
-from websockets.exceptions import InvalidStatusCode
 
 # 导入配置和依赖模块
 from config.settings import helius_key_pool
@@ -27,6 +26,8 @@ from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+# 猎手交易单独写入 monitor.log，便于查看时间与交易币种
+trade_logger = get_logger("trade")
 
 # 常量配置
 HUNTER_DATA_FILE = "data/hunters.json"
@@ -194,15 +195,14 @@ class HunterMonitorController:
                             if set(self.storage.get_monitored_addresses()) != set(monitored_addrs):
                                 break
 
-            except InvalidStatusCode as e:
-                if e.status_code == 429:
+            except Exception as e:
+                status_code = getattr(e, "status_code", None)
+                is_429 = status_code == 429 or "429" in str(e).lower()
+                if is_429:
                     helius_key_pool.mark_current_failed()
                     logger.warning("⚠️ Helius WebSocket 429 限流，已切换 Key，5 秒后重试")
                 else:
-                    logger.exception("⚠️ WS 连接被拒绝: HTTP %s", e.status_code)
-                await asyncio.sleep(5)
-            except Exception:
-                logger.exception("⚠️ WS 重连异常")
+                    logger.exception("⚠️ WS 重连异常")
                 await asyncio.sleep(5)
 
     async def process_transaction_log(self, log_info):
@@ -242,11 +242,11 @@ class HunterMonitorController:
 
             if sol_change < 0 and delta > 0:  # BUY
                 self.active_holdings[mint][hunter] = time.time()
-                logger.info(f"📥 买入: {hunter[:6]} -> {mint}")
+                trade_logger.info(f"📥 买入: {hunter[:6]} -> {mint}")
             elif sol_change > 0 and delta < 0:  # SELL
                 if hunter in self.active_holdings[mint]:
                     del self.active_holdings[mint][hunter]
-                    logger.info(f"📤 卖出: {hunter[:6]} -> {mint}")
+                    trade_logger.info(f"📤 卖出: {hunter[:6]} -> {mint}")
 
             await self.check_resonance(mint)
 
@@ -263,7 +263,7 @@ class HunterMonitorController:
         c3 = count >= 2 and total_score >= 160
 
         if c1 or c2 or c3:
-            logger.info(f"🚨 共振触发: {mint} (人数:{count}, 分:{total_score})")
+            trade_logger.info(f"🚨 共振触发: {mint} (人数:{count}, 分:{total_score})")
             if self.signal_callback:
                 signal = {
                     "token_address": mint,

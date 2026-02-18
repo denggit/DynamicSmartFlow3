@@ -243,7 +243,6 @@ async def test_websocket_and_helius_api():
             SOLANA_PRIVATE_KEY_BASE58,
         )
         import websockets
-        from websockets.exceptions import InvalidStatusCode
 
         if not helius_key_pool.get_wss_url():
             logger.error("❌ WSS 为空（需配置 HELIUS_API_KEY）")
@@ -269,17 +268,16 @@ async def test_websocket_and_helius_api():
                         logger.info("✅ WebSocket 已连接（订阅响应超时可接受）")
                     ws_ok = True
                     break
-            except InvalidStatusCode as e:
-                if e.status_code == 429 and helius_key_pool.size >= 1:
+            except Exception as e:
+                status_code = getattr(e, "status_code", None)
+                is_429 = status_code == 429 or "429" in str(e).lower()
+                if is_429 and helius_key_pool.size >= 1:
                     helius_key_pool.mark_current_failed()
                     logger.warning("⚠️ Helius WebSocket 429，已切换 Key 重试")
                     continue
-                logger.error("❌ WebSocket 连接被拒绝: HTTP %s", e.status_code)
-                break
-            except websockets.exceptions.InvalidURI as e:
-                logger.error("❌ WebSocket URI 无效: %s", e)
-                break
-            except Exception as e:
+                if "invalid uri" in str(e).lower() or "invaliduri" in str(e).lower():
+                    logger.error("❌ WebSocket URI 无效: %s", e)
+                    break
                 logger.error("❌ WebSocket 连接失败: %s", e)
                 break
 

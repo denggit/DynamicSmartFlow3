@@ -20,13 +20,14 @@ from typing import Dict, List, Callable, Optional
 
 import httpx
 import websockets
-from websockets.exceptions import InvalidStatusCode
 
 from config.settings import helius_key_pool
 from services.helius.sm_searcher import TransactionParser
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+# 猎手交易单独写入 monitor.log，便于查看时间与交易币种
+trade_logger = get_logger("trade")
 
 
 class TokenMission:
@@ -178,15 +179,14 @@ class HunterAgentController:
                                 logger.info("🔄 监控列表变动，重启 WebSocket...")
                                 break
 
-            except InvalidStatusCode as e:
-                if e.status_code == 429:
+            except Exception as e:
+                status_code = getattr(e, "status_code", None)
+                is_429 = status_code == 429 or "429" in str(e).lower()
+                if is_429:
                     helius_key_pool.mark_current_failed()
                     logger.warning("⚠️ Helius WebSocket 429 限流，已切换 Key，5 秒后重试")
                 else:
-                    logger.exception("❌ WS 连接被拒绝: HTTP %s", e.status_code)
-                await asyncio.sleep(5)
-            except Exception:
-                logger.exception("❌ Agent 监控异常，5秒后重试")
+                    logger.exception("❌ Agent 监控异常，5秒后重试")
                 await asyncio.sleep(5)
 
     async def process_log(self, log_info):
@@ -303,7 +303,7 @@ class HunterAgentController:
             else:
                 ratio = 1.0  # 异常情况，视为全卖
 
-            logger.info(
+            trade_logger.info(
                 f"📉 [Agent] 猎手 {hunter[:6]} 卖出 {token[:6]} | 数量: {sell_amount:.2f} | 比例: {ratio:.1%} (剩 {new_bal:.2f})")
 
             # 触发回调
@@ -329,7 +329,7 @@ class HunterAgentController:
             else:
                 increase_ratio = 1.0  # 建仓
 
-            logger.info(
+            trade_logger.info(
                 f"📈 [Agent] 猎手 {hunter[:6]} 加仓 {token[:6]} | 数量: +{delta:.2f} | 增幅: {increase_ratio:.1%}")
 
             if self.signal_callback:
