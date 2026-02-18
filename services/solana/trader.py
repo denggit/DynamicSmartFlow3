@@ -310,7 +310,7 @@ class SolanaTrader:
 
         sell_amount_ui = min(sell_amount_ui, share.token_amount)
 
-        # 链上余额为准：查到多少卖多少（粉尘清仓、部分卖出均直接以链上为准）
+        # 链上余额为准：查到多少卖多少；查余额失败时兜底 99.9% 防超卖
         chain_bal = await self._fetch_own_token_balance(token_address)
         if chain_bal is not None:
             if sell_amount_ui > chain_bal:
@@ -327,6 +327,9 @@ class SolanaTrader:
                     ratio = chain_bal / old_total
                     for s in pos.shares.values():
                         s.token_amount *= ratio
+        else:
+            # 查余额失败，兜底 99.9%
+            sell_amount_ui = min(sell_amount_ui, share.token_amount * SELL_BUFFER)
         if sell_amount_ui <= 0:
             logger.warning("链上无持仓或余额为 0，跳过卖出")
             return
@@ -416,10 +419,12 @@ class SolanaTrader:
 
         for level, sell_pct in TAKE_PROFIT_LEVELS:
             if pnl_pct >= level and level not in pos.tp_hit_levels:
-                sell_amount = pos.total_tokens * sell_pct  # 分批止盈，检查到多少卖多少
+                sell_amount = pos.total_tokens * sell_pct
                 chain_bal = await self._fetch_own_token_balance(token_address)
                 if chain_bal is not None:
-                    sell_amount = min(sell_amount, chain_bal)  # 以链上为准，不预留 buffer
+                    sell_amount = min(sell_amount, chain_bal)
+                else:
+                    sell_amount = min(sell_amount, pos.total_tokens * SELL_BUFFER)  # 查余额失败，兜底 99.9%
                     if chain_bal < pos.total_tokens * 0.99:
                         logger.warning("⚠️ 止盈前状态与链上不一致: 内部 %.2f vs 链上 %.2f", pos.total_tokens, chain_bal)
                 if sell_amount <= 0:
