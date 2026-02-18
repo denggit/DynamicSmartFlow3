@@ -514,7 +514,7 @@ class HunterMonitorController:
                     for addr in frequent_removed:
                         if addr in self.storage.hunters:
                             del self.storage.hunters[addr]
-                            logger.info("🚫 踢出频繁交易猎手 %s.. (平均间隔<5分钟)", addr)
+                            logger.info("🚫 踢出猎手 %s (持仓时间分布不符合: 过频或过慢)", addr)
                     if frequent_removed:
                         current_hunters = list(self.storage.hunters.items())
 
