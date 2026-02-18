@@ -112,14 +112,20 @@ class SolanaTrader:
         return base
 
     async def _recreate_rpc_client(self) -> None:
-        """当前 Helius key 不可用时，仅切换 Helius 池内下一个并重建 RPC 客户端。"""
+        """
+        当前 Helius key 不可用（429 等）时，切换 Helius 池内下一个并重建 RPC 客户端。
+        若仅配置 1 个 Key，切换无效，需在 .env 中配置多个：HELIUS_API_KEY=key1,key2,key3
+        """
         try:
             await self.rpc_client.close()
         except Exception:
             pass
         self._helius_pool.mark_current_failed()
         self.rpc_client = AsyncClient(self._helius_pool.get_rpc_url(), commitment=Confirmed)
-        logger.info("🔄 已切换 Helius Key，重建 RPC 客户端")
+        if self._helius_pool.size <= 1:
+            logger.warning("⚠️ 仅配置 1 个 Helius Key，429 时切换无效，建议配置多个: HELIUS_API_KEY=key1,key2,key3")
+        else:
+            logger.info("🔄 已切换 Helius Key，重建 RPC 客户端")
 
     async def close(self):
         await self.rpc_client.close()
@@ -439,7 +445,7 @@ class SolanaTrader:
     async def _get_decimals(self, mint_address: str) -> int:
         """
         获取代币精度。Pump.fun 代币多为 6 位，遇 429/限流时不再重试，
-        直接返回默认值以免进一步消耗额度。
+        直接返回默认值；但必须切换 Helius Key，否则后续 send_transaction 会继续打同一 Key。
         """
         try:
             pubkey = Pubkey.from_string(mint_address)
@@ -447,7 +453,9 @@ class SolanaTrader:
             return resp.value.decimals
         except Exception as e:
             if _is_rate_limit_error(e):
-                logger.warning("获取 decimals 遇限流，使用默认 6 (pump 常见): %s", e)
+                logger.warning("获取 decimals 遇限流，切换 Key 并使用默认 6: %s", e)
+                if self._helius_pool.size >= 1:
+                    await self._recreate_rpc_client()
             else:
                 logger.exception("获取 decimals 失败，使用默认 6")
             return 6  # pump.fun 代币常见精度
