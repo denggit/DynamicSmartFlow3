@@ -467,11 +467,11 @@ class HunterMonitorController:
         count = len(addrs)
         total_score = sum(scores)
 
-        c1 = count >= 3
-        c2 = count >= 2 and any(s >= 90 for s in scores)
-        c3 = count >= 2 and total_score >= 160
+        HIGH_SCORE_THRESHOLD = 80  # 80 分以上为高分猎手
+        c1 = count >= 2  # 两个猎手持仓
+        c2 = count >= 1 and any(s >= HIGH_SCORE_THRESHOLD for s in scores)  # 一个高分猎手持仓
 
-        if c1 or c2 or c3:
+        if c1 or c2:
             trade_logger.info(f"🚨 共振触发: {mint} (人数:{count}, 分:{total_score})")
             if self.signal_callback:
                 signal = {

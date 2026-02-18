@@ -418,22 +418,35 @@ class SolanaTrader:
                 return 9  # 默认 9，meme 常见精度
         return 9
 
-    # 辅助: 份额分配 (逻辑同前)
     def _rebalance_shares_logic(self, pos: Position, hunters: List[Dict]):
-        # ... (保持之前的代码不变) ...
+        """
+        份额分配：谁卖跟谁跑。
+        - 1 个猎手：100% 份额，只跟这一个人买卖（除非后续有新猎手进场会触发重新分配）
+        - 2 个猎手：按分数比例分配
+        - 3 个及以上：均分三份（取前三人）
+        """
         count = len(hunters)
-        if count == 0: return
-        active_hunters = hunters[:3]
+        if count == 0:
+            return
         total_tokens = pos.total_tokens
         new_shares = {}
-        if len(active_hunters) >= 3:
+
+        if count == 1:
+            # 单猎手跟仓：全部份额归其一人，只需跟其买卖
+            h = hunters[0]
+            new_shares[h['address']] = VirtualShare(h['address'], h.get('score', 0), total_tokens)
+        elif count >= 3:
+            # 三人及以上：均分三份
+            active = hunters[:3]
             share_amt = total_tokens / 3.0
-            for h in active_hunters:
+            for h in active:
                 new_shares[h['address']] = VirtualShare(h['address'], h.get('score', 0), share_amt)
         else:
-            total_score = sum(h.get('score', 0) for h in active_hunters)
-            if total_score == 0: total_score = 1
-            for h in active_hunters:
+            # 两人：按分数比例分配
+            total_score = sum(h.get('score', 0) for h in hunters)
+            if total_score == 0:
+                total_score = 1
+            for h in hunters:
                 ratio = h.get('score', 0) / total_score
                 new_shares[h['address']] = VirtualShare(h['address'], h.get('score', 0), total_tokens * ratio)
         pos.shares = new_shares
