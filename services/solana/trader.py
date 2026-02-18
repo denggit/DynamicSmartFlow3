@@ -21,6 +21,7 @@ from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
 from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
+from solders.message import to_bytes_versioned
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
@@ -380,7 +381,7 @@ class SolanaTrader:
                 swap_transaction_base64 = swap_data.get("swapTransaction") or swap_data.get("transaction")
                 raw_tx = base64.b64decode(swap_transaction_base64)
                 tx = VersionedTransaction.from_bytes(raw_tx)
-                signature = self.keypair.sign_message(tx.message.to_bytes_versioned(tx.message))
+                signature = self.keypair.sign_message(to_bytes_versioned(tx.message))
                 signed_tx = VersionedTransaction.populate(tx.message, [signature])
                 opts = TxOpts(skip_preflight=True, preflight_commitment=Confirmed)
                 sig = await self.rpc_client.send_raw_transaction(bytes(signed_tx), opts=opts)
@@ -401,16 +402,21 @@ class SolanaTrader:
         return None, 0
 
     async def _get_decimals(self, mint_address: str) -> int:
-        """获取代币精度"""
-        # 可以缓存这个结果
-        try:
-            # 简易实现：使用 get_token_supply
-            pubkey = Pubkey.from_string(mint_address)
-            resp = await self.rpc_client.get_token_supply(pubkey)
-            return resp.value.decimals
-        except Exception:
-            logger.exception("获取 decimals 失败，使用默认 6")
-            return 6  # 默认兜底
+        """获取代币精度，429 时切换 Key 重试。"""
+        for _ in range(max(2, self._helius_pool.size)):
+            try:
+                pubkey = Pubkey.from_string(mint_address)
+                resp = await self.rpc_client.get_token_supply(pubkey)
+                return resp.value.decimals
+            except Exception as e:
+                err_str = str(e).lower()
+                if "429" in err_str or "rate" in err_str or "limit" in err_str:
+                    await self._recreate_rpc_client()
+                    await asyncio.sleep(1)
+                    continue
+                logger.exception("获取 decimals 失败，使用默认 9")
+                return 9  # 默认 9，meme 常见精度
+        return 9
 
     # 辅助: 份额分配 (逻辑同前)
     def _rebalance_shares_logic(self, pos: Position, hunters: List[Dict]):
