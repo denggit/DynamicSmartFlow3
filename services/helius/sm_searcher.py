@@ -35,13 +35,9 @@ MIN_TOKEN_AGE_SEC = 900  # 最少上市 15分钟 (排除纯土狗/貔貅)
 MAX_TOKEN_AGE_SEC = 10800  # 最多上市 3小时 (太老的币数据太深，不挖了)
 MAX_BACKTRACK_PAGES = 10  # 最多回溯10页 (1万笔交易)，对于3小时内的币通常足够
 
-# 猎手筛选：按「每个 token 持仓时间」判断，理想区间 5分钟～1天
+# 频繁交易过滤：平均间隔 < 5 分钟的地址不纳入/踢出猎手池（只统计「真实交易」）
 RECENT_TX_COUNT_FOR_FREQUENCY = 100
-MIN_HOLD_SEC = 300        # 单次持仓最少 5 分钟（低于此= scalp 过于频繁）
-MAX_HOLD_SEC = 86400      # 单次持仓最多 1 天（超过此= 长持不符合跟单节奏）
-MAX_PCT_UNDER_5MIN = 0.5  # 超 50% 持仓 <5 分钟 → 踢出（频繁）
-MAX_PCT_OVER_1DAY = 0.5   # 超 50% 持仓 >1 天 → 踢出（太慢）
-MIN_HOLDING_SAMPLES = 3   # 至少 3 个完整回合（买+卖）才做判断
+MIN_AVG_TX_INTERVAL_SEC = 300
 
 # 与 SmartFlow3 一致：只把「真实买卖」算作交易，忽略 SOL/USDC/USDT 等
 IGNORE_MINTS = {
@@ -83,62 +79,26 @@ def is_real_trade_for_address(tx: dict, address: str) -> bool:
     return False
 
 
-def _compute_avg_holding_per_token(txs: list, address: str) -> list:
+def _is_frequent_trader_by_real_txs(txs: list, address: str) -> bool:
     """
-    按「单币」计算：每个 token 独立解析其所有买→卖回合的持仓时长，取该 token 的平均。
-    返回各 token 的平均持仓时长列表（秒），每个 token 一个数。
-    只统计非 IGNORE 代币。
+    根据「真实交易」时间戳计算平均间隔；只统计该地址参与的真实买卖。
+    txs: 已解析的交易列表（与 sigs 顺序一致，新在前），来自 fetch_parsed_transactions。
     """
-    parser = TransactionParser(address)
-    # mint -> [(amount, buy_ts), ...] 该 token 的买入队列（单币内部按时间先后匹配卖）
-    buy_queues: Dict[str, list] = defaultdict(list)
-    # mint -> [hold_sec, ...] 该 token 各回合的持仓时长
-    hold_per_mint: Dict[str, list] = defaultdict(list)
-
-    sorted_txs = sorted([t for t in txs if t.get("timestamp")], key=lambda x: x.get("timestamp", 0))
-    for tx in sorted_txs:
-        _, token_changes, _ = parser.parse_transaction(tx)
-        ts = tx.get("timestamp", 0)
-        for mint, delta in token_changes.items():
-            if mint in IGNORE_MINTS or abs(delta) < 1e-9:
-                continue
-            if delta > 0:  # 买入
-                buy_queues[mint].append((delta, ts))
-            else:  # 卖出：与该 token 的买入按时间先后匹配
-                to_sell = abs(delta)
-                while to_sell > 1e-9 and buy_queues[mint]:
-                    amt, buy_ts = buy_queues[mint].pop(0)
-                    close_amt = min(amt, to_sell)
-                    hold_sec = ts - buy_ts
-                    if hold_sec > 0:
-                        hold_per_mint[mint].append(hold_sec)
-                    if amt > close_amt + 1e-9:
-                        buy_queues[mint].insert(0, (amt - close_amt, buy_ts))
-                    to_sell -= close_amt
-
-    # 每个 token 一个平均持仓时长
-    avg_per_token = []
-    for mint, holds in hold_per_mint.items():
-        if holds:
-            avg_per_token.append(sum(holds) / len(holds))
-    return avg_per_token
-
-
-def _should_kick_by_holding_times(avg_per_token: list) -> bool:
-    """
-    按单币平均持仓判断：>50% 的 token 平均持仓 <5min 为过于频繁，
-    >50% 的 token 平均持仓 >1天 为过于缓慢。
-    """
-    if len(avg_per_token) < MIN_HOLDING_SAMPLES:
+    real_ts = []
+    for tx in txs:
+        if len(real_ts) >= RECENT_TX_COUNT_FOR_FREQUENCY:
+            break
+        if not is_real_trade_for_address(tx, address):
+            continue
+        ts = tx.get("timestamp")
+        if ts is not None:
+            real_ts.append(ts)
+    if len(real_ts) < 2:
         return False
-    total = len(avg_per_token)
-    count_short = sum(1 for h in avg_per_token if h < MIN_HOLD_SEC)
-    count_long = sum(1 for h in avg_per_token if h > MAX_HOLD_SEC)
-    if count_short / total > MAX_PCT_UNDER_5MIN:
-        return True  # 过于频繁
-    if count_long / total > MAX_PCT_OVER_1DAY:
-        return True  # 过于缓慢
-    return False
+    real_ts.sort()
+    span = real_ts[-1] - real_ts[0]
+    avg_interval = span / (len(real_ts) - 1)
+    return avg_interval < MIN_AVG_TX_INTERVAL_SEC
 
 
 def _normalize_token_amount(raw) -> float:
@@ -317,15 +277,14 @@ class SmartMoneySearcher:
 
     async def is_frequent_trader(self, client, address: str) -> bool:
         """
-        判断该地址是否应踢出：按每个 token 持仓时间统计，
-        >50% 持仓 <5 分钟（过于频繁）或 >50% 持仓 >1 天（过于缓慢）则踢出。
+        判断该地址是否为「频繁交易」：最近 100 笔「真实交易」平均间隔 < 5 分钟。
+        只统计该地址参与的真实买卖（非 IGNORE 代币 / meaningful native），与 SmartFlow3 一致。
         """
         sigs = await self.get_signatures(client, address, limit=RECENT_TX_COUNT_FOR_FREQUENCY)
         if not sigs:
             return False
         txs = await self.fetch_parsed_transactions(client, sigs)
-        avg_per_token = _compute_avg_holding_per_token(txs or [], address)
-        return _should_kick_by_holding_times(avg_per_token)
+        return _is_frequent_trader_by_real_txs(txs or [], address)
 
     async def fetch_parsed_transactions(self, client, signatures):
         if not signatures: return []
@@ -353,15 +312,9 @@ class SmartMoneySearcher:
         txs = await self.fetch_parsed_transactions(client, sigs)
         if not txs:
             return None
-        avg_per_token = _compute_avg_holding_per_token(txs, hunter_address)
-        if _should_kick_by_holding_times(avg_per_token):
-            n_short = sum(1 for h in avg_per_token if h < MIN_HOLD_SEC)
-            n_long = sum(1 for h in avg_per_token if h > MAX_HOLD_SEC)
-            total = len(avg_per_token)
-            if n_short / total > MAX_PCT_UNDER_5MIN:
-                logger.info("⏭️ 剔除地址 %s.. (%.0f%% 持仓<5分钟，过于频繁)", hunter_address, n_short / total * 100)
-            else:
-                logger.info("⏭️ 剔除地址 %s.. (%.0f%% 持仓>1天，过于缓慢)", hunter_address, n_long / total * 100)
+        # 频繁交易过滤：只统计「真实交易」，最近 100 笔真实买卖平均间隔 < 5 分钟则剔除
+        if _is_frequent_trader_by_real_txs(txs, hunter_address):
+            logger.info("⏭️ 剔除频繁交易地址 %s.. (真实交易平均间隔<5分钟)", hunter_address)
             return None
         if not txs: return None
 
