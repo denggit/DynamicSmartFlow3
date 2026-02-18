@@ -22,7 +22,7 @@ import websockets
 # 导入配置和依赖模块
 from config.settings import helius_key_pool
 from services.dexscreener.dex_scanner import DexScanner
-from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
+from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser, tx_has_real_trade
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -37,6 +37,16 @@ MAINTENANCE_INTERVAL = 86400  # 维护间隔 1天 (大幅降低频率)
 POOL_SIZE_LIMIT = 50  # 地址库上限
 ZOMBIE_THRESHOLD = 86400 * 10  # 10天不交易视为僵尸 (清理标准)
 AUDIT_EXPIRATION = 86400 * 15  # 体检有效期 15天 (重算分数标准)
+
+# Helius 消耗控制：仅做去重，不限制监听数量
+RECENT_SIG_TTL_SEC = 90  # 同一 signature 在此时间内不重复拉取（去重）
+DISCOVERY_INTERVAL_WHEN_FULL_SEC = 43200  # 猎手池已满(50)时，挖掘间隔改为 12 小时
+
+# 与 SmartFlow3 一致：拉取交易详情时重试（WebSocket 推送时 Helius 可能尚未索引）
+FETCH_TX_MAX_RETRIES = 3
+FETCH_TX_RETRY_DELAY_BASE = 2  # 第 i 次重试前等待 2+i 秒
+# 订阅使用 processed 可更早收到通知（与 SmartFlow3 一致）
+LOGS_COMMITMENT = "processed"
 
 
 class HunterStorage:
@@ -143,6 +153,8 @@ class HunterMonitorController:
 
         # 实时持仓状态池
         self.active_holdings = defaultdict(dict)
+        # Helius 消耗控制：仅去重
+        self._recent_sigs: Dict[str, float] = {}  # signature -> 首次处理时间
 
     async def start(self):
         logger.info("🚀 启动 Hunter Monitor 系统 (V3 低功耗版)...")
@@ -163,7 +175,11 @@ class HunterMonitorController:
                     self.storage.prune_and_update(new_hunters)
             except Exception:
                 logger.exception("❌ 挖掘异常")
-            await asyncio.sleep(DISCOVERY_INTERVAL)
+            # 池满时降低挖掘频率，避免无意义消耗 credit
+            if len(self.storage.hunters) >= POOL_SIZE_LIMIT:
+                await asyncio.sleep(DISCOVERY_INTERVAL_WHEN_FULL_SEC)
+            else:
+                await asyncio.sleep(DISCOVERY_INTERVAL)
 
     # --- 线程 2: 监控 ---
     async def realtime_monitor_loop(self):
@@ -175,20 +191,53 @@ class HunterMonitorController:
                     await asyncio.sleep(10)
                     continue
 
-                async with websockets.connect(helius_key_pool.get_wss_url()) as ws:
+                async with websockets.connect(
+                    helius_key_pool.get_wss_url(),
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=None,
+                    max_size=None,
+                ) as ws:
                     payload = {
                         "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-                        "params": [{"mentions": monitored_addrs}, {"commitment": "confirmed"}]
+                        "params": [{"mentions": monitored_addrs}, {"commitment": LOGS_COMMITMENT}]
                     }
                     await ws.send(json.dumps(payload))
-                    logger.info(f"✅ WebSocket 订阅 {len(monitored_addrs)} 地址")
+                    logger.info(f"📤 已发送订阅请求 ({len(monitored_addrs)} 地址)，等待确认...")
+                    # 与 SmartFlow3 一致：等待订阅确认或首条通知（最多约 5 秒）
+                    sub_ok = False
+                    for _ in range(10):
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                            data = json.loads(msg)
+                            if data.get("id") == 1 and "result" in data:
+                                sub_ok = True
+                                logger.info(f"✅ 订阅成功，订阅ID: {data['result']}")
+                                break
+                            if data.get("method") == "logsNotification":
+                                sub_ok = True
+                                logger.info("✅ 已收到交易通知，订阅已生效")
+                                await self.process_transaction_log(data["params"]["result"])
+                                break
+                        except asyncio.TimeoutError:
+                            continue
+                    if not sub_ok:
+                        logger.warning("⚠️ 订阅确认超时，继续监控...")
+                    logger.info(f"👀 监控就绪，监听 {len(monitored_addrs)} 个猎手")
 
+                    # 主循环：与 SmartFlow3 一致，仅处理 logsNotification，避免误处理其他类型导致异常
                     while True:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=60)
                             data = json.loads(msg)
-                            if "params" in data:
-                                await self.process_transaction_log(data["params"]["result"])
+                            if data.get("method") != "logsNotification":
+                                continue
+                            res = data["params"]["result"]
+                            sig = (res.get("value") or {}).get("signature")
+                            if not sig:
+                                logger.warning("logsNotification 缺少 signature")
+                                continue
+                            await self.process_transaction_log(res)
                         except asyncio.TimeoutError:
                             await ws.ping()
                             # 检查列表变更
@@ -206,30 +255,78 @@ class HunterMonitorController:
                 await asyncio.sleep(5)
 
     async def process_transaction_log(self, log_info):
-        signature = log_info['value']['signature']
+        """处理单条 logsNotification 的 result，与 SmartFlow3 结构一致：params.result.value.signature。"""
+        value = log_info.get("value") or {}
+        signature = value.get("signature")
+        if not signature:
+            logger.warning("process_transaction_log 缺少 value.signature: %s", str(log_info)[:200])
+            return
+        now = time.time()
+
+        # 去重：同一 signature 在 TTL 内只拉一次，避免重复扣 credit
+        if signature in self._recent_sigs and (now - self._recent_sigs[signature]) < RECENT_SIG_TTL_SEC:
+            return
+        self._recent_sigs[signature] = now
+        for sig in list(self._recent_sigs.keys()):
+            if now - self._recent_sigs[sig] > RECENT_SIG_TTL_SEC * 2:
+                del self._recent_sigs[sig]
+
         try:
             from httpx import AsyncClient
-            async with AsyncClient() as client:
-                url = helius_key_pool.get_http_endpoint()
-                resp = await client.post(url, json={"transactions": [signature]}, timeout=10)
-                if resp.status_code == 429 and helius_key_pool.size > 1:
-                    helius_key_pool.mark_current_failed()
-                if resp.status_code != 200:
-                    return
-                txs = resp.json()
-                if not txs: return
-                tx = txs[0]
+            payload = {"transactions": [signature]}
+            tx = None
+            async with AsyncClient(timeout=10.0) as client:
+                for attempt in range(FETCH_TX_MAX_RETRIES):
+                    url = helius_key_pool.get_http_endpoint()
+                    resp = await client.post(url, json=payload)
+                    if resp.status_code == 429 and helius_key_pool.size >= 1:
+                        helius_key_pool.mark_current_failed()
+                    if resp.status_code != 200:
+                        if attempt < FETCH_TX_MAX_RETRIES - 1:
+                            await asyncio.sleep(FETCH_TX_RETRY_DELAY_BASE + attempt)
+                        continue
+                    txs = resp.json()
+                    if txs and len(txs) > 0:
+                        tx = txs[0]
+                        break
+                    # Helius 可能尚未索引，与 SmartFlow3 一致：重试 + 退避
+                    if attempt < FETCH_TX_MAX_RETRIES - 1:
+                        logger.debug("交易 %s.. 尚未索引，%d 秒后重试", signature[:16], FETCH_TX_RETRY_DELAY_BASE + attempt)
+                        await asyncio.sleep(FETCH_TX_RETRY_DELAY_BASE + attempt)
+            if not tx:
+                logger.warning("拉取交易详情失败（已重试 %d 次）: %s..", FETCH_TX_MAX_RETRIES, signature[:16])
+                return
 
-                tx_accounts = set()
-                if 'accountData' in tx:
-                    for acc in tx['accountData']:
-                        tx_accounts.add(acc.get('account'))
+            # 与 SmartFlow3 一致：非真实交易（无 token 买卖 / 无 meaningful native）直接跳过，不参与统计
+            if not tx_has_real_trade(tx):
+                return
 
-                active_hunters = set(self.storage.get_monitored_addresses()).intersection(tx_accounts)
+            # 从交易中收集参与账户：Helius 可能无 accountData，用 feePayer + 各类 transfer 的 from/to
+            tx_accounts = set()
+            fp = tx.get("feePayer") or tx.get("fee_payer")
+            if fp:
+                tx_accounts.add(fp)
+            for nt in tx.get("nativeTransfers", []):
+                for key in ("fromUserAccount", "toUserAccount"):
+                    a = nt.get(key)
+                    if a:
+                        tx_accounts.add(a)
+            for tt in tx.get("tokenTransfers", []):
+                for key in ("fromUserAccount", "toUserAccount"):
+                    a = tt.get(key)
+                    if a:
+                        tx_accounts.add(a)
+            if "accountData" in tx:
+                for acc in tx["accountData"]:
+                    a = acc.get("account")
+                    if a:
+                        tx_accounts.add(a)
 
-                for hunter in active_hunters:
-                    self.storage.update_last_active(hunter, time.time())
-                    await self.analyze_action(hunter, tx)
+            active_hunters = set(self.storage.get_monitored_addresses()).intersection(tx_accounts)
+
+            for hunter in active_hunters:
+                self.storage.update_last_active(hunter, time.time())
+                await self.analyze_action(hunter, tx)
         except Exception:
             logger.exception("process_transaction_log 异常")
 
@@ -297,6 +394,18 @@ class HunterMonitorController:
 
                 from httpx import AsyncClient
                 async with AsyncClient() as client:
+                    # 0. 频繁交易剔除：最近 100 笔平均间隔 < 5 分钟的踢出猎手池
+                    frequent_removed = []
+                    for addr, _ in current_hunters:
+                        if await self.sm_searcher.is_frequent_trader(client, addr):
+                            frequent_removed.append(addr)
+                    for addr in frequent_removed:
+                        if addr in self.storage.hunters:
+                            del self.storage.hunters[addr]
+                            logger.info("🚫 踢出频繁交易猎手 %s.. (平均间隔<5分钟)", addr[:8])
+                    if frequent_removed:
+                        current_hunters = list(self.storage.hunters.items())
+
                     for addr, info in current_hunters:
                         last_audit = info.get('last_audit', 0)
 

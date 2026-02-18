@@ -35,6 +35,84 @@ MIN_TOKEN_AGE_SEC = 900  # 最少上市 15分钟 (排除纯土狗/貔貅)
 MAX_TOKEN_AGE_SEC = 10800  # 最多上市 3小时 (太老的币数据太深，不挖了)
 MAX_BACKTRACK_PAGES = 10  # 最多回溯10页 (1万笔交易)，对于3小时内的币通常足够
 
+# 频繁交易过滤：平均间隔 < 5 分钟的地址不纳入/踢出猎手池（只统计「真实交易」）
+RECENT_TX_COUNT_FOR_FREQUENCY = 100
+MIN_AVG_TX_INTERVAL_SEC = 300
+
+# 与 SmartFlow3 一致：只把「真实买卖」算作交易，忽略 SOL/USDC/USDT 等
+IGNORE_MINTS = {
+    "So11111111111111111111111111111111111111112",  # WSOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",   # USDT
+}
+MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算「真实」
+
+
+def tx_has_real_trade(tx: dict) -> bool:
+    """
+    判断该笔链上交易是否包含「真实交易」：非纯授权/失败/粉尘。
+    与 SmartFlow3 一致：存在非 IGNORE 代币的 tokenTransfer，或 meaningful 的 nativeTransfer。
+    """
+    for tt in tx.get("tokenTransfers", []):
+        if tt.get("mint") and tt["mint"] not in IGNORE_MINTS:
+            return True
+    for nt in tx.get("nativeTransfers", []):
+        if (nt.get("amount") or 0) >= MIN_NATIVE_LAMPORTS_FOR_REAL:
+            return True
+    return False
+
+
+def is_real_trade_for_address(tx: dict, address: str) -> bool:
+    """
+    判断该笔交易对给定地址而言是否为「真实交易」：该地址参与了非 IGNORE 的 token 或 meaningful 的 native。
+    """
+    for tt in tx.get("tokenTransfers", []):
+        if tt.get("mint") in IGNORE_MINTS:
+            continue
+        if tt.get("fromUserAccount") == address or tt.get("toUserAccount") == address:
+            return True
+    for nt in tx.get("nativeTransfers", []):
+        if (nt.get("amount") or 0) < MIN_NATIVE_LAMPORTS_FOR_REAL:
+            continue
+        if nt.get("fromUserAccount") == address or nt.get("toUserAccount") == address:
+            return True
+    return False
+
+
+def _is_frequent_trader_by_real_txs(txs: list, address: str) -> bool:
+    """
+    根据「真实交易」时间戳计算平均间隔；只统计该地址参与的真实买卖。
+    txs: 已解析的交易列表（与 sigs 顺序一致，新在前），来自 fetch_parsed_transactions。
+    """
+    real_ts = []
+    for tx in txs:
+        if len(real_ts) >= RECENT_TX_COUNT_FOR_FREQUENCY:
+            break
+        if not is_real_trade_for_address(tx, address):
+            continue
+        ts = tx.get("timestamp")
+        if ts is not None:
+            real_ts.append(ts)
+    if len(real_ts) < 2:
+        return False
+    real_ts.sort()
+    span = real_ts[-1] - real_ts[0]
+    avg_interval = span / (len(real_ts) - 1)
+    return avg_interval < MIN_AVG_TX_INTERVAL_SEC
+
+
+def _normalize_token_amount(raw) -> float:
+    """将 Helius tokenAmount 转为浮点数。支持数字或对象 { amount: string, decimals: int }（与 SmartFlow3 一致）。"""
+    if raw is None:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, dict):
+        amount = float(raw.get("amount") or 0)
+        decimals = int(raw.get("decimals") or 0)
+        return amount / (10 ** decimals) if decimals else amount
+    return float(raw)
+
 
 class TransactionParser:
     def __init__(self, target_wallet: str):
@@ -55,7 +133,7 @@ class TransactionParser:
 
         for tt in tx.get('tokenTransfers', []):
             mint = tt.get('mint', '')
-            amt = tt.get('tokenAmount', 0)
+            amt = _normalize_token_amount(tt.get('tokenAmount'))
             if mint == self.wsol_mint:
                 if tt.get('fromUserAccount') == self.target_wallet:
                     wsol_change -= amt
@@ -197,6 +275,17 @@ class SmartMoneySearcher:
             params[1]["before"] = before
         return await self._rpc_post(client, "getSignaturesForAddress", params)
 
+    async def is_frequent_trader(self, client, address: str) -> bool:
+        """
+        判断该地址是否为「频繁交易」：最近 100 笔「真实交易」平均间隔 < 5 分钟。
+        只统计该地址参与的真实买卖（非 IGNORE 代币 / meaningful native），与 SmartFlow3 一致。
+        """
+        sigs = await self.get_signatures(client, address, limit=RECENT_TX_COUNT_FOR_FREQUENCY)
+        if not sigs:
+            return False
+        txs = await self.fetch_parsed_transactions(client, sigs)
+        return _is_frequent_trader_by_real_txs(txs or [], address)
+
     async def fetch_parsed_transactions(self, client, signatures):
         if not signatures: return []
         chunk_size = 90
@@ -218,8 +307,15 @@ class SmartMoneySearcher:
 
     async def analyze_hunter_performance(self, client, hunter_address, exclude_token=None):
         sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
-        if not sigs: return None
+        if not sigs:
+            return None
         txs = await self.fetch_parsed_transactions(client, sigs)
+        if not txs:
+            return None
+        # 频繁交易过滤：只统计「真实交易」，最近 100 笔真实买卖平均间隔 < 5 分钟则剔除
+        if _is_frequent_trader_by_real_txs(txs, hunter_address):
+            logger.info("⏭️ 剔除频繁交易地址 %s.. (真实交易平均间隔<5分钟)", hunter_address[:8])
+            return None
         if not txs: return None
 
         parser = TransactionParser(hunter_address)
