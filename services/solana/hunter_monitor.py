@@ -293,7 +293,7 @@ class HunterMonitorController:
                                         logger.info("✅ 订阅已正常，已收到首笔交易推送")
                                     logger.info(
                                         "📨 [猎手交易] sig=%s (本连接第 %d 笔)",
-                                        sig + "..." if len(sig) > 20 else sig,
+                                        sig[:20] + "..." if len(sig) > 20 else sig,
                                         recv_count,
                                     )
                                     self._sig_queue.put_nowait(sig)
