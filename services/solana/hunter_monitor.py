@@ -424,48 +424,6 @@ class HunterMonitorController:
                 logger.exception("消费队列异常")
                 await asyncio.sleep(1)
 
-    async def _log_holdings_summary(self, mint: str):
-        """买入后打日志：该 token 当前被多少猎手持仓，每人持仓价值多少 SOL。"""
-        holders = self.active_holdings.get(mint) or {}
-        if not holders:
-            return
-        try:
-            price_sol = await self.dex_scanner.get_token_price(mint)
-            from httpx import AsyncClient
-            parts = []
-            async with AsyncClient(timeout=6.0) as client:
-                for h in holders:
-                    try:
-                        payload = {
-                            "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
-                            "params": [h, {"mint": mint}, {"encoding": "jsonParsed"}]
-                        }
-                        resp = await client.post(helius_key_pool.get_rpc_url(), json=payload)
-                        if resp.status_code == 429 and helius_key_pool.size > 1:
-                            helius_key_pool.mark_current_failed()
-                        data = resp.json()
-                        raw, decimals = 0.0, 9
-                        if data.get("result", {}).get("value"):
-                            for acc in data["result"]["value"]:
-                                info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
-                                ta = info.get("tokenAmount") or {}
-                                raw += float(ta.get("amount", 0))
-                                decimals = int(ta.get("decimals", 9))
-                        amount_ui = raw / (10 ** decimals) if decimals else raw
-                        value_sol = amount_ui * price_sol if price_sol else 0.0
-                        parts.append(f"{h}={value_sol:.4f} SOL")
-                    except Exception:
-                        parts.append(f"{h}=(获取失败)")
-            count = len(holders)
-            trade_logger.info(
-                "📊 %s 当前被 %d 个猎手持仓 (每人价值): %s",
-                mint,
-                count,
-                ", ".join(parts),
-            )
-        except Exception:
-            logger.exception("_log_holdings_summary 异常")
-
     async def _process_one_tx(self, hunter: str, tx: dict):
         """单笔命中猎手的 tx：解析买卖、写 monitor.log、触发共振。"""
         parser = TransactionParser(hunter)
@@ -476,7 +434,8 @@ class HunterMonitorController:
             if sol_change < 0 and delta > 0:
                 self.active_holdings[mint][hunter] = time.time()
                 trade_logger.info(f"📥 买入: {hunter} -> {mint}")
-                asyncio.create_task(self._log_holdings_summary(mint))
+                holders = self.active_holdings[mint]
+                trade_logger.info("📊 %s 当前被 %d 个猎手持仓", mint, len(holders))
             elif sol_change > 0 and delta < 0:
                 if hunter in self.active_holdings[mint]:
                     del self.active_holdings[mint][hunter]
