@@ -34,7 +34,7 @@ HUNTER_DATA_FILE = "data/hunters.json"
 HUNTER_DATA_BACKUP = "data/hunters_backup.json"
 DISCOVERY_INTERVAL = 900  # 挖掘间隔 15分钟
 MAINTENANCE_INTERVAL = 86400  # 维护间隔 1天 (大幅降低频率)
-POOL_SIZE_LIMIT = 50  # 地址库上限
+POOL_SIZE_LIMIT = 300  # 地址库上限
 ZOMBIE_THRESHOLD = 86400 * 10  # 10天不交易视为僵尸 (清理标准)
 AUDIT_EXPIRATION = 86400 * 15  # 体检有效期 15天 (重算分数标准)
 
