@@ -22,7 +22,7 @@ import httpx
 import websockets
 
 from config.settings import helius_key_pool
-from services.helius.sm_searcher import TransactionParser
+from services.helius.sm_searcher import IGNORE_MINTS
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -213,9 +213,7 @@ class HunterAgentController:
                 if "result" not in data or not data["result"]: return
                 tx = data["result"]
 
-                # 2. 解析交易
-                # 我们需要知道哪个猎手参与了交易，且是否涉及我们在监控的 Token
-
+                # 2. 解析交易：找出参与的猎手，并只处理非 IGNORE 代币的变动（真实交易）
                 # 获取交易涉及的所有账号
                 account_keys = [k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"]]
                 involved_hunters = set(account_keys).intersection(self.hunter_map.keys())
@@ -229,16 +227,12 @@ class HunterAgentController:
                 block_time = tx.get("blockTime", time.time())
 
                 for hunter in involved_hunters:
-                    # 猎手 -> 涉及的Tokens -> 我们的Active Missions
                     potential_tokens = self.hunter_map[hunter]
-
-                    # 使用 Parser 解析具体的 Token 变动
-                    parser = TransactionParser(hunter)
-                    # 适配 RPC 格式到 parser 格式 (parser 期望 Helius API 格式，但也兼容部分 RPC)
-                    # 关键在于 meta.preTokenBalances 和 postTokenBalances
-
-                    # 手动计算余额变化 (比 Parser 更直接，因为我们有任务上下文)
                     token_changes = self._calculate_balance_changes(tx, hunter)
+                    # 与 SmartFlow3 一致：只把非 SOL/USDC/USDT 的变动当作真实交易，忽略 IGNORE_MINTS
+                    token_changes = {m: d for m, d in token_changes.items() if m not in IGNORE_MINTS}
+                    if not token_changes:
+                        continue
 
                     for token_addr, delta in token_changes.items():
                         # 只处理我们在监控的 Token
