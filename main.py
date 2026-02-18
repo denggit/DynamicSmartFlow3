@@ -218,6 +218,7 @@ async def main():
     trader.on_position_closed_callback = _on_position_closed
     await restore_agent_from_trader()
     monitor = HunterMonitorController(signal_callback=on_monitor_signal)
+    monitor.set_agent(agent)  # 跟仓信号由 Monitor 统一推送，避免 Agent 自建 WS 漏单
     agent.signal_callback = on_agent_signal
 
     await asyncio.gather(

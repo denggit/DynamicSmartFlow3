@@ -22,7 +22,7 @@ import websockets
 # 导入配置和依赖模块
 from config.settings import helius_key_pool
 from services.dexscreener.dex_scanner import DexScanner
-from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser, tx_has_real_trade
+from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -45,8 +45,17 @@ DISCOVERY_INTERVAL_WHEN_FULL_SEC = 43200  # 猎手池已满(50)时，挖掘间�
 # 与 SmartFlow3 一致：拉取交易详情时重试（WebSocket 推送时 Helius 可能尚未索引）
 FETCH_TX_MAX_RETRIES = 3
 FETCH_TX_RETRY_DELAY_BASE = 2  # 第 i 次重试前等待 2+i 秒
-# 使用 Helius transactionSubscribe（按账户包含），支持多地址；logsSubscribe 的 mentions 仅支持单地址且易漏 Swap
-TRANSACTION_COMMITMENT = "processed"
+WS_COMMITMENT = "processed"
+
+# 【Program WS】只监听 Program，不监听钱包；Solana logsSubscribe mentions 每次仅支持 1 个 Pubkey，故分 4 次订阅
+SWAP_PROGRAM_IDS = [
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",   # Jupiter Aggregator
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",   # Raydium AMM
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",   # Orca Whirlpool
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token Program
+]
+SIG_QUEUE_BATCH_SIZE = 15       # 批量拉取时每批最多 15 个 signature
+SIG_QUEUE_DRAIN_TIMEOUT = 0.3   # 凑批时每次 get 的超时（秒）
 
 
 class HunterStorage:
@@ -153,15 +162,24 @@ class HunterMonitorController:
 
         # 实时持仓状态池
         self.active_holdings = defaultdict(dict)
-        # Helius 消耗控制：仅去重
+        # 去重：同一 signature 在 TTL 内只处理一次
         self._recent_sigs: Dict[str, float] = {}  # signature -> 首次处理时间
+        # 【Program WS】只产 signature，中后段消费；钱包池不参与 WS 订阅
+        self._sig_queue: asyncio.Queue = asyncio.Queue()
+        # 跟仓阶段：命中钱包池的 tx 推给 Agent，避免 Agent 自建 WS 漏单
+        self.agent: Optional[Callable] = None
+
+    def set_agent(self, agent) -> None:
+        """主程序注入 Agent，Monitor 消费队列命中后会把 (tx, active_hunters) 推给 Agent。"""
+        self.agent = agent
 
     async def start(self):
-        logger.info("🚀 启动 Hunter Monitor 系统 (V3 低功耗版)...")
+        logger.info("🚀 启动 Hunter Monitor 系统 (Program WS + 钱包池过滤 + 兜底轮询)...")
         tasks = [
             asyncio.create_task(self.discovery_loop()),
-            asyncio.create_task(self.realtime_monitor_loop()),
-            asyncio.create_task(self.maintenance_loop())
+            asyncio.create_task(self._program_ws_loop()),       # 只拿 signature 入队
+            asyncio.create_task(self._consume_sig_queue_loop()), # 批量拉取 + 钱包过滤 + 发消息
+            asyncio.create_task(self.maintenance_loop()),
         ]
         await asyncio.gather(*tasks)
 
@@ -181,16 +199,12 @@ class HunterMonitorController:
             else:
                 await asyncio.sleep(DISCOVERY_INTERVAL)
 
-    # --- 线程 2: 监控 ---
-    async def realtime_monitor_loop(self):
-        logger.info("👀 [线程2] 监控启动")
+    # --- 【Program WS】只拿 signature，不做任何 RPC ---
+    async def _program_ws_loop(self):
+        """WebSocket 只订阅 4 个 Swap/Token Program，收到 logsNotification 只取 signature 入队。"""
+        logger.info("👀 [Program WS] 监控启动 (Jupiter/Raydium/Orca/SPL Token)")
         while True:
             try:
-                monitored_addrs = self.storage.get_monitored_addresses()
-                if not monitored_addrs:
-                    await asyncio.sleep(10)
-                    continue
-
                 async with websockets.connect(
                     helius_key_pool.get_wss_url(),
                     ping_interval=20,
@@ -198,147 +212,158 @@ class HunterMonitorController:
                     close_timeout=None,
                     max_size=None,
                 ) as ws:
-                    # Helius transactionSubscribe：按 accountInclude 推送，任意猎手参与的交易都会推（支持多地址）
-                    # logsSubscribe 的 mentions 仅支持单地址且 Swap 常不把地址写进日志，会漏单
-                    payload = {
-                        "jsonrpc": "2.0", "id": 1, "method": "transactionSubscribe",
-                        "params": [
-                            {"accountInclude": monitored_addrs},
-                            {
-                                "commitment": TRANSACTION_COMMITMENT,
-                                "encoding": "jsonParsed",
-                                "transactionDetails": "signatures",
-                                "maxSupportedTransactionVersion": 0,
-                            }
-                        ]
-                    }
-                    await ws.send(json.dumps(payload))
-                    logger.info(f"📤 已发送 transactionSubscribe ({len(monitored_addrs)} 地址)，进入接收循环")
-                    sub_was_unconfirmed = True
+                    # Solana logsSubscribe mentions 每次仅支持 1 个 Pubkey，故分 4 次订阅
+                    for sub_id, program_id in enumerate(SWAP_PROGRAM_IDS, start=1):
+                        payload = {
+                            "jsonrpc": "2.0", "id": sub_id, "method": "logsSubscribe",
+                            "params": [{"mentions": [program_id]}, {"commitment": WS_COMMITMENT}]
+                        }
+                        await ws.send(json.dumps(payload))
+                    logger.info("📤 已发送 4 个 Program 订阅，进入接收循环（只取 signature 入队）")
+                    sub_ok = False
                     idle_60s_count = 0
 
-                    # 主循环：处理 transactionNotification（Helius 按账户推送）
                     while True:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=60)
                             data = json.loads(msg)
-                            if data.get("method") != "transactionNotification":
+                            if data.get("method") == "logsNotification":
+                                idle_60s_count = 0
+                                res = (data.get("params") or {}).get("result") or {}
+                                val = res.get("value") or {}
+                                sig = val.get("signature")
+                                if sig:
+                                    if not sub_ok:
+                                        sub_ok = True
+                                        logger.info("✅ 订阅已正常，已收到交易推送")
+                                    self._sig_queue.put_nowait(sig)
+                            else:
                                 logger.info("收到 WebSocket 消息: method=%s id=%s", data.get("method"), data.get("id"))
-                                continue
-                            idle_60s_count = 0
-                            res = data.get("params") or {}
-                            result = res.get("result") or {}
-                            sig = result.get("signature")
-                            if not sig:
-                                logger.warning("transactionNotification 缺少 signature")
-                                continue
-                            if sub_was_unconfirmed:
-                                logger.info("✅ 订阅已正常，已收到交易推送")
-                                sub_was_unconfirmed = False
-                            logger.info("收到交易推送: %s..", sig[:20])
-                            # 复用原有处理：只传 signature 结构，后续会拉 Helius 解析后的详情
-                            await self.process_transaction_log({"value": {"signature": sig}})
                         except asyncio.TimeoutError:
                             await ws.ping()
                             idle_60s_count += 1
-                            # 每 10 分钟打一条存活日志，便于区分「程序在等」和「程序挂了」
                             if idle_60s_count >= 10:
-                                logger.info("监控运行中 | 已 %d 分钟无新推送（猎手有交易时会有日志）", idle_60s_count)
+                                logger.info("监控运行中 | 已 %d 分钟无新推送", idle_60s_count)
                                 idle_60s_count = 0
-                            # 检查列表变更
-                            if set(self.storage.get_monitored_addresses()) != set(monitored_addrs):
-                                break
 
             except Exception as e:
                 status_code = getattr(e, "status_code", None)
-                is_429 = status_code == 429 or "429" in str(e).lower()
-                if is_429:
+                if status_code == 429 or "429" in str(e).lower():
                     helius_key_pool.mark_current_failed()
                     logger.warning("⚠️ Helius WebSocket 429 限流，已切换 Key，5 秒后重试")
                 else:
                     logger.exception("⚠️ WS 重连异常")
                 await asyncio.sleep(5)
 
-    async def process_transaction_log(self, log_info):
-        """处理单条 logsNotification 的 result，与 SmartFlow3 结构一致：params.result.value.signature。"""
-        value = log_info.get("value") or {}
-        signature = value.get("signature")
-        if not signature:
-            logger.warning("process_transaction_log 缺少 value.signature: %s", str(log_info)[:200])
-            return
-        now = time.time()
+    # --- 【钱包池过滤 + 轻量解析】消费队列：批量拉取 → 只保留命中钱包池且真实交易的 tx ---
+    @staticmethod
+    def _involved_accounts(tx: dict) -> set:
+        """从 feePayer + nativeTransfers + tokenTransfers 收集参与账户，不依赖 accountData。"""
+        out = set()
+        fp = tx.get("feePayer") or tx.get("fee_payer")
+        if fp:
+            out.add(fp)
+        for nt in tx.get("nativeTransfers", []):
+            for k in ("fromUserAccount", "toUserAccount"):
+                a = nt.get(k)
+                if a:
+                    out.add(a)
+        for tt in tx.get("tokenTransfers", []):
+            for k in ("fromUserAccount", "toUserAccount"):
+                a = tt.get(k)
+                if a:
+                    out.add(a)
+        return out
 
-        # 去重：同一 signature 在 TTL 内只拉一次，避免重复扣 credit
-        if signature in self._recent_sigs and (now - self._recent_sigs[signature]) < RECENT_SIG_TTL_SEC:
-            return
-        self._recent_sigs[signature] = now
-        for sig in list(self._recent_sigs.keys()):
-            if now - self._recent_sigs[sig] > RECENT_SIG_TTL_SEC * 2:
-                del self._recent_sigs[sig]
+    @staticmethod
+    def _is_real_trade_light(tx: dict) -> bool:
+        """轻量判断：有 SOL/Token 实质变动即可。"""
+        return bool(tx.get("tokenTransfers") or tx.get("nativeTransfers"))
 
-        try:
-            from httpx import AsyncClient
-            payload = {"transactions": [signature]}
-            tx = None
-            async with AsyncClient(timeout=10.0) as client:
-                for attempt in range(FETCH_TX_MAX_RETRIES):
-                    url = helius_key_pool.get_http_endpoint()
-                    resp = await client.post(url, json=payload)
-                    if resp.status_code == 429 and helius_key_pool.size >= 1:
-                        helius_key_pool.mark_current_failed()
-                    if resp.status_code != 200:
-                        if attempt < FETCH_TX_MAX_RETRIES - 1:
-                            await asyncio.sleep(FETCH_TX_RETRY_DELAY_BASE + attempt)
-                        continue
-                    txs = resp.json()
-                    if txs and len(txs) > 0:
-                        tx = txs[0]
+    async def _consume_sig_queue_loop(self):
+        """从队列取 signature → 去重 → 批量 POST /transactions → 钱包池过滤 → 轻量真实交易 → 发消息。"""
+        logger.info("📥 [消费队列] 启动（批量拉取 + 钱包池过滤）")
+        from httpx import AsyncClient
+        while True:
+            try:
+                batch = []
+                for _ in range(SIG_QUEUE_BATCH_SIZE):
+                    try:
+                        sig = await asyncio.wait_for(self._sig_queue.get(), timeout=SIG_QUEUE_DRAIN_TIMEOUT)
+                        if sig:
+                            batch.append(sig)
+                    except asyncio.TimeoutError:
                         break
-                    # Helius 可能尚未索引，与 SmartFlow3 一致：重试 + 退避
-                    if attempt < FETCH_TX_MAX_RETRIES - 1:
-                        logger.debug("交易 %s.. 尚未索引，%d 秒后重试", signature[:16], FETCH_TX_RETRY_DELAY_BASE + attempt)
-                        await asyncio.sleep(FETCH_TX_RETRY_DELAY_BASE + attempt)
-            if not tx:
-                logger.warning("拉取交易详情失败（已重试 %d 次）: %s..", FETCH_TX_MAX_RETRIES, signature[:16])
-                return
+                if not batch:
+                    await asyncio.sleep(0.5)
+                    continue
 
-            # 与 SmartFlow3 一致：非真实交易（无 token 买卖 / 无 meaningful native）直接跳过，不参与统计
-            if not tx_has_real_trade(tx):
-                logger.debug("本笔非真实交易，跳过: %s..", signature[:16])
-                return
+                now = time.time()
+                to_fetch = [s for s in batch if (s not in self._recent_sigs) or (now - self._recent_sigs[s]) >= RECENT_SIG_TTL_SEC]
+                if not to_fetch:
+                    continue
+                for s in to_fetch:
+                    self._recent_sigs[s] = now
+                for sig in list(self._recent_sigs.keys()):
+                    if now - self._recent_sigs[sig] > RECENT_SIG_TTL_SEC * 2:
+                        del self._recent_sigs[sig]
 
-            # 从交易中收集参与账户：Helius 可能无 accountData，用 feePayer + 各类 transfer 的 from/to
-            tx_accounts = set()
-            fp = tx.get("feePayer") or tx.get("fee_payer")
-            if fp:
-                tx_accounts.add(fp)
-            for nt in tx.get("nativeTransfers", []):
-                for key in ("fromUserAccount", "toUserAccount"):
-                    a = nt.get(key)
-                    if a:
-                        tx_accounts.add(a)
-            for tt in tx.get("tokenTransfers", []):
-                for key in ("fromUserAccount", "toUserAccount"):
-                    a = tt.get(key)
-                    if a:
-                        tx_accounts.add(a)
-            if "accountData" in tx:
-                for acc in tx["accountData"]:
-                    a = acc.get("account")
-                    if a:
-                        tx_accounts.add(a)
+                url = helius_key_pool.get_http_endpoint()
+                async with AsyncClient(timeout=15.0) as client:
+                    for attempt in range(FETCH_TX_MAX_RETRIES):
+                        resp = await client.post(url, json={"transactions": to_fetch[:20]})
+                        if resp.status_code == 429 and helius_key_pool.size >= 1:
+                            helius_key_pool.mark_current_failed()
+                            url = helius_key_pool.get_http_endpoint()
+                        if resp.status_code != 200:
+                            if attempt < FETCH_TX_MAX_RETRIES - 1:
+                                await asyncio.sleep(FETCH_TX_RETRY_DELAY_BASE + attempt)
+                            continue
+                        txs = resp.json() or []
+                        for tx in txs:
+                            if not tx:
+                                continue
+                            involved = self._involved_accounts(tx)
+                            hunter_set = set(self.storage.get_monitored_addresses())
+                            if not hunter_set:
+                                continue
+                            active_hunters = involved & hunter_set
+                            if not active_hunters:
+                                continue
+                            if not self._is_real_trade_light(tx):
+                                continue
+                            logger.info("本笔涉及 %d 名猎手: %s", len(active_hunters), [h[:8] for h in list(active_hunters)[:5]])
+                            for hunter in active_hunters:
+                                self.storage.update_last_active(hunter, time.time())
+                                await self._process_one_tx(hunter, tx)
+                            # 跟仓：同一笔 tx 推给 Agent，避免 Agent 自建 WS 漏单导致卖不掉
+                            if self.agent and hasattr(self.agent, "on_tx_from_monitor"):
+                                try:
+                                    await self.agent.on_tx_from_monitor(tx, active_hunters)
+                                except Exception:
+                                    logger.exception("Agent.on_tx_from_monitor 异常")
+                        break
+                    else:
+                        logger.warning("批量拉取失败（已重试 %d 次）", FETCH_TX_MAX_RETRIES)
+            except Exception:
+                logger.exception("消费队列异常")
+                await asyncio.sleep(1)
 
-            active_hunters = set(self.storage.get_monitored_addresses()).intersection(tx_accounts)
-            if not active_hunters:
-                logger.debug("本笔无监控猎手参与，跳过: %s..", signature[:16])
-                return
-            logger.info("本笔涉及 %d 名猎手: %s", len(active_hunters), [h[:8] for h in list(active_hunters)[:5]])
-
-            for hunter in active_hunters:
-                self.storage.update_last_active(hunter, time.time())
-                await self.analyze_action(hunter, tx)
-        except Exception:
-            logger.exception("process_transaction_log 异常")
+    async def _process_one_tx(self, hunter: str, tx: dict):
+        """单笔命中猎手的 tx：解析买卖、写 monitor.log、触发共振。"""
+        parser = TransactionParser(hunter)
+        sol_change, token_changes, _ = parser.parse_transaction(tx)
+        for mint, delta in token_changes.items():
+            if abs(delta) < 1e-9:
+                continue
+            if sol_change < 0 and delta > 0:
+                self.active_holdings[mint][hunter] = time.time()
+                trade_logger.info(f"📥 买入: {hunter[:6]} -> {mint}")
+            elif sol_change > 0 and delta < 0:
+                if hunter in self.active_holdings[mint]:
+                    del self.active_holdings[mint][hunter]
+                trade_logger.info(f"📤 卖出: {hunter[:6]} -> {mint}")
+            await self.check_resonance(mint)
 
     async def analyze_action(self, hunter, tx):
         parser = TransactionParser(hunter)

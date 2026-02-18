@@ -22,7 +22,7 @@ import httpx
 import websockets
 
 from config.settings import helius_key_pool
-from services.helius.sm_searcher import IGNORE_MINTS
+from services.helius.sm_searcher import IGNORE_MINTS, TransactionParser
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -86,9 +86,31 @@ class HunterAgentController:
         self.hunter_map = defaultdict(set)
 
     async def start(self):
-        """启动 Agent：WebSocket 监控 + 定时持仓同步（防漏订阅）"""
-        logger.info("🕵️‍♂️ 启动 Hunter Agent (跟单管家)...")
-        await asyncio.gather(self.monitor_loop(), self.sync_positions_loop())
+        """启动 Agent：只跑持仓同步兜底；交易信号由 Monitor 统一推送，避免自建 WS 漏单。"""
+        logger.info("🕵️‍♂️ 启动 Hunter Agent (跟单管家，信号来自 Monitor)...")
+        await self.sync_positions_loop()
+
+    async def on_tx_from_monitor(self, tx: dict, active_hunters: set):
+        """
+        Monitor 消费队列命中钱包池后推送：同一笔 tx + 命中的猎手集合。
+        用 Helius 格式解析 token 变动，只处理 Agent 正在跟仓的 (hunter, token)，发 HUNTER_SELL/HUNTER_BUY。
+        """
+        for hunter in active_hunters:
+            if hunter not in self.hunter_map:
+                continue
+            potential_tokens = self.hunter_map[hunter]
+            if not potential_tokens:
+                continue
+            parser = TransactionParser(hunter)
+            _, token_changes, _ = parser.parse_transaction(tx)
+            token_changes = {m: d for m, d in token_changes.items() if m not in IGNORE_MINTS and abs(d) >= 1e-9}
+            for mint, delta in token_changes.items():
+                if mint not in potential_tokens:
+                    continue
+                try:
+                    await self.analyze_action(hunter, mint, delta, None, time.time())
+                except Exception:
+                    logger.exception("on_tx_from_monitor analyze_action 异常 %s %s", hunter[:6], mint[:6])
 
     # === 1. 任务管理接口 (供主程序调用) ===
 
