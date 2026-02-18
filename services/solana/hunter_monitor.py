@@ -46,16 +46,10 @@ DISCOVERY_INTERVAL_WHEN_FULL_SEC = 43200  # 猎手池已满(50)时，挖掘间�
 FETCH_TX_MAX_RETRIES = 3
 FETCH_TX_RETRY_DELAY_BASE = 2  # 第 i 次重试前等待 2+i 秒
 WS_COMMITMENT = "processed"
-
-# 【Program WS】只监听 Program，不监听钱包；Solana logsSubscribe mentions 每次仅支持 1 个 Pubkey，故分 4 次订阅
-SWAP_PROGRAM_IDS = [
-    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",   # Jupiter Aggregator
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",   # Raydium AMM
-    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",   # Orca Whirlpool
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token Program
-]
+# Helius Enhanced WebSocket：transactionSubscribe 支持 accountInclude 一次传入最多 5 万地址，只收这些钱包相关交易
 SIG_QUEUE_BATCH_SIZE = 15       # 批量拉取时每批最多 15 个 signature
 SIG_QUEUE_DRAIN_TIMEOUT = 0.3   # 凑批时每次 get 的超时（秒）
+WALLET_WS_RESUBSCRIBE_SEC = 300  # wallet 模式下每 5 分钟重连并按当前猎手池重新订阅
 
 
 class HunterStorage:
@@ -174,7 +168,7 @@ class HunterMonitorController:
         self.agent = agent
 
     async def start(self):
-        logger.info("🚀 启动 Hunter Monitor 系统 (Program WS + 钱包池过滤 + 兜底轮询)...")
+        logger.info("🚀 启动 Hunter Monitor 系统 (transactionSubscribe 按猎手地址，只收猎手相关交易)")
         tasks = [
             asyncio.create_task(self.discovery_loop()),
             asyncio.create_task(self._program_ws_loop()),       # 只拿 signature 入队
@@ -199,12 +193,17 @@ class HunterMonitorController:
             else:
                 await asyncio.sleep(DISCOVERY_INTERVAL)
 
-    # --- 【Program WS】只拿 signature，不做任何 RPC ---
+    # --- 【WS 订阅】Helius transactionSubscribe：accountInclude 一次传所有猎手地址，只收猎手相关交易 ---
     async def _program_ws_loop(self):
-        """WebSocket 只订阅 4 个 Swap/Token Program，收到 logsNotification 只取 signature 入队。"""
-        logger.info("👀 [Program WS] 监控启动 (Jupiter/Raydium/Orca/SPL Token)")
+        """使用 transactionSubscribe + accountInclude，一次订阅最多 5 万地址，只收猎手相关 tx。"""
         while True:
             try:
+                addrs = self.storage.get_monitored_addresses()
+                if not addrs:
+                    logger.info("👀 猎手池为空，30 秒后重试订阅")
+                    await asyncio.sleep(30)
+                    continue
+
                 async with websockets.connect(
                     helius_key_pool.get_wss_url(),
                     ping_interval=20,
@@ -212,38 +211,74 @@ class HunterMonitorController:
                     close_timeout=None,
                     max_size=None,
                 ) as ws:
-                    # Solana logsSubscribe mentions 每次仅支持 1 个 Pubkey，故分 4 次订阅
-                    for sub_id, program_id in enumerate(SWAP_PROGRAM_IDS, start=1):
-                        payload = {
-                            "jsonrpc": "2.0", "id": sub_id, "method": "logsSubscribe",
-                            "params": [{"mentions": [program_id]}, {"commitment": WS_COMMITMENT}]
-                        }
-                        await ws.send(json.dumps(payload))
-                    logger.info("📤 已发送 4 个 Program 订阅，进入接收循环（只取 signature 入队）")
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "transactionSubscribe",
+                        "params": [
+                            {"accountInclude": addrs, "failed": False},
+                            {
+                                "commitment": WS_COMMITMENT,
+                                "encoding": "jsonParsed",
+                                "transactionDetails": "signatures",
+                                "maxSupportedTransactionVersion": 0,
+                            },
+                        ],
+                    }
+                    await ws.send(json.dumps(payload))
+                    logger.info(
+                        "📤 已发送 transactionSubscribe（accountInclude %d 个猎手），只收猎手相关交易。示例地址: %s ...",
+                        len(addrs),
+                        addrs[0][:12] + "..." if addrs else "(无)",
+                    )
                     sub_ok = False
+                    recv_count = 0
                     idle_60s_count = 0
+                    recv_deadline = time.time() + WALLET_WS_RESUBSCRIBE_SEC
 
                     while True:
                         try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=60)
+                            timeout = min(60, max(1, int(recv_deadline - time.time())))
+                            msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
                             data = json.loads(msg)
-                            if data.get("method") == "logsNotification":
+
+                            if data.get("method") == "transactionNotification":
                                 idle_60s_count = 0
                                 res = (data.get("params") or {}).get("result") or {}
-                                val = res.get("value") or {}
-                                sig = val.get("signature")
+                                sig = res.get("signature")
                                 if sig:
+                                    recv_count += 1
                                     if not sub_ok:
                                         sub_ok = True
-                                        logger.info("✅ 订阅已正常，已收到交易推送")
+                                        logger.info("✅ 订阅已正常，已收到首笔交易推送")
+                                    logger.info(
+                                        "📨 [猎手交易] sig=%s (本连接第 %d 笔)",
+                                        sig[:20] + "..." if len(sig) > 20 else sig,
+                                        recv_count,
+                                    )
                                     self._sig_queue.put_nowait(sig)
+                            elif "error" in data:
+                                logger.warning("⚠️ WebSocket 返回错误: %s", data.get("error"))
+                            elif "id" in data and "result" in data:
+                                logger.info("📩 订阅确认 id=%s result=%s", data.get("id"), data.get("result"))
                             else:
-                                logger.info("收到 WebSocket 消息: method=%s id=%s", data.get("method"), data.get("id"))
+                                logger.info(
+                                    "收到 WebSocket 消息: method=%s id=%s",
+                                    data.get("method"),
+                                    data.get("id"),
+                                )
                         except asyncio.TimeoutError:
                             await ws.ping()
                             idle_60s_count += 1
+                            if time.time() >= recv_deadline:
+                                logger.info("🔄 到达重订阅间隔，重连以刷新猎手池（本次共收到 %d 笔）", recv_count)
+                                break
                             if idle_60s_count >= 10:
-                                logger.info("监控运行中 | 已 %d 分钟无新推送", idle_60s_count)
+                                logger.info(
+                                    "监控运行中 | 已 %d 分钟无新推送（本连接共 %d 笔）",
+                                    idle_60s_count,
+                                    recv_count,
+                                )
                                 idle_60s_count = 0
 
             except Exception as e:
