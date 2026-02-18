@@ -85,10 +85,16 @@ async def test_configuration():
 
 
 def _is_helius_429(e: Exception) -> bool:
-    """判断异常是否为 Helius RPC/HTTP 429 限流。"""
-    if hasattr(e, "response") and getattr(e.response, "status_code", None) == 429:
-        return True
-    return "429" in str(e).lower() or "too many requests" in str(e).lower()
+    """判断异常是否为 Helius RPC/HTTP 429 限流（含 SolanaRpcException 包装的 httpx.HTTPStatusError）。"""
+    err = e
+    while err is not None:
+        if getattr(err, "response", None) is not None and getattr(err.response, "status_code", None) == 429:
+            return True
+        s = str(err).lower()
+        if "429" in s or "too many requests" in s:
+            return True
+        err = getattr(err, "__cause__", None)
+    return False
 
 
 async def test_rpc_and_jupiter():
