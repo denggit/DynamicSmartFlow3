@@ -225,6 +225,8 @@ class HunterMonitorController:
                         logger.info(f"👀 监控就绪，监听 {len(monitored_addrs)} 个猎手")
                     else:
                         logger.warning("⚠️ 订阅确认超时，继续尝试接收 (共 %d 个猎手)", len(monitored_addrs))
+                    # 若曾超时，首次收到推送时打一条「已正常」方便确认
+                    sub_was_unconfirmed = not sub_ok
 
                     # 主循环：与 SmartFlow3 一致，仅处理 logsNotification，避免误处理其他类型导致异常
                     while True:
@@ -238,6 +240,9 @@ class HunterMonitorController:
                             if not sig:
                                 logger.warning("logsNotification 缺少 signature")
                                 continue
+                            if sub_was_unconfirmed:
+                                logger.info("✅ 订阅已正常，已收到交易推送")
+                                sub_was_unconfirmed = False
                             await self.process_transaction_log(res)
                         except asyncio.TimeoutError:
                             await ws.ping()
