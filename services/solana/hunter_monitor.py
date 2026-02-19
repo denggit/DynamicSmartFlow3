@@ -147,7 +147,12 @@ class HunterStorage:
         return list(self.hunters.keys())
 
     def get_hunter_score(self, address: str) -> float:
-        return self.hunters.get(address, {}).get('score', 0)
+        """返回猎手分数，确保为数值类型（JSON 可能为 int）。"""
+        v = self.hunters.get(address, {}).get('score', 0)
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     def prune_and_update(self, new_hunters: List[Dict] = None) -> Dict:
         """
@@ -157,7 +162,7 @@ class HunterStorage:
         now = time.time()
         added, removed_zombie, replaced = 0, 0, 0
 
-        # 1. 清理僵尸 (10天未交易)
+        # 1. 清理僵尸 (15天未交易)
         zombies = []
         for addr, info in self.hunters.items():
             last_active = info.get('last_active', 0)
@@ -167,7 +172,7 @@ class HunterStorage:
                 zombies.append(addr)
 
         for z in zombies:
-            logger.info(f"💀 清理僵尸地址 (10天未动): {z}..")
+            logger.info(f"💀 清理僵尸地址 (15天未动): {z}..")
             del self.hunters[z]
         removed_zombie = len(zombies)
 
@@ -179,7 +184,11 @@ class HunterStorage:
                 h['last_audit'] = h.get('last_audit', now)  # 新人入库算作刚体检
 
                 if addr in self.hunters:
-                    # 如果已存在，更新信息，但保留原有的 last_audit (除非这次是强制更新)
+                    # 同一挖掘批次中同一地址可能来自不同代币，只在高分时更新，避免低分覆盖高分
+                    old_score = float(self.hunters[addr].get('score', 0) or 0)
+                    new_score = float(h.get('score', 0) or 0)
+                    if new_score <= old_score:
+                        continue
                     old_audit = self.hunters[addr].get('last_audit', 0)
                     self.hunters[addr].update(h)
                     self.hunters[addr]['last_audit'] = old_audit
@@ -190,11 +199,13 @@ class HunterStorage:
                     added += 1
                     logger.info(f"🆕 新猎手入库: {addr} (分:{h['score']})")
                 else:
-                    # 库满 PK
-                    sorted_hunters = sorted(self.hunters.items(), key=lambda x: x[1].get('score', 0))
+                    # 库满 PK：按分数升序取最低
+                    def _score_val(item):
+                        return float(item[1].get('score', 0) or 0)
+                    sorted_hunters = sorted(self.hunters.items(), key=_score_val)
                     lowest_addr, lowest_val = sorted_hunters[0]
 
-                    if h['score'] > lowest_val.get('score', 0):
+                    if float(h.get('score', 0) or 0) > _score_val((lowest_addr, lowest_val)):
                         logger.info(f"♻️ 优胜劣汰: {h['score']}分 替换了 {lowest_val.get('score', 0)}分")
                         del self.hunters[lowest_addr]
                         self.hunters[addr] = h
@@ -660,7 +671,7 @@ class HunterMonitorController:
     # --- 线程 3: 维护 (Maintenance - 优化版) ---
     async def maintenance_loop(self):
         """
-        [优化] 每日巡检 + 15天体检逻辑
+        每 10 天检查，对超过 20 天未体检的猎手重新审计；并清理频繁交易者。
         """
         logger.info("🛠️ [线程3] 维护线程启动 (每 %d 天检查体检)", MAINTENANCE_INTERVAL // 86400)
 

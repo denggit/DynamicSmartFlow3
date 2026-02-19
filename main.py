@@ -257,7 +257,7 @@ def _parse_args():
     parser.add_argument(
         "--immediate-audit",
         action="store_true",
-        help="启动时立即对 data/hunters.json 中所有猎手做一次审计体检，剔除 60 分以下并更新其余",
+        help="启动时立即对 data/hunters.json 中所有猎手做一次审计体检（pnl/胜率/利润/30天收益未达标踢出，其余更新）",
     )
     return parser.parse_args()
 

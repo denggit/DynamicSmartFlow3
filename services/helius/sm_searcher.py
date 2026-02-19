@@ -46,7 +46,6 @@ from config.settings import (
     SM_ROI_MULT_200,
     SM_ROI_MULT_100_200,
     SM_ROI_MULT_50_100,
-    SM_MIN_HUNTER_SCORE,
     DEX_MIN_24H_GAIN_PCT,
     WALLET_BLACKLIST_FILE,
     WALLET_BLACKLIST_MIN_SCORE,
@@ -718,7 +717,7 @@ class SmartMoneySearcher:
 
             # 3.5 + 4 收益过滤 + 评分（生产者-消费者：拉取一次交易，复用于 ROI 与体检，节省 Helius credit）
             verified_hunters = []
-            pnl_passed_count = 0  # 通过 ROI≥200% 的猎手数
+            pnl_passed_count = 0  # 通过 ROI≥100% 的猎手数
             total = len(hunters_candidates)
             progress_interval = max(1, total // 10)  # 每 ~10% 打一次进度
             for idx, candidate in enumerate(hunters_candidates, 1):
@@ -819,8 +818,7 @@ class SmartMoneySearcher:
                 except Exception:
                     logger.exception("❌ 挖掘代币 %s 出错", sym)
                 await asyncio.sleep(1)
-        all_hunters.sort(key=lambda x: x.get('score', 0), reverse=True)
-        # 只保留 60 分及以上猎手，与猎手池入库规则一致
+        all_hunters.sort(key=lambda x: float(x.get('score', 0) or 0), reverse=True)
         return all_hunters
 
 
