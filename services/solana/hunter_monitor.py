@@ -21,6 +21,7 @@ import websockets
 
 # 导入配置和依赖模块
 from config.settings import (
+    BASE_DIR,
     helius_key_pool,
     USDC_PER_SOL,
     MAX_ENTRY_PUMP_MULTIPLIER,
@@ -44,8 +45,12 @@ from services.dexscreener.dex_scanner import DexScanner
 from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
 from utils.logger import get_logger
 from utils.hunter_scoring import compute_hunter_score
+from services import notification
 
 logger = get_logger(__name__)
+
+# 猎手数据文件绝对路径（邮件附件用）
+HUNTER_JSON_PATH = str(BASE_DIR / "data" / "hunters.json")
 # 猎手交易单独写入 monitor.log，便于查看时间与交易币种
 trade_logger = get_logger("trade")
 
@@ -101,11 +106,13 @@ class HunterStorage:
     def get_hunter_score(self, address: str) -> float:
         return self.hunters.get(address, {}).get('score', 0)
 
-    def prune_and_update(self, new_hunters: List[Dict] = None):
+    def prune_and_update(self, new_hunters: List[Dict] = None) -> Dict:
         """
-        库满时的优胜劣汰
+        库满时的优胜劣汰。
+        返回: {"added": n, "removed_zombie": n, "replaced": n} 供变化通知使用。
         """
         now = time.time()
+        added, removed_zombie, replaced = 0, 0, 0
 
         # 1. 清理僵尸 (10天未交易)
         zombies = []
@@ -119,6 +126,7 @@ class HunterStorage:
         for z in zombies:
             logger.info(f"💀 清理僵尸地址 (10天未动): {z}..")
             del self.hunters[z]
+        removed_zombie = len(zombies)
 
         # 2. 处理新猎手（只入库 60 分以上）
         if new_hunters:
@@ -138,6 +146,7 @@ class HunterStorage:
 
                 if len(self.hunters) < POOL_SIZE_LIMIT:
                     self.hunters[addr] = h
+                    added += 1
                     logger.info(f"🆕 新猎手入库: {addr} (分:{h['score']})")
                 else:
                     # 库满 PK
@@ -148,8 +157,10 @@ class HunterStorage:
                         logger.info(f"♻️ 优胜劣汰: {h['score']}分 替换了 {lowest_val.get('score', 0)}分")
                         del self.hunters[lowest_addr]
                         self.hunters[addr] = h
+                        replaced += 1
 
         self.save_hunters()
+        return {"added": added, "removed_zombie": removed_zombie, "replaced": replaced}
 
 
 class HunterMonitorController:
@@ -205,7 +216,16 @@ class HunterMonitorController:
             try:
                 new_hunters = await self.sm_searcher.run_pipeline(self.dex_scanner)
                 if new_hunters:
-                    self.storage.prune_and_update(new_hunters)
+                    delta = self.storage.prune_and_update(new_hunters)
+                    total = delta["added"] + delta["removed_zombie"] + delta["replaced"]
+                    if total > 0:
+                        notification.send_hunter_changes_email(
+                            added=delta["added"],
+                            removed=delta["removed_zombie"],
+                            replaced=delta["replaced"],
+                            total_count=len(self.storage.hunters),
+                            attachment_path=HUNTER_JSON_PATH,
+                        )
             except Exception:
                 logger.exception("❌ 挖掘异常")
             # 池满时降低挖掘频率，避免无意义消耗 credit
@@ -589,6 +609,13 @@ class HunterMonitorController:
 
         self.storage.save_hunters()
         logger.info("🩺 [立即审计] 完成 | 剔除 %d 名 | 更新 %d 名", len(removed), updated)
+        if len(removed) > 0 or updated > 0:
+            notification.send_hunter_changes_email(
+                removed=len(removed),
+                updated=updated,
+                total_count=len(self.storage.hunters),
+                attachment_path=HUNTER_JSON_PATH,
+            )
 
     # --- 线程 3: 维护 (Maintenance - 优化版) ---
     async def maintenance_loop(self):
@@ -669,7 +696,16 @@ class HunterMonitorController:
                     logger.info("✨ 所有猎手均在体检有效期内，无需更新")
 
                 # 2. 清理僵尸 & 存盘 (每次维护都做一次清理)
-                self.storage.prune_and_update([])
+                delta = self.storage.prune_and_update([])
+                removed_total = len(low_score_removed) + len(frequent_removed) + delta["removed_zombie"]
+                if removed_total > 0 or delta["replaced"] > 0 or needs_audit_count > 0:
+                    notification.send_hunter_changes_email(
+                        removed=removed_total,
+                        replaced=delta["replaced"],
+                        updated=needs_audit_count,
+                        total_count=len(self.storage.hunters),
+                        attachment_path=HUNTER_JSON_PATH,
+                    )
                 logger.info("✅ 维护完成")
 
             except Exception:

@@ -199,8 +199,8 @@ MIN_LIQUIDITY_TO_FDV_RATIO = 0.03  # 流动性/市值比至少 3%
 # ==================== 猎手监控 (hunter_monitor) ====================
 DISCOVERY_INTERVAL = 900  # 挖掘间隔 15 分钟
 MAINTENANCE_INTERVAL = 86400  # 维护间隔 1 天
-POOL_SIZE_LIMIT = 50  # 猎手池上限
-ZOMBIE_THRESHOLD_DAYS = 10  # 多少天未交易视为僵尸
+POOL_SIZE_LIMIT = 100  # 猎手池上限
+ZOMBIE_THRESHOLD_DAYS = 15  # 多少天未交易视为僵尸
 AUDIT_EXPIRATION_DAYS = 5  # 体检有效期 (天)
 ZOMBIE_THRESHOLD = 86400 * ZOMBIE_THRESHOLD_DAYS
 AUDIT_EXPIRATION = 86400 * AUDIT_EXPIRATION_DAYS

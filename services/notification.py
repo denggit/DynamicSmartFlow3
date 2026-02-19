@@ -189,3 +189,36 @@ def send_daily_report_email(today_pnl_sol: float, total_pnl_sol: float, details_
     subject = "📊 每日收益日报"
     content = build_daily_report_content(today_pnl_sol, total_pnl_sol, details_lines)
     send_email_in_thread(subject, content)
+
+
+def send_hunter_changes_email(
+    added: int = 0,
+    removed: int = 0,
+    replaced: int = 0,
+    updated: int = 0,
+    total_count: int = 0,
+    attachment_path: str = None,
+) -> None:
+    """
+    猎手库变化通知：新增/删除/替换/僵尸剔除/体检更新等，附带 hunters.json 附件。
+    """
+    parts = []
+    if added > 0:
+        parts.append(f"新增 {added} 个")
+    if removed > 0:
+        parts.append(f"删除 {removed} 个")
+    if replaced > 0:
+        parts.append(f"替换 {replaced} 个")
+    if updated > 0:
+        parts.append(f"更新 {updated} 个")
+    if not parts:
+        return
+    change_summary = "，".join(parts)
+    content = (
+        f"【猎手库变化】\n\n"
+        f"变化: {change_summary}\n"
+        f"当前猎手总数: {total_count}\n\n"
+        f"附件: hunters.json（最新猎手数据）"
+    )
+    subject = "📋 猎手库变化"
+    send_email_in_thread(subject, content, attachment_path)
