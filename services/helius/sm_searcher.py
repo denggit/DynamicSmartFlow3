@@ -631,7 +631,12 @@ class SmartMoneySearcher:
 
             # 3.5 + 4 收益过滤 + 评分（生产者-消费者：拉取一次交易，复用于 ROI 与体检，节省 Helius credit）
             verified_hunters = []
-            for candidate in hunters_candidates:
+            total = len(hunters_candidates)
+            progress_interval = max(1, total // 10)  # 每 ~10% 打一次进度
+            for idx, candidate in enumerate(hunters_candidates, 1):
+                if idx == 1 or idx % progress_interval == 0 or idx == total:
+                    pct = idx * 100 // total
+                    logger.info(f"  [进度] {idx}/{total} ({pct}%%) | 已入库 {len(verified_hunters)} 个")
                 roi, txs = await self.get_hunter_profit_on_token(client, candidate["address"], token_address)
                 if roi is None or roi < SM_MIN_TOKEN_PROFIT_PCT:
                     await asyncio.sleep(0.3)
