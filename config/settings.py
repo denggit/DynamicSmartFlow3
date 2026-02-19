@@ -130,10 +130,10 @@ SELL_BUFFER = 0.999  # 留 0.1% 缓冲，防止 rounding overflow
 # 止盈策略 (触发倍数, 卖出比例)
 # 1.5 = 收益率 150% (即 2.5倍)
 TAKE_PROFIT_LEVELS = [
-    (1.0, 0.5),  # 赚 150% -> 卖 50%
-    (3.0, 0.3),  # 赚 300% -> 卖 50%
-    (5.0, 0.3),  # 赚 300% -> 卖 50%
-    (7.0, 0.3),  # 赚 300% -> 卖 50%
+    (1.0, 0.5),  # 赚 100% -> 卖 50%
+    (3.0, 0.3),  # 赚 300% -> 卖 30%
+    (5.0, 0.3),  # 赚 500% -> 卖 30%
+    (7.0, 0.3),  # 赚 700% -> 卖 30%
     (10.0, 0.5)  # 赚 1000% -> 卖 50%
 ]
 
@@ -151,13 +151,14 @@ SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 
 # ==================== 猎手挖掘 (sm_searcher) ====================
 MIN_TOKEN_AGE_SEC = 900  # 最少上市 15 分钟 (排除纯土狗/貔貅)
-MAX_TOKEN_AGE_SEC = 10800  # 最多上市 3 小时 (太老的币数据太深不挖)
-MAX_BACKTRACK_PAGES = 10  # 最多回溯 10 页 (1万笔交易)
+MAX_TOKEN_AGE_SEC = 43200  # 最多上市 12 小时 (放宽年龄)
+MAX_BACKTRACK_PAGES = 20  # 最多回溯 20 页 (2万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
 MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算真实
-SM_MIN_DELAY_SEC = 5  # 开盘后至少 N 秒买入才计入
-SM_MAX_DELAY_SEC = 900  # 15 分钟内买入才算早期
+SM_MIN_DELAY_SEC = 15  # 初筛：开盘后至少 15 秒买入才计入
+SM_MAX_DELAY_SEC = 43200  # 12 小时内买入都算（与代币年龄一致）
+SM_MIN_TOKEN_PROFIT_PCT = 200.0  # 猎手/初筛买家在该代币至少赚 200% 才入库
 SM_AUDIT_TX_LIMIT = 500  # 体检时拉取交易笔数
 SM_MIN_BUY_SOL = 0.1  # 初筛：单笔买入最少 SOL
 SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
@@ -169,6 +170,7 @@ SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
 # ==================== DexScreener 扫描 ====================
 DEX_MIN_LIQUIDITY_USD = 10000  # 最低流动性 (USD)
 DEX_MIN_VOL_1H_USD = 50000  # 1 小时最低成交额 (USD)
+DEX_MIN_24H_GAIN_PCT = 1000.0  # 过去 24 小时涨幅 > 1000% 才算热门币
 
 # ==================== 风控 (risk_control) ====================
 MAX_ACCEPTABLE_BUY_TAX_PCT = 25.0  # 买入税超过此比例拒绝

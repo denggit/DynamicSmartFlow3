@@ -10,7 +10,7 @@ import asyncio
 
 import httpx
 
-from config.settings import DEX_MIN_LIQUIDITY_USD, DEX_MIN_VOL_1H_USD
+from config.settings import DEX_MIN_LIQUIDITY_USD, DEX_MIN_VOL_1H_USD, DEX_MIN_24H_GAIN_PCT
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -128,20 +128,31 @@ class DexScanner:
 
             liq = main_pair.get('liquidity', {}).get('usd', 0)
             vol_1h = main_pair.get('volume', {}).get('h1', 0)
+            # 24h 涨幅：支持 pricePercentChange24h 或 priceChange.h24 (小数形式 10=1000%)
+            gain_24h = main_pair.get('pricePercentChange24h')
+            if gain_24h is None:
+                price_change = main_pair.get('priceChange') or {}
+                gain_24h = price_change.get('h24')
+            gain_24h = float(gain_24h or 0)
 
-            # 过滤逻辑
-            if liq >= self.min_liquidity and vol_1h >= self.min_vol_1h:
-                logger.info(
-                    "找到符合标准代币: %s | 地址: %s",
-                    main_pair.get('baseToken', {}).get('symbol'),
-                    addr,
-                )
-                qualified_tokens.append({
-                    "address": addr,
-                    "symbol": main_pair.get('baseToken', {}).get('symbol'),
-                    "liquidity": liq,
-                    "vol_1h": vol_1h
-                })
+            # 过滤逻辑：流动性 + 成交量 + 过去24小时涨幅 > 1000%
+            if liq < self.min_liquidity or vol_1h < self.min_vol_1h:
+                continue
+            if gain_24h < DEX_MIN_24H_GAIN_PCT:
+                continue
+            logger.info(
+                "找到符合标准代币: %s | 地址: %s | 24h涨幅: %.0f%%",
+                main_pair.get('baseToken', {}).get('symbol'),
+                addr,
+                gain_24h,
+            )
+            qualified_tokens.append({
+                "address": addr,
+                "symbol": main_pair.get('baseToken', {}).get('symbol'),
+                "liquidity": liq,
+                "vol_1h": vol_1h,
+                "gain_24h_pct": gain_24h,
+            })
 
         return qualified_tokens
 

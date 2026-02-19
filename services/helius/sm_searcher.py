@@ -5,10 +5,12 @@
 @Author  : Zijun Deng
 @Date    : 2/17/2026
 @File    : sm_searcher.py
-@Description: Smart Money Searcher V6 - Golden Window Edition
-              1. [策略调整] 放弃挖掘老币，只挖掘上市 15分钟 - 3小时 的代币
-              2. [成本控制] 因为币比较新，回溯翻页次数极少 (通常<5次)，大幅节省 API
-              3. [去重逻辑] 保持 scanned_tokens.json 避免重复劳动
+@Description: Smart Money Searcher V7 - 热门币猎手挖掘
+              1. 热门币筛选: DexScreener 过去24小时涨幅 > 1000%
+              2. 代币年龄: 放宽至 12 小时内
+              3. 回溯: 最多 20 页
+              4. 初筛买家: 开盘 15 秒后买入，且在该代币至少赚取 200%（已清仓或未清仓）
+              5. 筛选后的钱包做评分入库
 """
 
 import asyncio
@@ -35,6 +37,7 @@ from config.settings import (
     SM_AUDIT_TX_LIMIT,
     SM_MIN_BUY_SOL,
     SM_MAX_BUY_SOL,
+    SM_MIN_TOKEN_PROFIT_PCT,
     SM_MIN_WIN_RATE,
     SM_MIN_TOTAL_PROFIT,
     SM_MIN_HUNTER_SCORE,
@@ -361,6 +364,84 @@ class SmartMoneySearcher:
 
         return {"win_rate": win_rate, "worst_roi": worst_roi, "total_profit": total_profit, "count": len(recent)}
 
+    async def _get_token_price_sol(self, client, token_address: str) -> float | None:
+        """
+        从 DexScreener 获取代币当前价格 (1 token = ? SOL)，用于计算未实现收益。
+        """
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+        try:
+            resp = await client.get(url, timeout=5.0)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            pairs = data.get("pairs", [])
+            wsol = "So11111111111111111111111111111111111111112"
+            for p in pairs:
+                if p.get("chainId") != "solana":
+                    continue
+                base = p.get("baseToken") or {}
+                quote = p.get("quoteToken") or {}
+                base_addr = (base.get("address") or "").strip()
+                quote_addr = (quote.get("address") or "").strip()
+                price_native = p.get("priceNative")
+                if price_native is None:
+                    continue
+                try:
+                    pr = float(price_native)
+                except (TypeError, ValueError):
+                    continue
+                if pr <= 0:
+                    continue
+                is_sol = lambda a: a == wsol or "11111111111111111111" in (a or "")
+                if base_addr == token_address and is_sol(quote_addr):
+                    return pr
+                if quote_addr == token_address and is_sol(base_addr):
+                    return 1.0 / pr if pr > 0 else None
+        except Exception:
+            logger.debug("获取代币价格失败", exc_info=True)
+        return None
+
+    async def get_hunter_profit_on_token(self, client, hunter_address: str, token_address: str) -> float | None:
+        """
+        计算猎手在该代币上的收益率 (ROI %)，已清仓用卖出收益算，未清仓用现价估算。
+        返回 ROI 百分比，若无法计算返回 None。
+        """
+        sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
+        if not sigs:
+            return None
+        txs = await self.fetch_parsed_transactions(client, sigs)
+        if not txs:
+            return None
+        parser = TransactionParser(hunter_address)
+        calc = TokenAttributionCalculator()
+        buy_sol, sell_sol, tokens_held = 0.0, 0.0, 0.0
+        txs.sort(key=lambda x: x.get("timestamp", 0))
+        for tx in txs:
+            try:
+                sol_change, token_changes, _ = parser.parse_transaction(tx)
+                if token_address not in token_changes:
+                    continue
+                delta = token_changes[token_address]
+                if abs(delta) < 1e-9:
+                    continue
+                buy_attrs, sell_attrs = calc.calculate_attribution(sol_change, token_changes)
+                if token_address in buy_attrs:
+                    buy_sol += buy_attrs[token_address]
+                if token_address in sell_attrs:
+                    sell_sol += sell_attrs[token_address]
+                tokens_held += delta
+            except Exception:
+                continue
+        if buy_sol < 0.01:
+            return None
+        total_value = sell_sol
+        if tokens_held > 1e-9:
+            price = await self._get_token_price_sol(client, token_address)
+            if price is not None and price > 0:
+                total_value += tokens_held * price
+        roi = (total_value - buy_sol) / buy_sol * 100
+        return roi
+
     async def verify_token_age_via_dexscreener(self, client, token_address):
         """返回: (is_valid_window, start_time, reason)"""
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
@@ -456,9 +537,20 @@ class SmartMoneySearcher:
                     seen_buyers.add(spender)
                     hunters_candidates.append({"address": spender, "entry_delay": delay, "cost": spend_sol})
 
-            logger.info(f"  [初筛] 发现 {len(hunters_candidates)} 个候选人")
+            logger.info(f"  [初筛] 15秒后买入且金额合规: {len(hunters_candidates)} 个")
 
-            # 4. 深度审计
+            # 3.5 过滤：该代币上至少赚取 200%（已清仓或未清仓）
+            profit_filtered = []
+            for candidate in hunters_candidates:
+                roi = await self.get_hunter_profit_on_token(client, candidate["address"], token_address)
+                if roi is not None and roi >= SM_MIN_TOKEN_PROFIT_PCT:
+                    profit_filtered.append(candidate)
+                    logger.debug(f"    通过 200%% 收益过滤: {candidate['address'][:12]}.. ROI={roi:.0f}%%")
+                await asyncio.sleep(0.3)
+            hunters_candidates = profit_filtered
+            logger.info(f"  [初筛] 在该代币赚取≥{SM_MIN_TOKEN_PROFIT_PCT:.0f}%%: {len(hunters_candidates)} 个")
+
+            # 4. 深度审计 + 评分入库
             verified_hunters = []
             for candidate in hunters_candidates:
                 addr = candidate["address"]
@@ -498,7 +590,7 @@ class SmartMoneySearcher:
             return verified_hunters
 
     async def run_pipeline(self, dex_scanner_instance):
-        logger.info("启动 Alpha 猎手挖掘 (V6 黄金窗口版)...")
+        logger.info("启动 Alpha 猎手挖掘 (V7 热门币版: 24h涨幅>1000% | 代币≤12h | 初筛15s后买入且≥200%收益)")
         hot_tokens = await dex_scanner_instance.scan()
         all_hunters = []
         if hot_tokens:
