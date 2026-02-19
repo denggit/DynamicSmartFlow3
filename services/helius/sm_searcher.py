@@ -43,6 +43,7 @@ from config.settings import (
     SM_MIN_WIN_RATE,
     SM_MIN_TOTAL_PROFIT,
     SM_MIN_HUNTER_SCORE, DEX_MIN_24H_GAIN_PCT,
+    SM_PROFIT_SCORE_REF_PCT,
     WALLET_BLACKLIST_FILE,
     WALLET_BLACKLIST_MIN_SCORE,
     WALLET_BLACKLIST_LOSS_USDC,
@@ -421,8 +422,10 @@ class SmartMoneySearcher:
         wins = [p for p in recent if p["profit"] > 0]
         win_rate = len(wins) / len(recent)
         worst_roi = max(-100, min([p["roi"] for p in recent])) if recent else 0
+        # 每个代币作为一个单位，平均盈利率 (%)
+        avg_roi_pct = sum(p["roi"] for p in recent) / len(recent) if recent else 0.0
 
-        return {"win_rate": win_rate, "worst_roi": worst_roi, "total_profit": total_profit, "count": len(recent)}
+        return {"win_rate": win_rate, "worst_roi": worst_roi, "total_profit": total_profit, "count": len(recent), "avg_roi_pct": avg_roi_pct}
 
     async def _get_usdc_price_sol(self, client) -> float | None:
         """从 DexScreener 获取 1 USDC = ? SOL，用于将 USDC 流动折算为 SOL 等价。"""
@@ -662,12 +665,13 @@ class SmartMoneySearcher:
 
             # 3.5 + 4 收益过滤 + 评分（生产者-消费者：拉取一次交易，复用于 ROI 与体检，节省 Helius credit）
             verified_hunters = []
+            pnl_passed_count = 0  # 通过 ROI≥200% 的猎手数
             total = len(hunters_candidates)
             progress_interval = max(1, total // 10)  # 每 ~10% 打一次进度
             for idx, candidate in enumerate(hunters_candidates, 1):
                 if idx == 1 or idx % progress_interval == 0 or idx == total:
                     pct = idx * 100 // total
-                    logger.info(f"  [进度] {idx}/{total} ({pct}%) | 已入库 {len(verified_hunters)} 个")
+                    logger.info(f"  [进度] {idx}/{total} ({pct}%) | 符合PnL {pnl_passed_count} 个 | 已入库 {len(verified_hunters)} 个")
                 addr = candidate["address"]
                 if addr in self.wallet_blacklist:
                     logger.debug("    跳过黑名单: %s..", addr[:12])
@@ -676,6 +680,7 @@ class SmartMoneySearcher:
                 if roi is None or roi < SM_MIN_TOKEN_PROFIT_PCT:
                     await asyncio.sleep(0.3)
                     continue
+                pnl_passed_count += 1
                 logger.debug(f"    通过 200%% 收益过滤: {addr[:12]}.. ROI={roi:.0f}%%")
 
                 # 复用已拉取的 txs，不再重复请求 Helius
@@ -685,12 +690,16 @@ class SmartMoneySearcher:
 
                 if stats:
                     score_hit_rate = stats["win_rate"]
-                    delay = candidate["entry_delay"]
-                    score_entry = max(0, 1 - (delay / self.max_delay_sec))
+                    # 盈利分：代币维度平均盈利率，≥10% 满分，≤0% 零分，线性插值
+                    avg_roi_pct = stats.get("avg_roi_pct", 0.0)
+                    if avg_roi_pct <= 0:
+                        score_profit = 0.0
+                    else:
+                        score_profit = min(1.0, avg_roi_pct / SM_PROFIT_SCORE_REF_PCT)
                     score_drawdown = 1 - abs(stats["worst_roi"] / 100)
                     score_drawdown = max(0, min(1, score_drawdown))
 
-                    final_score = (score_hit_rate * 30) + (score_entry * 40) + (score_drawdown * 30)
+                    final_score = (score_hit_rate * 30) + (score_profit * 40) + (score_drawdown * 30)
                     final_score = round(final_score, 1)
 
                     is_qualified = False
@@ -712,14 +721,14 @@ class SmartMoneySearcher:
                             "win_rate": f"{stats['win_rate']:.1%}",
                             "worst_roi": f"{stats['worst_roi']:.1f}%",
                             "total_profit": f"{stats['total_profit']:.2f} SOL",
-                            "scores_detail": f"H:{score_hit_rate:.2f}/E:{score_entry:.2f}/D:{score_drawdown:.2f}"
+                            "scores_detail": f"H:{score_hit_rate:.2f}/P:{score_profit:.2f}/D:{score_drawdown:.2f}"
                         })
                         verified_hunters.append(candidate)
                         logger.info(
                             f"    ✅ 锁定猎手 {addr}.. | 利润: {candidate['total_profit']} | 评分: {final_score}")
                 await asyncio.sleep(0.5)
 
-            logger.info(f"  [收益+评分] 入库 {len(verified_hunters)} 个猎手（交易数据复用，节省 Helius credit）")
+            logger.info(f"  [收益+评分] 初筛 {total} → 符合PnL≥{SM_MIN_TOKEN_PROFIT_PCT:.0f}%%: {pnl_passed_count} 个 → 入库 {len(verified_hunters)} 个")
             self._save_scanned_token(token_address)
             return verified_hunters
 

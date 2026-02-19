@@ -150,7 +150,7 @@ PNL_CHECK_INTERVAL = 5  # 每 5 秒检查一次止盈/止损
 SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 
 # ==================== 猎手挖掘 (sm_searcher) ====================
-MIN_TOKEN_AGE_SEC = 900  # 最少上市 15 (太新的币数据少，难找好猎手)
+MIN_TOKEN_AGE_SEC = 1800  # 最少上市 15 (太新的币数据少，难找好猎手)
 MAX_TOKEN_AGE_SEC = 14400  # 最多上市 4 小时 (放宽年龄)
 MAX_BACKTRACK_PAGES = 100  # 最多回溯 100 页 (10万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
@@ -167,6 +167,8 @@ SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
 SM_MIN_WIN_RATE = 0.4  # 猎手入库：胜率至少 40%
 SM_MIN_TOTAL_PROFIT = 100.0  # 猎手入库：或总利润 ≥ 100 SOL 可放宽胜率
 SM_MIN_HUNTER_SCORE = 60  # 猎手入库最低分数
+# 盈利分：代币维度平均盈利率 (%)，每个代币一单位；≥10% 满分，≤0% 零分
+SM_PROFIT_SCORE_REF_PCT = 10.0  # 平均盈利率 ≥ 10% → 盈利分=1
 SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
 # 钱包黑名单：劣质猎手不再分析，节省 Helius API
 WALLET_BLACKLIST_FILE = "data/wallet_blacklist.json"
