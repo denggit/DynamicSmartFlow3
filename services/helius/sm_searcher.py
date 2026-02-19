@@ -42,7 +42,7 @@ from config.settings import (
     SM_MIN_TOKEN_PROFIT_PCT,
     SM_MIN_WIN_RATE,
     SM_MIN_TOTAL_PROFIT,
-    SM_MIN_HUNTER_SCORE,
+    SM_MIN_HUNTER_SCORE, DEX_MIN_24H_GAIN_PCT,
 )
 from utils.logger import get_logger
 
@@ -495,41 +495,58 @@ class SmartMoneySearcher:
         return roi, txs
 
     async def verify_token_age_via_dexscreener(self, client, token_address):
-        """返回: (is_valid_window, start_time, reason)"""
+        """
+        返回: (is_valid_window, start_time, reason, gain_24h, should_save_scanned)
+        should_save_scanned: 是否应写入 scanned_tokens（年龄超龄必写；年龄范围内但涨幅未达标不写，便于后续重试）
+        """
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
         try:
             resp = await client.get(url, timeout=5.0)
             if resp.status_code == 200:
                 data = resp.json()
                 pairs = data.get('pairs', [])
-                if not pairs: return False, 0, "No Pairs"
+                if not pairs:
+                    return False, 0, "No Pairs", 0.0, False
+
+                main_pair = max(pairs, key=lambda p: float(p.get('liquidity', {}).get('usd', 0) or 0))
+                gain_24h = main_pair.get('pricePercentChange24h')
+                if gain_24h is None:
+                    gain_24h = (main_pair.get('priceChange') or {}).get('h24')
+                gain_24h = float(gain_24h or 0)
 
                 created_at_ms = min([p.get('pairCreatedAt', float('inf')) for p in pairs])
-                if created_at_ms == float('inf'): return False, 0, "No Creation Time"
+                if created_at_ms == float('inf'):
+                    return False, 0, "No Creation Time", gain_24h, False
 
                 created_at_sec = created_at_ms / 1000
                 age = time.time() - created_at_sec
 
                 if age < MIN_TOKEN_AGE_SEC:
-                    return False, created_at_sec, f"Too Young ({age / 60:.1f}m)"
+                    return False, created_at_sec, f"Too Young ({age / 60:.1f}m)", gain_24h, False
                 if age > MAX_TOKEN_AGE_SEC:
-                    return False, created_at_sec, f"Too Old ({age / 3600:.1f}h)"
+                    return False, created_at_sec, f"Too Old ({age / 3600:.1f}h)", gain_24h, True
 
-                return True, created_at_sec, "OK"
+                # 年龄在范围内：涨幅未达标时不写 scanned，便于下次发现周期重试
+                if gain_24h < DEX_MIN_24H_GAIN_PCT:
+                    return False, created_at_sec, f"GainNotYet ({gain_24h:.0f}% < {DEX_MIN_24H_GAIN_PCT}%)", gain_24h, False
+
+                return True, created_at_sec, "OK", gain_24h, False
             else:
-                return False, 0, "API Error"
+                return False, 0, "API Error", 0.0, False
         except Exception:
             logger.exception("verify_token_age_via_dexscreener 请求异常")
-            return False, 0, "Exception"
+            return False, 0, "Exception", 0.0, False
 
     async def search_alpha_hunters(self, token_address):
         if token_address in self.scanned_tokens: return []
 
         async with httpx.AsyncClient() as client:
-            # 1. 严格的年龄检查 (15m - 3h)
-            is_valid, start_time, reason = await self.verify_token_age_via_dexscreener(client, token_address)
+            # 1. 年龄 + 涨幅检查：年龄超龄写 scanned，年龄范围内涨幅未达标不写（便于下次重试）
+            is_valid, start_time, reason, gain_24h, should_save = await self.verify_token_age_via_dexscreener(client, token_address)
             if not is_valid:
                 logger.info(f"⏭️ 跳过代币 {token_address}: {reason}")
+                if should_save:
+                    self._save_scanned_token(token_address)
                 return []
 
             logger.info(f"🔍 锁定黄金窗口代币 (年龄 {time.time() - start_time:.0f}s)，开始高效回溯...")
@@ -656,10 +673,11 @@ class SmartMoneySearcher:
             return verified_hunters
 
     async def run_pipeline(self, dex_scanner_instance):
-        logger.info("启动 Alpha 猎手挖掘 (V7 热门币版: 24h涨幅>1000% | 代币≤12h | 初筛15s后买入且≥200%收益)")
+        logger.info(f"启动 Alpha 猎手挖掘 (流动性+成交量筛选 | 年龄区间内且涨幅>{DEX_MIN_24H_GAIN_PCT}%才挖 | 未达标不写scanned便于重试)")
         hot_tokens = await dex_scanner_instance.scan()
         all_hunters = []
         if hot_tokens:
+            hot_tokens.sort(key=lambda t: float(t.get('gain_24h_pct', 0)), reverse=True)
             for token in hot_tokens:
                 addr = token.get('address')
                 sym = token.get('symbol')

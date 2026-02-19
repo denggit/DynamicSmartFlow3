@@ -150,7 +150,7 @@ PNL_CHECK_INTERVAL = 5  # 每 5 秒检查一次止盈/止损
 SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 
 # ==================== 猎手挖掘 (sm_searcher) ====================
-MIN_TOKEN_AGE_SEC = 1800  # 最少上市 30分钟 (太新的币数据少，难找好猎手)
+MIN_TOKEN_AGE_SEC = 900  # 最少上市 15 (太新的币数据少，难找好猎手)
 MAX_TOKEN_AGE_SEC = 14400  # 最多上市 4 小时 (放宽年龄)
 MAX_BACKTRACK_PAGES = 100  # 最多回溯 100 页 (10万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
@@ -172,7 +172,7 @@ SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
 # ==================== DexScreener 扫描 ====================
 DEX_MIN_LIQUIDITY_USD = 10000  # 最低流动性 (USD)
 DEX_MIN_VOL_1H_USD = 50000  # 1 小时最低成交额 (USD)
-DEX_MIN_24H_GAIN_PCT = 500.0  # 过去 24 小时涨幅 > 500% 才算热门币
+DEX_MIN_24H_GAIN_PCT = 500.0  # 年龄在范围内时，涨幅 > 500% 才执行猎手挖掘；未达标不写 scanned，下次重试
 
 # ==================== 风控 (risk_control) ====================
 MAX_ACCEPTABLE_BUY_TAX_PCT = 25.0  # 买入税超过此比例拒绝

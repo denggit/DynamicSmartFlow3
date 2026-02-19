@@ -135,13 +135,11 @@ class DexScanner:
                 gain_24h = price_change.get('h24')
             gain_24h = float(gain_24h or 0)
 
-            # 过滤逻辑：流动性 + 成交量 + 过去24小时涨幅 > 1000%
+            # 过滤逻辑：流动性 + 成交量；涨幅不再在此处过滤，由 sm_searcher 结合年龄决定
             if liq < self.min_liquidity or vol_1h < self.min_vol_1h:
                 continue
-            if gain_24h < DEX_MIN_24H_GAIN_PCT:
-                continue
             logger.info(
-                "找到符合标准代币: %s | 地址: %s | 24h涨幅: %.0f%%",
+                "找到符合流动性/成交量的代币: %s | 地址: %s | 24h涨幅: %.0f%%",
                 main_pair.get('baseToken', {}).get('symbol'),
                 addr,
                 gain_24h,
