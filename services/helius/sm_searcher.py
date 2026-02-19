@@ -508,7 +508,8 @@ class SmartMoneySearcher:
                     logger.exception("❌ 挖掘代币 %s 出错", sym)
                 await asyncio.sleep(1)
         all_hunters.sort(key=lambda x: x.get('score', 0), reverse=True)
-        return all_hunters
+        # 只保留 60 分及以上猎手，与猎手池入库规则一致
+        return [h for h in all_hunters if h.get('score', 0) >= 60]
 
 
 if __name__ == "__main__":
