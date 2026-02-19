@@ -20,7 +20,7 @@ from typing import Dict, List, Callable, Optional, Set
 import websockets
 
 # 导入配置和依赖模块
-from config.settings import helius_key_pool
+from config.settings import helius_key_pool, MAX_ENTRY_PUMP_MULTIPLIER
 from services.dexscreener.dex_scanner import DexScanner
 from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
 from utils.logger import get_logger
@@ -167,6 +167,14 @@ class HunterMonitorController:
 
         # 实时持仓状态池
         self.active_holdings = defaultdict(dict)
+        # 首个猎手买入时的价格（用于 300% 追高限制）
+        self._first_buy_price: Dict[str, float] = {}
+        # 首个买入该代币的猎手地址；若其在共振前清仓，则永不再触发共振
+        self._first_buyer: Dict[str, str] = {}
+        # 已发出共振信号的代币（用于判断「首买者清仓时是否已共振」）
+        self._resonance_emitted: Set[str] = set()
+        # 永久禁止共振的代币（首买者在共振前已清仓）
+        self._blacklisted_mints: Set[str] = set()
         # 去重：同一 signature 在 TTL 内只处理一次
         self._recent_sigs: Dict[str, float] = {}  # signature -> 首次处理时间
         # 【Program WS】只产 signature，中后段消费；钱包池不参与 WS 订阅
@@ -230,6 +238,8 @@ class HunterMonitorController:
                         to_remove.append(mint)
                 for mint in to_remove:
                     del self.active_holdings[mint]
+                    self._first_buy_price.pop(mint, None)
+                    self._first_buyer.pop(mint, None)
                 if to_remove:
                     logger.info("🧹 [Holdings 清理] 删除 %d 条超时未跟仓记录: %s", len(to_remove), to_remove[:5])
             except Exception:
@@ -434,13 +444,27 @@ class HunterMonitorController:
             if abs(delta) < 1e-9:
                 continue
             if sol_change < 0 and delta > 0:
+                was_first = len(self.active_holdings[mint]) == 0
                 self.active_holdings[mint][hunter] = time.time()
+                if was_first:
+                    self._first_buyer[mint] = hunter
+                    try:
+                        p = await self.dex_scanner.get_token_price(mint)
+                        if p and p > 0:
+                            self._first_buy_price[mint] = p
+                    except Exception:
+                        pass
                 trade_logger.info(f"📥 买入: {hunter} -> {mint}")
                 holders = self.active_holdings[mint]
                 trade_logger.info("📊 %s 当前被 %d 个猎手持仓", mint, len(holders))
             elif sol_change > 0 and delta < 0:
                 if hunter in self.active_holdings[mint]:
+                    first_buyer = self._first_buyer.get(mint)
                     del self.active_holdings[mint][hunter]
+                    # 首买者在共振前清仓 → 永久禁止该代币共振
+                    if first_buyer == hunter and mint not in self._resonance_emitted:
+                        self._blacklisted_mints.add(mint)
+                        trade_logger.info("🚫 首买者 %s 已清仓且未达共振，代币 %s 永久禁止共振", hunter[:8], mint[:8])
                 trade_logger.info(f"📤 卖出: {hunter} -> {mint}")
             await self.check_resonance(mint)
 
@@ -462,6 +486,8 @@ class HunterMonitorController:
             await self.check_resonance(mint)
 
     async def check_resonance(self, mint):
+        if mint in self._blacklisted_mints:
+            return
         holders = self.active_holdings[mint]
         if not holders: return
         addrs = list(holders.keys())
@@ -485,6 +511,20 @@ class HunterMonitorController:
         if c1 or c2:
             if self.position_check and self.position_check(mint):
                 return
+            # 首买追高限制：首个猎手买入后已涨 300% 则坚决不买
+            first_price = self._first_buy_price.get(mint)
+            if first_price and first_price > 0:
+                try:
+                    curr_price = await self.dex_scanner.get_token_price(mint)
+                    if curr_price and curr_price >= first_price * MAX_ENTRY_PUMP_MULTIPLIER:
+                        trade_logger.info(
+                            "🚫 共振跳过: %s 首买后已涨 %.0f%% (%.6f -> %.6f)",
+                            mint[:8], (curr_price / first_price - 1) * 100, first_price, curr_price
+                        )
+                        return
+                except Exception:
+                    pass
+            self._resonance_emitted.add(mint)
             trade_logger.info(f"🚨 共振触发: {mint} (人数:{count}, 分:{total_score})")
             if self.signal_callback:
                 signal = {

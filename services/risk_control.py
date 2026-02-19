@@ -3,7 +3,7 @@
 """
 @Description: 风控模块 - 早期跟单场景下主要避免：貔貅/蜜罐、不能卖、一买入就高税导致大额亏损、
               铸币权/冻结权未放弃（Mint Authority、Freeze Authority 必须为 Renounced/None）、
-              老鼠仓（Top2-10 控盘过高）、撤池风险（池子 < $5k）。
+              老鼠仓（Top2-10 控盘过高）、撤池风险（池子 < $5k）、FDV 过高追高、流动性/市值比过低（虚胖控盘）。
 """
 from typing import Tuple
 
@@ -25,6 +25,11 @@ MAX_TOP2_10_COMBINED_PCT = 0.30
 # 防老鼠仓：排除 LP 后，单一地址不得超过「剩余供应」的此比例
 MAX_SINGLE_HOLDER_PCT = 0.10
 
+# 最大可接受入场市值 (FDV)：超过此市值坚决不追高（建议 50万 - 150万美金）
+MAX_ENTRY_FDV_USD = 1000000.0
+# 流动性/市值健康比：池子太小但市值很高属于"虚胖控盘"，极易暴跌
+MIN_LIQUIDITY_TO_FDV_RATIO = 0.03  # 池子资金至少占市值的 3%
+
 
 async def check_is_safe_token(token_mint: str) -> bool:
     """
@@ -41,9 +46,15 @@ async def check_is_safe_token(token_mint: str) -> bool:
             resp = await client.get(url)
             if resp.status_code != 200:
                 logger.warning("RugCheck 未收录该代币: %s", token_mint[:16] + "..")
-                has_pool, liq_usd, _ = await check_token_liquidity(token_mint)
+                has_pool, liq_usd, fdv_usd = await check_token_liquidity(token_mint)
                 if not has_pool or liq_usd < MIN_LIQUIDITY_USD:
                     logger.warning("⚠️ 未收录且池子过小 ($%.0f)，拒绝: %s", liq_usd, token_mint[:16] + "..")
+                    return False
+                if fdv_usd > MAX_ENTRY_FDV_USD:
+                    logger.warning("⚠️ 未收录且 FDV 过高 ($%.0f)，拒绝: %s", fdv_usd, token_mint[:16] + "..")
+                    return False
+                if fdv_usd > 0 and liq_usd / fdv_usd < MIN_LIQUIDITY_TO_FDV_RATIO:
+                    logger.warning("⚠️ 未收录且流动性/市值比过低，拒绝: %s", token_mint[:16] + "..")
                     return False
                 return True
 
@@ -87,10 +98,19 @@ async def check_is_safe_token(token_mint: str) -> bool:
                 logger.warning("⚠️ 买入税过高 (%.1f%%): %s", buy_tax, token_mint[:16] + "..")
                 return False
 
-            # 5. 池子大小（防撤池）
-            has_pool, liq_usd, _ = await check_token_liquidity(token_mint)
+            # 5. 池子大小（防撤池）+ FDV + 流动性/市值比
+            has_pool, liq_usd, fdv_usd = await check_token_liquidity(token_mint)
             if not has_pool or liq_usd < MIN_LIQUIDITY_USD:
                 logger.warning("⚠️ 池子过小 (Liquidity $%.0f < $%.0f): %s", liq_usd, MIN_LIQUIDITY_USD, token_mint[:16] + "..")
+                return False
+            if fdv_usd > MAX_ENTRY_FDV_USD:
+                logger.warning("⚠️ FDV 过高 ($%.0f > $%.0f)，不追高: %s", fdv_usd, MAX_ENTRY_FDV_USD, token_mint[:16] + "..")
+                return False
+            if fdv_usd > 0 and liq_usd / fdv_usd < MIN_LIQUIDITY_TO_FDV_RATIO:
+                logger.warning(
+                    "⚠️ 流动性/市值比过低 (%.2f%% < %.0f%%)，虚胖控盘: %s",
+                    liq_usd / fdv_usd * 100, MIN_LIQUIDITY_TO_FDV_RATIO * 100, token_mint[:16] + ".."
+                )
                 return False
 
             # 6. Top 10 持仓（防老鼠仓）：排除 LP 后，第 2~10 名不得控盘过高

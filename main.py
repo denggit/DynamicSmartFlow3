@@ -11,6 +11,7 @@ from pathlib import Path
 from config.settings import (
     PNL_CHECK_INTERVAL,
     HUNTER_ADD_THRESHOLD_SOL,
+    MAX_ENTRY_PUMP_MULTIPLIER,
     DAILY_REPORT_HOUR,
     BASE_DIR,
 )
@@ -137,6 +138,10 @@ async def on_agent_signal(signal):
     elif msg_type == "HUNTER_BUY":
         pos = trader.positions.get(token)
         if not pos:
+            return
+        # 首买追高限制：入场后已涨 300% 则不加仓
+        if pos.average_price > 0 and price >= pos.average_price * MAX_ENTRY_PUMP_MULTIPLIER:
+            logger.info("🚫 加仓跳过: %s 已涨 %.0f%% 不追高", token[:8], (price / pos.average_price - 1) * 100)
             return
         add_amount_ui = signal.get("add_amount_ui")
         if add_amount_ui is None:
