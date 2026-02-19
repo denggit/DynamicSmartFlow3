@@ -150,21 +150,30 @@ class HunterAgentController:
         # 这里会触发 WebSocket 重连以更新订阅列表
         # (在 monitor_loop 里会自动处理)
 
+    # 开仓后超过此时间的新增猎手不再触发加仓，仅加入监控（用于跟卖）
+    NEW_HUNTER_ADD_WINDOW_SEC = 600  # 10 分钟
+
     async def _handle_new_hunter_join(self, hunter: str, token_address: str, delta_ui: float):
         """
         新增猎手入场：池内猎手买入我们持有的 token 时，加入任务并触发 HUNTER_BUY。
         main 收到信号后加仓 0.1 SOL 并调用 add_hunter_to_mission（幂等）。
         节流：1 分钟内同一 token 多名新猎手加入时，只发一次 HUNTER_BUY，避免重复跟仓。
+        窗口：开仓 10 分钟后加入的新猎手既不加入监控也不跟卖，直接忽略。
         """
         mission = self.active_missions.get(token_address)
         if not mission or hunter in mission.hunter_states:
             return
+
+        now = time.time()
+        if now - mission.creation_time > self.NEW_HUNTER_ADD_WINDOW_SEC:
+            trade_logger.info("🔄 [Agent] 开仓已超 10 分钟，新增猎手 %s 不加入监控", hunter[:8])
+            return
+
         balance = await self._fetch_token_balance(hunter, token_address)
         mission.add_hunter(hunter, balance)
         self.hunter_map[hunter].add(token_address)
         trade_logger.info(f"🆕 [Agent] 新增猎手入场 {hunter[:6]} -> {token_address[:6]} | 买入: {delta_ui:.2f}")
 
-        now = time.time()
         last_at = self._last_new_hunter_signal_at.get(token_address, 0)
         if now - last_at < 60:
             trade_logger.info("🔄 [Agent] 1 分钟内已有新猎手加仓信号，本次仅加入监控不重复跟仓")

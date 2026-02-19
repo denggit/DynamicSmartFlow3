@@ -469,9 +469,17 @@ class HunterMonitorController:
         count = len(addrs)
         total_score = sum(scores)
 
+        # 在看总分前，至少存在一个猎手评分 > 60；3+ 猎手时，前 3 名（按分数取）中至少一个 > 60
+        addr_scores = sorted(zip(addrs, scores), key=lambda x: x[1], reverse=True)
+        top_k = addr_scores[:min(3, len(addr_scores))]
+        has_qualified_hunter = any(s > 60 for _, s in top_k)
+        if not has_qualified_hunter:
+            trade_logger.debug("共振跳过: %s 猎手中前 %d 名均无 >60 分", mint[:8], len(top_k))
+            return
+
         HIGH_SCORE_THRESHOLD = 75  # 75 分以上为高分猎手
         MIN_TOTAL_SCORE_C1 = 120  # c1 条件：两人及以上时，总分数需 >= 120
-        c1 = count >= 2 and total_score >= MIN_TOTAL_SCORE_C1  # 两个猎手持仓且总分>=100
+        c1 = count >= 2 and total_score >= MIN_TOTAL_SCORE_C1  # 两个猎手持仓且总分>=120
         c2 = count >= 1 and any(s >= HIGH_SCORE_THRESHOLD for s in scores)  # 一个高分猎手持仓
 
         if c1 or c2:
