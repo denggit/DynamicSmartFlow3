@@ -513,6 +513,9 @@ class SmartMoneySearcher:
                 if gain_24h is None:
                     gain_24h = (main_pair.get('priceChange') or {}).get('h24')
                 gain_24h = float(gain_24h or 0)
+                # priceChange.h24 可能为倍数 (6=6x=500%)，若在 [1,20] 视为倍数并换算
+                if 1 < gain_24h <= 20:
+                    gain_24h = (gain_24h - 1) * 100
 
                 created_at_ms = min([p.get('pairCreatedAt', float('inf')) for p in pairs])
                 if created_at_ms == float('inf'):
@@ -544,12 +547,15 @@ class SmartMoneySearcher:
             # 1. 年龄 + 涨幅检查：年龄超龄写 scanned，年龄范围内涨幅未达标不写（便于下次重试）
             is_valid, start_time, reason, gain_24h, should_save = await self.verify_token_age_via_dexscreener(client, token_address)
             if not is_valid:
-                logger.info(f"⏭️ 跳过代币 {token_address}: {reason}")
+                if "GainNotYet" in reason:
+                    logger.info(f"📉 涨幅未达标，跳过挖掘: {reason} (不写 scanned，下次重试)")
+                else:
+                    logger.info(f"⏭️ 跳过代币 {token_address}: {reason}")
                 if should_save:
                     self._save_scanned_token(token_address)
                 return []
 
-            logger.info(f"🔍 锁定黄金窗口代币 (年龄 {time.time() - start_time:.0f}s)，开始高效回溯...")
+            logger.info(f"🔍 涨幅达标 ({gain_24h:.0f}%≥{DEX_MIN_24H_GAIN_PCT}%) | 年龄 {time.time() - start_time:.0f}s，开始回溯...")
 
             # 2. 回溯翻页 (因为只挖3小时内的币，翻页压力很小)
             target_time_window = start_time + self.max_delay_sec
@@ -685,6 +691,7 @@ class SmartMoneySearcher:
                     logger.info("⏭️ 跳过已扫描代币: %s (%s)", sym, addr[:16] + "..")
                     continue
                 logger.info(f"=== 正在挖掘: {sym} ===")
+                logger.info(f"    地址: {addr}")
                 try:
                     hunters = await self.search_alpha_hunters(addr)
                     if hunters: all_hunters.extend(hunters)
