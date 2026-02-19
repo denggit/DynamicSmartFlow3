@@ -151,8 +151,8 @@ SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 
 # ==================== 猎手挖掘 (sm_searcher) ====================
 MIN_TOKEN_AGE_SEC = 3600  # 最少上市 1 小时 (太新的币数据少，难找好猎手)
-MAX_TOKEN_AGE_SEC = 43200  # 最多上市 12 小时 (放宽年龄)
-MAX_BACKTRACK_PAGES = 30  # 最多回溯 30 页 (3万笔交易)
+MAX_TOKEN_AGE_SEC = 21600  # 最多上市 12 小时 (放宽年龄)
+MAX_BACKTRACK_PAGES = 50  # 最多回溯 50 页 (5万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
 MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算真实
@@ -172,7 +172,7 @@ SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
 # ==================== DexScreener 扫描 ====================
 DEX_MIN_LIQUIDITY_USD = 10000  # 最低流动性 (USD)
 DEX_MIN_VOL_1H_USD = 50000  # 1 小时最低成交额 (USD)
-DEX_MIN_24H_GAIN_PCT = 1000.0  # 过去 24 小时涨幅 > 1000% 才算热门币
+DEX_MIN_24H_GAIN_PCT = 500.0  # 过去 24 小时涨幅 > 500% 才算热门币
 
 # ==================== 风控 (risk_control) ====================
 MAX_ACCEPTABLE_BUY_TAX_PCT = 25.0  # 买入税超过此比例拒绝
