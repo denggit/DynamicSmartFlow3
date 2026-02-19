@@ -35,7 +35,8 @@ from config.settings import (
     SOLANA_PRIVATE_KEY_BASE58,
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS,
     BASE_DIR, helius_key_pool, jup_key_pool,
-    TX_VERIFY_MAX_WAIT_SEC, TRADER_RPC_TIMEOUT,
+    TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
+    TRADER_RPC_TIMEOUT,
 )
 from utils.logger import get_logger
 
@@ -141,39 +142,51 @@ class SolanaTrader:
         """
         获取我方钱包在链上的 Token 余额（UI 单位）。
         用于卖出前校验：内部状态可能因各种原因与链上不一致，需以链上为准 cap 卖出数量。
+        遇 Helius 429 时切换 Key 重试。
         """
         if not self.keypair:
             return None
-        try:
-            owner_b58 = str(self.keypair.pubkey())
-            payload = {
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getTokenAccountsByOwner",
-                "params": [
-                    owner_b58,
-                    {"mint": token_mint},
-                    {"encoding": "jsonParsed"}
-                ]
-            }
-            resp = await self.http_client.post(
-                self._helius_pool.get_rpc_url(), json=payload, timeout=TRADER_RPC_TIMEOUT
-            )
-            if resp.status_code == 429 and self._helius_pool.size > 1:
-                self._helius_pool.mark_current_failed()
-            data = resp.json()
-            if "result" in data and data["result"]["value"]:
-                total_ui = 0.0
-                for acc in data["result"]["value"]:
-                    info = acc["account"]["data"]["parsed"]["info"]
-                    tamt = info.get("tokenAmount") or {}
-                    ui = tamt.get("uiAmount")
-                    if ui is not None:
-                        total_ui += float(ui)
-                return total_ui if total_ui > 0 else None
-            return 0.0  # 无持仓
-        except Exception:
-            logger.debug("获取链上 Token 余额失败", exc_info=True)
-            return None
+        owner_b58 = str(self.keypair.pubkey())
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                owner_b58,
+                {"mint": token_mint},
+                {"encoding": "jsonParsed"}
+            ]
+        }
+        for attempt in range(2):  # 最多 2 次：首次 + 429 后切换 Key 重试
+            try:
+                resp = await self.http_client.post(
+                    self._helius_pool.get_rpc_url(), json=payload, timeout=TRADER_RPC_TIMEOUT
+                )
+                if resp.status_code == 429:
+                    if self._helius_pool.size > 1 and attempt == 0:
+                        logger.warning("获取 Token 余额遇 Helius 429，切换 Key 重试")
+                        await self._recreate_rpc_client()
+                        continue
+                    return None
+                if resp.status_code != 200:
+                    return None
+                data = resp.json()
+                if "result" in data and data["result"]["value"]:
+                    total_ui = 0.0
+                    for acc in data["result"]["value"]:
+                        info = acc["account"]["data"]["parsed"]["info"]
+                        tamt = info.get("tokenAmount") or {}
+                        ui = tamt.get("uiAmount")
+                        if ui is not None:
+                            total_ui += float(ui)
+                    return total_ui if total_ui > 0 else None
+                return 0.0  # 无持仓
+            except Exception:
+                if attempt == 0 and self._helius_pool.size > 1:
+                    await self._recreate_rpc_client()
+                    continue
+                logger.debug("获取链上 Token 余额失败", exc_info=True)
+                return None
+        return None
 
     async def ensure_fully_closed(self, token_address: str) -> None:
         """
@@ -699,9 +712,30 @@ class SolanaTrader:
                 await asyncio.sleep(5)
 
                 # 验证交易是否真正确认，避免广播成功但链上执行失败时误更新状态
-                if not await self._verify_tx_confirmed(sig_str, max_wait_sec=TX_VERIFY_MAX_WAIT_SEC):
-                    logger.warning("❌ 交易链上确认失败: %s（可能滑点/余额不足）", sig_str)
-                    return None, 0
+                verified = await self._verify_tx_confirmed(sig_str, max_wait_sec=TX_VERIFY_MAX_WAIT_SEC)
+                if not verified:
+                    # 初次验证失败可能是 RPC 限流/超时导致误判，交易实则已成功。二次验证降低漏记风险。
+                    logger.info(
+                        "⏳ 初次验证超时/无响应，%ds 后切换 RPC 进行二次验证: %s",
+                        TX_VERIFY_RETRY_DELAY_SEC, sig_str,
+                    )
+                    await asyncio.sleep(TX_VERIFY_RETRY_DELAY_SEC)
+                    if self._helius_pool.size >= 1:
+                        await self._recreate_rpc_client()
+                    verified = await self._verify_tx_confirmed(
+                        sig_str, max_wait_sec=TX_VERIFY_RETRY_MAX_WAIT_SEC
+                    )
+                    if verified:
+                        logger.info("⚠️ 二次验证成功，交易已确认（初检可能受 RPC 限流影响）: %s", sig_str)
+                    else:
+                        logger.warning("❌ 交易链上确认失败: %s（可能滑点/余额不足）", sig_str)
+                        return None, 0
+
+                # 显式记录买入/卖出确认，便于排查与审计
+                if is_sell:
+                    logger.info("✅ 卖出已确认: %s", sig_str)
+                else:
+                    logger.info("✅ 买入已确认: %s", sig_str)
 
                 if not is_sell:
                     return sig_str, out_amount_raw
@@ -753,14 +787,27 @@ class SolanaTrader:
         return None
 
     async def _verify_tx_confirmed(self, sig_str: str, max_wait_sec: int | None = None) -> bool:
-        """轮询 get_signature_statuses，确认交易成功落地。链上失败（滑点等）时返回 False，不更新状态。"""
+        """
+        轮询 get_signature_statuses，确认交易成功落地。
+        链上失败（滑点等）时返回 False。遇 Helius 429 时切换 Key 继续轮询，避免限流误判。
+        """
         if max_wait_sec is None:
             max_wait_sec = TX_VERIFY_MAX_WAIT_SEC
         try:
             from solders.signature import Signature
             sig = Signature.from_string(sig_str) if isinstance(sig_str, str) else sig_str
             for _ in range(max_wait_sec):
-                resp = await self.rpc_client.get_signature_statuses([sig])
+                try:
+                    resp = await self.rpc_client.get_signature_statuses([sig])
+                except Exception as e:
+                    if _is_rate_limit_error(e) and self._helius_pool.size > 1:
+                        logger.warning("验证交易时 Helius 429，切换 Key 继续: %s", e)
+                        await self._recreate_rpc_client()
+                        await asyncio.sleep(1)
+                        continue
+                    logger.debug("验证交易确认异常", exc_info=True)
+                    await asyncio.sleep(1)
+                    continue
                 vals = getattr(resp, "value", None) or []
                 if not vals:
                     await asyncio.sleep(1)

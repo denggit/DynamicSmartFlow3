@@ -239,6 +239,8 @@ NEW_HUNTER_ADD_WINDOW_SEC = 600  # 开仓 10 分钟内才处理新猎手 (单猎
 
 # ==================== 交易 (trader) ====================
 TX_VERIFY_MAX_WAIT_SEC = 15  # 交易确认最大等待秒
+TX_VERIFY_RETRY_DELAY_SEC = 15  # 初次验证失败后，等待链上传播再二次验证
+TX_VERIFY_RETRY_MAX_WAIT_SEC = 30  # 二次验证最大等待秒（切换 RPC 后，避免限流误判）
 TRADER_RPC_TIMEOUT = 30.0  # RPC 请求超时
 
 # ==================== 其他 ====================

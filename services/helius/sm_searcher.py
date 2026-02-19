@@ -627,7 +627,10 @@ class SmartMoneySearcher:
                 if 1 < gain_24h <= 20:
                     gain_24h = (gain_24h - 1) * 100
 
-                created_at_ms = min([p.get('pairCreatedAt', float('inf')) for p in pairs])
+                # 使用主交易对（流动性最高）的创建时间，而非 min(全部)
+                # 原因：Pump.fun bonding curve 的 pair 创建最早，迁移到 Pumpswap 后才有主 DEX；
+                # 主 DEX 的 pairCreatedAt 才代表代币真正上线时间。
+                created_at_ms = main_pair.get('pairCreatedAt', float('inf'))
                 if created_at_ms == float('inf'):
                     return False, 0, "No Creation Time", gain_24h, False
 
