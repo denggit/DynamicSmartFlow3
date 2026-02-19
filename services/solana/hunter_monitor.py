@@ -121,9 +121,11 @@ class HunterStorage:
             logger.info(f"💀 清理僵尸地址 (10天未动): {z}..")
             del self.hunters[z]
 
-        # 2. 处理新猎手
+        # 2. 处理新猎手（只入库 60 分以上）
         if new_hunters:
             for h in new_hunters:
+                if h.get('score', 0) < 60:
+                    continue
                 addr = h['address']
                 h['last_active'] = h.get('last_active', now)
                 h['last_audit'] = h.get('last_audit', now)  # 新人入库算作刚体检
@@ -490,25 +492,19 @@ class HunterMonitorController:
             return
         holders = self.active_holdings[mint]
         if not holders: return
-        addrs = list(holders.keys())
-        scores = [self.storage.get_hunter_score(a) for a in addrs]
-        count = len(addrs)
-        total_score = sum(scores)
 
-        # 在看总分前，至少存在一个猎手评分 > 60；3+ 猎手时，前 3 名（按分数取）中至少一个 > 60
-        addr_scores = sorted(zip(addrs, scores), key=lambda x: x[1], reverse=True)
-        top_k = addr_scores[:min(3, len(addr_scores))]
-        has_qualified_hunter = any(s > 60 for _, s in top_k)
-        if not has_qualified_hunter:
-            trade_logger.debug("共振跳过: %s 猎手中前 %d 名均无 >60 分", mint[:8], len(top_k))
+        # 只跟最早交易该 token 的猎手，且其分数 ≥ 60；其余猎手不跟
+        first_buyer = self._first_buyer.get(mint)
+        if not first_buyer or first_buyer not in holders:
+            trade_logger.debug("共振跳过: %s 无首买者", mint[:8])
+            return
+        lead_score = self.storage.get_hunter_score(first_buyer)
+        if lead_score < 60:
+            trade_logger.debug("共振跳过: %s 首买者 %.0f 分 < 60", mint[:8], lead_score)
             return
 
-        HIGH_SCORE_THRESHOLD = 75  # 75 分以上为高分猎手
-        MIN_TOTAL_SCORE_C1 = 120  # c1 条件：两人及以上时，总分数需 >= 120
-        c1 = count >= 2 and total_score >= MIN_TOTAL_SCORE_C1  # 两个猎手持仓且总分>=120
-        c2 = count >= 1 and any(s >= HIGH_SCORE_THRESHOLD for s in scores)  # 一个高分猎手持仓
-
-        if c1 or c2:
+        lead_addr = first_buyer
+        if True:  # 单猎手共振条件：有一个 ≥60 分猎手持仓即可
             if self.position_check and self.position_check(mint):
                 return
             # 首买追高限制：首个猎手买入后已涨 300% 则坚决不买
@@ -525,12 +521,18 @@ class HunterMonitorController:
                 except Exception:
                     pass
             self._resonance_emitted.add(mint)
-            trade_logger.info(f"🚨 共振触发: {mint} (人数:{count}, 分:{total_score})")
+            lead_hunter_info = self.storage.hunters.get(lead_addr, {"address": lead_addr, "score": lead_score})
+            if isinstance(lead_hunter_info.get("score"), (int, float)):
+                pass
+            else:
+                lead_hunter_info = dict(lead_hunter_info)
+                lead_hunter_info["score"] = lead_score
+            trade_logger.info(f"🚨 共振触发: {mint} (跟单猎手 {lead_addr[:8]}.. 分:{lead_score})")
             if self.signal_callback:
                 signal = {
                     "token_address": mint,
-                    "hunters": [self.storage.hunters[a] for a in addrs],
-                    "total_score": total_score,
+                    "hunters": [lead_hunter_info],
+                    "total_score": lead_score,
                     "timestamp": time.time()
                 }
                 if asyncio.iscoroutinefunction(self.signal_callback):
@@ -559,7 +561,20 @@ class HunterMonitorController:
 
                 from httpx import AsyncClient
                 async with AsyncClient() as client:
-                    # 0. 频繁交易剔除：最近 100 笔平均间隔 < 5 分钟的踢出猎手池
+                    # 0. 低分剔除：60 分以下全部踢出，以后只跟单 60 分以上
+                    low_score_removed = []
+                    for addr, info in list(self.storage.hunters.items()):
+                        if info.get('score', 0) < 60:
+                            low_score_removed.append((addr, info.get('score', 0)))
+                    for addr, score in low_score_removed:
+                        if addr in self.storage.hunters:
+                            del self.storage.hunters[addr]
+                            logger.info("🚫 踢出低分猎手 %s.. (分:%.0f < 60)", addr[:12], score)
+                    if low_score_removed:
+                        self.storage.save_hunters()
+                        current_hunters = list(self.storage.hunters.items())
+
+                    # 1. 频繁交易剔除：最近 100 笔平均间隔 < 5 分钟的踢出猎手池
                     frequent_removed = []
                     for addr, _ in current_hunters:
                         if await self.sm_searcher.is_frequent_trader(client, addr):

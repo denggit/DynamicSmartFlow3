@@ -27,8 +27,9 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from config.settings import (
+    get_tier_config, HUNTER_ADD_THRESHOLD_SOL,
     TRADING_MAX_SOL_PER_TOKEN, TRADING_MIN_BUY_SOL, TRADING_ADD_BUY_SOL,
-    TRADING_SCORE_MULTIPLIER, TAKE_PROFIT_LEVELS, STOP_LOSS_PCT,
+    TAKE_PROFIT_LEVELS, STOP_LOSS_PCT,
     MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
     SOLANA_PRIVATE_KEY_BASE58,
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS,
@@ -68,7 +69,7 @@ class VirtualShare:
 
 
 class Position:
-    def __init__(self, token_address: str, entry_price: float, decimals: int = 9):
+    def __init__(self, token_address: str, entry_price: float, decimals: int = 9, lead_hunter_score: float = 0):
         self.token_address = token_address
         self.average_price = entry_price
         self.decimals = decimals
@@ -78,6 +79,7 @@ class Position:
         self.tp_hit_levels: Set[float] = set()
         self.entry_time: float = 0.0  # 首次开仓时间，用于邮件
         self.trade_records: List[Dict] = []  # 每笔交易，用于清仓邮件
+        self.lead_hunter_score: float = lead_hunter_score  # 跟单猎手分数，用于分档止损/加仓
 
 
 class SolanaTrader:
@@ -203,19 +205,25 @@ class SolanaTrader:
     # ==========================================
 
     async def execute_entry(self, token_address: str, hunters: List[Dict], total_score: float, current_price_ui: float):
+        """开仓：只跟单一个猎手，按分数档位决定买入金额。"""
         if not self.keypair: return
         if token_address in self.positions: return
+        if not hunters:
+            return
+        lead = hunters[0]  # 只跟单猎手（共振时已取最高分）
+        score = float(lead.get('score', 0))
+        tier = get_tier_config(score)
+        if not tier:
+            logger.warning("⚠️ 猎手分数 %.0f < 60，跳过开仓", score)
+            return
 
-        # 1. 获取精度 (这是关键)
+        # 1. 获取精度
         decimals = await self._get_decimals(token_address)
-        # 如果获取失败返回 0，我们强制设为 9 (SOL) 或 6 (USDC)，这里设为 9 更通用
         if decimals == 0:
             logger.warning(f"⚠️ 无法获取 {token_address} 精度，默认使用 9")
             decimals = 9
 
-        buy_sol = total_score * TRADING_SCORE_MULTIPLIER
-        buy_sol = max(buy_sol, TRADING_MIN_BUY_SOL)
-        buy_sol = min(buy_sol, TRADING_MAX_SOL_PER_TOKEN)
+        buy_sol = tier["entry_sol"]
 
         logger.info(f"🚀 [准备开仓] {token_address} | 计划: {buy_sol:.3f} SOL")
 
@@ -238,8 +246,8 @@ class SolanaTrader:
         else:
             actual_price = current_price_ui
 
-        # 4. 建仓 (传入 decimals)
-        pos = Position(token_address, actual_price, decimals)
+        # 4. 建仓 (传入 decimals, lead_hunter_score)
+        pos = Position(token_address, actual_price, decimals, lead_hunter_score=score)
         pos.total_cost_sol = buy_sol
         pos.total_tokens = token_amount_ui
         pos.entry_time = time.time()
@@ -254,41 +262,49 @@ class SolanaTrader:
         })
 
         self.positions[token_address] = pos
-        self._rebalance_shares_logic(pos, hunters)
+        self._rebalance_shares_logic(pos, [lead])  # 只跟单猎手
         self._save_state_safe()
         logger.info(f"✅ 开仓成功 | 均价: {actual_price:.6f} SOL | 持仓: {token_amount_ui:.2f}")
 
     async def execute_add_position(self, token_address: str, trigger_hunter: Dict, add_reason: str,
                                    current_price: float):
         """
-        加仓逻辑。止盈基于单 token 成本价 (average_price)：
-        - 首次 150%：单 token 价值 >= average_price * 2.5 时卖出 50%
-        - 加仓会抬高 average_price，阈值为新均价 * (1 + level)
-        一旦止盈触发，禁止再加仓（猎手加仓/新增猎手均不跟）
+        加仓逻辑。只跟单猎手的加仓，猎手加仓 ≥ 1 SOL 才跟。按档位决定加仓金额与上限。
         """
         if not self.keypair: return
         pos = self.positions.get(token_address)
         if not pos: return
 
+        # 只跟单猎手：加仓必须来自已在份额中的猎手
+        hunter_addr = trigger_hunter.get('address')
+        if hunter_addr not in pos.shares:
+            return
+
         if pos.tp_hit_levels:
             logger.info("💰 [加仓跳过] %s 止盈已触发，禁止加仓", token_address[:8])
             return
 
-        if pos.total_cost_sol >= TRADING_MAX_SOL_PER_TOKEN: return
+        score = float(trigger_hunter.get('score', 0)) or pos.lead_hunter_score
+        tier = get_tier_config(score) or get_tier_config(pos.lead_hunter_score)
+        if not tier:
+            return
+        max_sol = tier["max_sol"]
+        add_sol = tier["add_sol"]
 
-        buy_sol = TRADING_ADD_BUY_SOL
-        if pos.total_cost_sol + buy_sol > TRADING_MAX_SOL_PER_TOKEN:
-            buy_sol = TRADING_MAX_SOL_PER_TOKEN - pos.total_cost_sol
+        if pos.total_cost_sol >= max_sol:
+            return
+        if pos.total_cost_sol + add_sol > max_sol:
+            add_sol = max_sol - pos.total_cost_sol
+        if add_sol < 0.01:
+            return
 
-        if buy_sol < 0.01: return
-
-        logger.info(f"➕ [准备加仓] {token_address} | 金额: {buy_sol:.3f} SOL")
+        logger.info(f"➕ [准备加仓] {token_address} | 金额: {add_sol:.3f} SOL")
 
         # === 真实买入 ===
         tx_sig, token_got_raw = await self._jupiter_swap(
             input_mint=WSOL_MINT,
             output_mint=token_address,
-            amount_in_ui=buy_sol,
+            amount_in_ui=add_sol,
             slippage_bps=SLIPPAGE_BPS
         )
 
@@ -299,21 +315,20 @@ class SolanaTrader:
 
         # 更新状态与均价 (一次计算即可)
         new_total_tokens = pos.total_tokens + token_got_ui
-        pos.average_price = (pos.total_tokens * pos.average_price + buy_sol) / new_total_tokens
-        pos.total_cost_sol += buy_sol
+        pos.average_price = (pos.total_tokens * pos.average_price + add_sol) / new_total_tokens
+        pos.total_cost_sol += add_sol
         pos.total_tokens = new_total_tokens
 
         pos.trade_records.append({
             "ts": time.time(),
             "type": "buy",
-            "sol_spent": buy_sol,
+            "sol_spent": add_sol,
             "sol_received": 0.0,
             "token_amount": token_got_ui,
             "note": "加仓",
             "pnl_sol": None,
         })
-        # 份额分配
-        hunter_addr = trigger_hunter['address']
+        # 份额分配（只跟单猎手）
         if hunter_addr in pos.shares:
             pos.shares[hunter_addr].token_amount += token_got_ui
         else:
@@ -436,7 +451,11 @@ class SolanaTrader:
                 )
                 pnl_pct = jupiter_implied_pnl
 
-        if pnl_pct <= -STOP_LOSS_PCT:
+        stop_loss_pct = STOP_LOSS_PCT
+        tier = get_tier_config(pos.lead_hunter_score)
+        if tier:
+            stop_loss_pct = tier["stop_loss_pct"]
+        if pnl_pct <= -stop_loss_pct:
             chain_bal = await self._fetch_own_token_balance(token_address)
             sell_amount = chain_bal if chain_bal is not None else pos.total_tokens * SELL_BUFFER
             if chain_bal is not None and chain_bal < pos.total_tokens * 0.99:
@@ -468,7 +487,7 @@ class SolanaTrader:
                     "sol_spent": 0.0,
                     "sol_received": sol_received,
                     "token_amount": sell_amount,
-                    "note": f"止损{STOP_LOSS_PCT*100:.0f}%",
+                    "note": f"止损{stop_loss_pct*100:.0f}%",
                     "pnl_sol": pnl_sol,
                 })
                 self._emit_position_closed(token_address, pos)
@@ -764,6 +783,7 @@ class SolanaTrader:
             "decimals": pos.decimals,
             "total_tokens": pos.total_tokens,
             "total_cost_sol": pos.total_cost_sol,
+            "lead_hunter_score": pos.lead_hunter_score,
             "tp_hit_levels": list(pos.tp_hit_levels),
             "shares": {
                 addr: {"hunter": s.hunter, "score": s.score, "token_amount": s.token_amount}
@@ -782,6 +802,7 @@ class SolanaTrader:
         pos.entry_time = float(d.get("entry_time", 0))
         pos.total_tokens = float(d.get("total_tokens", 0))
         pos.total_cost_sol = float(d.get("total_cost_sol", 0))
+        pos.lead_hunter_score = float(d.get("lead_hunter_score", 0))
         pos.tp_hit_levels = set(float(x) for x in d.get("tp_hit_levels", []))
         for addr, s in (d.get("shares") or {}).items():
             pos.shares[addr] = VirtualShare(

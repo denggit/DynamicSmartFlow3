@@ -117,13 +117,10 @@ class HunterAgentController:
                     except Exception:
                         logger.exception("on_tx_from_monitor analyze_action 异常 %s %s", hunter[:6], mint[:6])
                 elif delta > 0:
-                    # 新增猎手：池内猎手买入我们持有的 token
+                    # 单猎手模式：不再添加新猎手，只跟开仓时的那个猎手
                     mission = self.active_missions.get(mint)
                     if mission and hunter not in mission.hunter_states:
-                        try:
-                            await self._handle_new_hunter_join(hunter, mint, delta)
-                        except Exception:
-                            logger.exception("on_tx_from_monitor _handle_new_hunter_join 异常 %s %s", hunter[:6], mint[:6])
+                        trade_logger.debug("单猎手模式: 新猎手 %s 买入不跟", hunter[:8])
 
     # === 1. 任务管理接口 (供主程序调用) ===
 

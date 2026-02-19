@@ -98,24 +98,31 @@ JUP_SWAP_API = "https://api.jup.ag/swap/v1/swap"
 SLIPPAGE_BPS = 200  # 滑点 2% (200 bps)
 PRIORITY_FEE_SETTINGS = "auto"
 
-# 仓位限制
-TRADING_MAX_SOL_PER_TOKEN = 0.3  # 单币最大持仓 (SOL)
-TRADING_MIN_BUY_SOL = 0.1  # 单次最低买入 (SOL)
-TRADING_ADD_BUY_SOL = 0.1  # 加仓固定金额 (SOL)
+# 单猎手跟单分档 (60-80 / 80-90 / 90+)，只跟一个猎手
+def get_tier_config(score: float) -> dict:
+    """根据猎手分数返回该档位的 entry/add/max/stop_loss。60 分以下返回 None。"""
+    if score >= 90:
+        return {"entry_sol": 0.2, "add_sol": 0.2, "max_sol": 1.0, "stop_loss_pct": 0.5}
+    if score >= 80:
+        return {"entry_sol": 0.1, "add_sol": 0.1, "max_sol": 0.5, "stop_loss_pct": 0.4}
+    if score >= 60:
+        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.3, "stop_loss_pct": 0.3}
+    return None
 
-# 入场计算
-TRADING_SCORE_MULTIPLIER = 0.001  # 总分 * 倍数 = 买入SOL
-# 例如: 160分 * 0.001 = 0.16 SOL
-
-# 猎手加仓跟随阈值
-# 猎手加仓或新增猎手买入 ≥ 1 SOL 即跟仓 0.1 SOL，单币上限 0.5 SOL
+# 猎手加仓跟随阈值：只跟对方买入 ≥ 1 SOL 的单
 HUNTER_ADD_THRESHOLD_SOL = 1.0
+
+# 兼容旧逻辑（不再使用）
+TRADING_MAX_SOL_PER_TOKEN = 0.5
+TRADING_MIN_BUY_SOL = 0.05
+TRADING_ADD_BUY_SOL = 0.1
+TRADING_SCORE_MULTIPLIER = 0.001
 
 # 首买追高限制：首个猎手买入后若已涨 300%（现价/首买价 ≥ 4），坚决不买、不加仓
 MAX_ENTRY_PUMP_MULTIPLIER = 4.0  # 4x = 300% 涨幅
 
-# 止损：亏损超过此比例直接全仓清仓
-STOP_LOSS_PCT = 0.3  # 亏损 30% 止损
+# 止损：按档位 (60-80: 30% / 80-90: 40% / 90+: 50%)，由 get_tier_config 返回
+STOP_LOSS_PCT = 0.4  # 默认兜底（80-90 档）
 
 # 卖出精度保护：全仓/接近全仓卖出时仅卖 99.9%，避免浮点转 int 时多出 1 wei 导致链上失败
 SELL_BUFFER = 0.999  # 留 0.1% 缓冲，防止 rounding overflow

@@ -114,7 +114,7 @@ async def on_monitor_signal(signal):
         hunters_summary=hunters_summary or "-",
     )
 
-    # 5. Agent 启动监控
+    # 5. Agent 启动监控（只跟单一个猎手）
     hunter_addrs = [h["address"] for h in hunters]
     await agent.start_tracking(token, hunter_addrs)
 
@@ -148,7 +148,7 @@ async def on_agent_signal(signal):
             add_amount_ui = signal.get("add_amount_raw", 0) / (10 ** pos.decimals)
         add_sol_value = add_amount_ui * price
         if add_sol_value >= HUNTER_ADD_THRESHOLD_SOL:
-            hunter_info = {"address": hunter_addr, "score": 50}
+            hunter_info = {"address": hunter_addr, "score": pos.lead_hunter_score}
             await trader.execute_add_position(token, hunter_info, "猎手大额加仓", price)
             await agent.add_hunter_to_mission(token, hunter_addr)
 
