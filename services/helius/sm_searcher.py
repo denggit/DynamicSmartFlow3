@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from collections import defaultdict
 from typing import Dict, List, Tuple, Set
@@ -24,6 +25,7 @@ from typing import Dict, List, Tuple, Set
 import httpx
 
 from config.settings import (
+    BASE_DIR,
     helius_key_pool,
     MIN_TOKEN_AGE_SEC,
     MAX_TOKEN_AGE_SEC,
@@ -245,8 +247,9 @@ class SmartMoneySearcher:
         self._load_wallet_blacklist()
 
     def _ensure_data_dir(self):
-        if not os.path.exists("data"):
-            os.makedirs("data")
+        """确保 data 目录存在，使用 BASE_DIR 保证路径一致性。"""
+        data_dir = BASE_DIR / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
 
     def _load_scanned_history(self):
         self._ensure_data_dir()
@@ -259,13 +262,20 @@ class SmartMoneySearcher:
                 logger.exception("⚠️ 加载扫描历史失败")
 
     def _save_scanned_token(self, token_address: str):
-        if token_address in self.scanned_tokens: return
+        """追加已扫描代币并后台写入文件，不阻塞挖掘。"""
+        if token_address in self.scanned_tokens:
+            return
         self.scanned_tokens.add(token_address)
-        try:
-            with open(SCANNED_HISTORY_FILE, 'w') as f:
-                json.dump(list(self.scanned_tokens), f)
-        except Exception:
-            logger.exception("保存扫描历史失败")
+        snapshot = list(self.scanned_tokens)
+
+        def _write():
+            try:
+                with open(SCANNED_HISTORY_FILE, 'w') as f:
+                    json.dump(snapshot, f)
+            except Exception:
+                logger.exception("保存扫描历史失败")
+
+        threading.Thread(target=_write, daemon=True).start()
 
     def _load_wallet_blacklist(self):
         """加载钱包黑名单：劣质猎手地址，扫描时直接跳过以节省 API。"""
@@ -280,16 +290,22 @@ class SmartMoneySearcher:
                 logger.exception("⚠️ 加载钱包黑名单失败")
 
     def _add_to_wallet_blacklist(self, address: str):
-        """将劣质猎手加入黑名单，下次扫描跳过。"""
+        """将劣质猎手加入黑名单并后台写入，不阻塞挖掘。"""
         if address in self.wallet_blacklist:
             return
         self.wallet_blacklist.add(address)
-        try:
-            with open(WALLET_BLACKLIST_FILE, 'w') as f:
-                json.dump(list(self.wallet_blacklist), f)
-            logger.debug("🖤 加入黑名单: %s..", address[:12])
-        except Exception:
-            logger.exception("保存钱包黑名单失败")
+        snapshot = list(self.wallet_blacklist)
+        addr_short = address[:12]
+
+        def _write():
+            try:
+                with open(WALLET_BLACKLIST_FILE, 'w') as f:
+                    json.dump(snapshot, f)
+                logger.debug("🖤 加入黑名单: %s..", addr_short)
+            except Exception:
+                logger.exception("保存钱包黑名单失败")
+
+        threading.Thread(target=_write, daemon=True).start()
 
     async def _rpc_post(self, client, method, params):
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -362,7 +378,15 @@ class SmartMoneySearcher:
         all_txs = []
         for i in range(0, len(signatures), chunk_size):
             batch = signatures[i:i + chunk_size]
-            payload = {"transactions": [s['signature'] for s in batch]}
+            # 兼容 RPC 返回 dict 或 str：dict 取 signature，str 直接使用
+            sigs = [
+                s.get("signature") or (s if isinstance(s, str) else None)
+                for s in batch
+            ]
+            sigs = [x for x in sigs if x]
+            if not sigs:
+                continue
+            payload = {"transactions": sigs}
             url = f"{self.base_api_url}/transactions?api-key={self.api_key}"
             try:
                 resp = await client.post(url, json=payload, timeout=30.0)

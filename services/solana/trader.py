@@ -13,6 +13,7 @@ import base64
 import json
 import math
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Set, Optional, Tuple, Callable, Any
@@ -86,7 +87,8 @@ class Position:
 class SolanaTrader:
     def __init__(self):
         self.positions: Dict[str, Position] = {}
-        self.on_position_closed_callback: Optional[Callable[[dict], None]] = None  # 清仓时回调，传 snapshot
+        self.on_position_closed_callback: Optional[Callable[[dict], None]] = None  # 清仓时回调
+        self.on_trade_recorded: Optional[Callable[[dict], None]] = None  # 每笔买卖后回调，用于 trading_history
 
         # 初始化钱包
         if not SOLANA_PRIVATE_KEY_BASE58:
@@ -261,7 +263,22 @@ class SolanaTrader:
 
         self.positions[token_address] = pos
         self._rebalance_shares_logic(pos, [lead])  # 只跟单猎手
-        self._save_state_safe()
+        self._save_state_in_background()
+        hunter_addr = lead.get("address", "")
+        if self.on_trade_recorded:
+            self.on_trade_recorded({
+                "date": time.strftime("%Y-%m-%d", time.localtime()),
+                "ts": pos.entry_time,
+                "token": token_address,
+                "type": "buy",
+                "sol_spent": buy_sol,
+                "sol_received": 0.0,
+                "token_amount": token_amount_ui,
+                "price": actual_price,
+                "hunter_addr": hunter_addr,
+                "pnl_sol": None,
+                "note": "首次开仓",
+            })
         logger.info(f"✅ 开仓成功 | 均价: {actual_price:.6f} SOL | 持仓: {token_amount_ui:.2f}")
 
     async def execute_add_position(self, token_address: str, trigger_hunter: Dict, add_reason: str,
@@ -333,7 +350,21 @@ class SolanaTrader:
             pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), token_got_ui)
             current_hunters_info = [{"address": h, "score": s.score} for h, s in pos.shares.items()]
             self._rebalance_shares_logic(pos, current_hunters_info)
-        self._save_state_safe()
+        if self.on_trade_recorded:
+            self.on_trade_recorded({
+                "date": time.strftime("%Y-%m-%d", time.localtime()),
+                "ts": time.time(),
+                "token": token_address,
+                "type": "buy",
+                "sol_spent": add_sol,
+                "sol_received": 0.0,
+                "token_amount": token_got_ui,
+                "price": current_price,
+                "hunter_addr": hunter_addr,
+                "pnl_sol": None,
+                "note": "加仓",
+            })
+        self._save_state_in_background()
 
     async def execute_follow_sell(self, token_address: str, hunter_addr: str, sell_ratio: float, current_price: float):
         """跟随卖出逻辑。文档: 猎手卖出<5%不跟，跟随时我方至少卖该份额的 MIN_SELL_RATIO。"""
@@ -374,12 +405,12 @@ class SolanaTrader:
         if chain_bal2 is not None and sell_amount_ui > chain_bal2:
             sell_amount_ui = min(sell_amount_ui, chain_bal2)
             logger.debug("二次校验链上余额 %.2f，最终卖出 %.2f", chain_bal2, sell_amount_ui)
-            if chain_bal < pos.total_tokens * 0.99:
-                # 同步内部状态，避免后续卖出继续出错
+            # 使用 chain_bal2（二次校验成功）进行状态同步，避免 chain_bal 为 None 时 TypeError
+            if chain_bal2 < pos.total_tokens * 0.99:
                 old_total = pos.total_tokens
-                pos.total_tokens = chain_bal
+                pos.total_tokens = chain_bal2
                 if old_total > 0:
-                    ratio = chain_bal / old_total
+                    ratio = chain_bal2 / old_total
                     for s in pos.shares.values():
                         s.token_amount *= ratio
         else:
@@ -407,8 +438,9 @@ class SolanaTrader:
 
         cost_this_sell = sell_amount_ui * pos.average_price
         pnl_sol = sol_got_ui - cost_this_sell
+        ts_now = time.time()
         pos.trade_records.append({
-            "ts": time.time(),
+            "ts": ts_now,
             "type": "sell",
             "sol_spent": 0.0,
             "sol_received": sol_got_ui,
@@ -416,6 +448,20 @@ class SolanaTrader:
             "note": "跟随卖出",
             "pnl_sol": pnl_sol,
         })
+        if self.on_trade_recorded:
+            self.on_trade_recorded({
+                "date": time.strftime("%Y-%m-%d", time.localtime(ts_now)),
+                "ts": ts_now,
+                "token": token_address,
+                "type": "sell",
+                "sol_spent": 0.0,
+                "sol_received": sol_got_ui,
+                "token_amount": sell_amount_ui,
+                "price": pos.average_price,
+                "hunter_addr": hunter_addr,
+                "pnl_sol": pnl_sol,
+                "note": "跟随卖出",
+            })
         pos.total_tokens -= sell_amount_ui
         share.token_amount -= sell_amount_ui
         if is_dust or share.token_amount <= 0:
@@ -424,7 +470,7 @@ class SolanaTrader:
         if pos.total_tokens <= 0:
             self._emit_position_closed(token_address, pos)
             del self.positions[token_address]
-        self._save_state_safe()
+        self._save_state_in_background()
 
     async def check_pnl_and_stop_profit(self, token_address: str, current_price_ui: float):
         """止盈与止损逻辑：亏损超 30% 全仓止损，盈利达标则分批止盈。"""
@@ -479,8 +525,9 @@ class SolanaTrader:
             if tx_sig:
                 cost_this_sell = sell_amount * pos.average_price
                 pnl_sol = sol_received - cost_this_sell
+                ts_now = time.time()
                 pos.trade_records.append({
-                    "ts": time.time(),
+                    "ts": ts_now,
                     "type": "sell",
                     "sol_spent": 0.0,
                     "sol_received": sol_received,
@@ -488,9 +535,24 @@ class SolanaTrader:
                     "note": f"止损{stop_loss_pct*100:.0f}%",
                     "pnl_sol": pnl_sol,
                 })
+                if self.on_trade_recorded:
+                    lead = list(pos.shares.keys())[0] if pos.shares else ""
+                    self.on_trade_recorded({
+                        "date": time.strftime("%Y-%m-%d", time.localtime(ts_now)),
+                        "ts": ts_now,
+                        "token": token_address,
+                        "type": "sell",
+                        "sol_spent": 0.0,
+                        "sol_received": sol_received,
+                        "token_amount": sell_amount,
+                        "price": pos.average_price,
+                        "hunter_addr": lead,
+                        "pnl_sol": pnl_sol,
+                        "note": f"止损{stop_loss_pct*100:.0f}%",
+                    })
                 self._emit_position_closed(token_address, pos)
                 del self.positions[token_address]
-            self._save_state_safe()
+            self._save_state_in_background()
             return
 
         for level, sell_pct in TAKE_PROFIT_LEVELS:
@@ -525,8 +587,9 @@ class SolanaTrader:
                 if tx_sig:
                     cost_this_sell = sell_amount * pos.average_price
                     pnl_sol = sol_received - cost_this_sell
+                    ts_now = time.time()
                     pos.trade_records.append({
-                        "ts": time.time(),
+                        "ts": ts_now,
                         "type": "sell",
                         "sol_spent": 0.0,
                         "sol_received": sol_received,
@@ -534,6 +597,21 @@ class SolanaTrader:
                         "note": f"止盈{sell_pct * 100:.0f}%",
                         "pnl_sol": pnl_sol,
                     })
+                    if self.on_trade_recorded:
+                        lead = list(pos.shares.keys())[0] if pos.shares else ""
+                        self.on_trade_recorded({
+                            "date": time.strftime("%Y-%m-%d", time.localtime(ts_now)),
+                            "ts": ts_now,
+                            "token": token_address,
+                            "type": "sell",
+                            "sol_spent": 0.0,
+                            "sol_received": sol_received,
+                            "token_amount": sell_amount,
+                            "price": pos.average_price,
+                            "hunter_addr": lead,
+                            "pnl_sol": pnl_sol,
+                            "note": f"止盈{sell_pct * 100:.0f}%",
+                        })
                     for share in pos.shares.values():
                         share.token_amount *= (1.0 - sell_pct)
                     pos.total_tokens -= sell_amount
@@ -541,7 +619,7 @@ class SolanaTrader:
                     if pos.total_tokens <= 0:
                         self._emit_position_closed(token_address, pos)
                         del self.positions[token_address]
-                self._save_state_safe()
+                self._save_state_in_background()
 
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
                             is_sell: bool = False, token_decimals: int = 9) -> Tuple[Optional[str], float]:
@@ -814,7 +892,7 @@ class SolanaTrader:
         return pos
 
     def _save_state_safe(self) -> None:
-        """将当前持仓写入本地文件，失败只打日志。"""
+        """同步写入当前持仓到本地文件（内部用）。"""
         try:
             TRADER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             data = {
@@ -829,9 +907,17 @@ class SolanaTrader:
         except Exception:
             logger.exception("保存持仓状态失败")
 
+    def _save_state_in_background(self) -> None:
+        """后台线程持久化持仓，不阻塞跟单。"""
+        def _run():
+            self._save_state_safe()
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
     def save_state(self) -> None:
-        """公开方法：持久化当前持仓到 data/trader_state.json。"""
-        self._save_state_safe()
+        """公开方法：持久化当前持仓到 data/trader_state.json（后台线程，不阻塞）。"""
+        self._save_state_in_background()
 
     def load_state(self) -> None:
         """从 data/trader_state.json 恢复持仓，启动时调用。"""

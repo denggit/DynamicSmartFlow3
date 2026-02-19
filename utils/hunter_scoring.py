@@ -55,7 +55,7 @@ def compute_hunter_score(stats: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # 胜率分：< 15% 零分，15%~35% 线性 0.5~1，≥35% 满分
-    wr = stats["win_rate"] * 100
+    wr = stats.get("win_rate", 0) * 100
     if wr < SM_WIN_RATE_ZERO_PCT:
         score_hit_rate = 0.0
     elif wr >= SM_WIN_RATE_FULL_PCT:

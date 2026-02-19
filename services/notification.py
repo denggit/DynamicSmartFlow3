@@ -145,7 +145,7 @@ def build_daily_report_content(
     total_pnl_sol: float,
     details_lines: list,
 ) -> str:
-    """日报正文。details_lines 为今日每笔盈亏等说明列表。"""
+    """日报正文（旧版简化格式，已由 build_detailed_daily_report 取代）。"""
     lines = [
         "【每日收益日报】\n",
         f"今日收益(SOL): {today_pnl_sol:+.4f}\n",
@@ -153,6 +153,64 @@ def build_daily_report_content(
         "--- 今日明细 ---\n",
     ]
     lines.extend(details_lines if details_lines else ["(无)\n"])
+    return "".join(lines)
+
+
+def build_detailed_daily_report(
+    hunter_pool_count: int,
+    hunter_pool_limit: int,
+    today_tokens_traded: int,
+    today_tokens_held: int,
+    today_tokens_settled: int,
+    today_pnl_sol: float,
+    today_avg_roi_pct: float,
+    today_win_count: int,
+    today_loss_count: int,
+    today_profit_factor: float,
+    total_pnl_sol: float,
+    total_trades: int,
+    top_hunters: list,
+    today_details: list,
+) -> str:
+    """
+    构建详细日报正文。
+    top_hunters: [(hunter_addr_short, pnl_sol, rank), ...] 前五名
+    today_details: 今日每笔交易/结算说明
+    """
+    lines = [
+        "【每日交易日报】\n",
+        "───────── 猎手池 ─────────\n",
+        f"当前猎手数: {hunter_pool_count}/{hunter_pool_limit}\n",
+        "\n",
+        "───────── 今日概况 ─────────\n",
+        f"交易代币数: {today_tokens_traded}\n",
+        f"当前持仓: {today_tokens_held}\n",
+        f"今日结算: {today_tokens_settled}\n",
+        f"今日盈亏: {today_pnl_sol:+.4f} SOL\n",
+    ]
+    if today_tokens_settled > 0:
+        lines.append(f"今日平均收益: {today_avg_roi_pct:+.1f}%\n")
+        lines.append(f"今日胜/亏单: {today_win_count}/{today_loss_count}\n")
+        if today_profit_factor != float("inf") and today_profit_factor >= 0:
+            lines.append(f"今日盈亏比: {today_profit_factor:.2f}\n")
+    lines.extend([
+        "\n",
+        "───────── 累计概况 ─────────\n",
+        f"累计盈亏: {total_pnl_sol:+.4f} SOL\n",
+        f"累计成交笔数: {total_trades}\n",
+        "\n",
+        "───────── 跟单猎手表现 TOP5 ─────────\n",
+    ])
+    if top_hunters:
+        for i, (addr, pnl, _) in enumerate(top_hunters, 1):
+            lines.append(f"  {i}. {addr}.. 累计盈亏: {pnl:+.4f} SOL\n")
+    else:
+        lines.append("  (暂无数据)\n")
+    lines.extend([
+        "\n",
+        "───────── 今日明细 ─────────\n",
+    ])
+    lines.extend(today_details if today_details else ["(今日无交易/结算)\n"])
     return "".join(lines)
 
 
@@ -185,9 +243,15 @@ def send_close_email(
 
 
 def send_daily_report_email(today_pnl_sol: float, total_pnl_sol: float, details_lines: list) -> None:
-    """日报：在新线程发送。"""
+    """日报：在新线程发送（简化版）。"""
     subject = "📊 每日收益日报"
     content = build_daily_report_content(today_pnl_sol, total_pnl_sol, details_lines)
+    send_email_in_thread(subject, content)
+
+
+def send_detailed_daily_report_email(content: str) -> None:
+    """详细日报：在新线程发送。"""
+    subject = "📊 每日交易日报"
     send_email_in_thread(subject, content)
 
 

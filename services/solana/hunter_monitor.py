@@ -53,7 +53,6 @@ from services.dexscreener.dex_scanner import DexScanner
 from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
 from utils.logger import get_logger
 from utils.hunter_scoring import compute_hunter_score
-from services import notification
 
 logger = get_logger(__name__)
 
@@ -97,9 +96,9 @@ def _apply_audit_update(info: dict, new_stats: dict, now: float, addr: str) -> N
 # 猎手交易单独写入 monitor.log，便于查看时间与交易币种
 trade_logger = get_logger("trade")
 
-# 常量配置
-HUNTER_DATA_FILE = "data/hunters.json"
-HUNTER_DATA_BACKUP = "data/hunters_backup.json"
+# 常量配置（使用 BASE_DIR 保证与 main 路径一致，不受 cwd 影响）
+HUNTER_DATA_FILE = str(BASE_DIR / "data" / "hunters.json")
+HUNTER_DATA_BACKUP = str(BASE_DIR / "data" / "hunters_backup.json")
 WS_COMMITMENT = "processed"
 
 
@@ -114,8 +113,9 @@ class HunterStorage:
         self.load_hunters()
 
     def ensure_data_dir(self):
-        if not os.path.exists("data"):
-            os.makedirs("data")
+        data_dir = BASE_DIR / "data"
+        if not data_dir.exists():
+            data_dir.mkdir(parents=True, exist_ok=True)
 
     def load_hunters(self):
         if os.path.exists(HUNTER_DATA_FILE):
@@ -268,16 +268,8 @@ class HunterMonitorController:
             try:
                 new_hunters = await self.sm_searcher.run_pipeline(self.dex_scanner)
                 if new_hunters:
-                    delta = self.storage.prune_and_update(new_hunters)
-                    total = delta["added"] + delta["removed_zombie"] + delta["replaced"]
-                    if total > 0:
-                        notification.send_hunter_changes_email(
-                            added=delta["added"],
-                            removed=delta["removed_zombie"],
-                            replaced=delta["replaced"],
-                            total_count=len(self.storage.hunters),
-                            attachment_path=HUNTER_JSON_PATH,
-                        )
+                    # 存盘为同步 I/O，放线程池执行，不阻塞挖掘/监控
+                    await asyncio.to_thread(self.storage.prune_and_update, new_hunters)
             except Exception:
                 logger.exception("❌ 挖掘异常")
             # 池满时降低挖掘频率，避免无意义消耗 credit
@@ -658,15 +650,8 @@ class HunterMonitorController:
                     logger.exception("审计猎手 %s 异常，跳过", addr[:12])
                 await asyncio.sleep(2)
 
-        self.storage.save_hunters()
+        await asyncio.to_thread(self.storage.save_hunters)
         logger.info("🩺 [立即审计] 完成 | 剔除 %d 名 | 更新 %d 名", removed, updated)
-        if removed > 0 or updated > 0:
-            notification.send_hunter_changes_email(
-                removed=removed,
-                updated=updated,
-                total_count=len(self.storage.hunters),
-                attachment_path=HUNTER_JSON_PATH,
-            )
 
     # --- 线程 3: 维护 (Maintenance - 优化版) ---
     async def maintenance_loop(self):
@@ -738,17 +723,8 @@ class HunterMonitorController:
                 if needs_audit_count == 0:
                     logger.info("✨ 所有猎手均在体检有效期内，无需更新")
 
-                # 2. 清理僵尸 & 存盘 (每次维护都做一次清理)
-                delta = self.storage.prune_and_update([])
-                removed_total = len(audit_removed) + len(frequent_removed) + delta["removed_zombie"]
-                if removed_total > 0 or delta["replaced"] > 0 or needs_audit_count > 0:
-                    notification.send_hunter_changes_email(
-                        removed=removed_total,
-                        replaced=delta["replaced"],
-                        updated=needs_audit_count,
-                        total_count=len(self.storage.hunters),
-                        attachment_path=HUNTER_JSON_PATH,
-                    )
+                # 2. 清理僵尸 & 存盘 (每次维护都做一次清理，放线程池不阻塞监控)
+                await asyncio.to_thread(self.storage.prune_and_update, [])
                 logger.info("✅ 维护完成")
 
             except Exception:

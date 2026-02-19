@@ -189,9 +189,9 @@ SM_WIN_RATE_FULL_PCT = 35.0   # ≥35% → 胜率分=1
 # 盈亏比分：总盈亏比 = 盈利单利润和/亏损单亏损和；< 1.5 零分，1.5~3 线性，> 3 满分
 SM_PNL_RATIO_ZERO = 1.5   # < 1.5 → 盈亏比分=0
 SM_PNL_RATIO_FULL = 3.0   # > 3.0 → 盈亏比分=1
-SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
+SCANNED_HISTORY_FILE = str(BASE_DIR / "data" / "scanned_tokens.json")
 # 钱包黑名单：劣质猎手不再分析，节省 Helius API
-WALLET_BLACKLIST_FILE = "data/wallet_blacklist.json"
+WALLET_BLACKLIST_FILE = str(BASE_DIR / "data" / "wallet_blacklist.json")
 WALLET_BLACKLIST_MIN_SCORE = 50  # 评分低于此加入黑名单
 WALLET_BLACKLIST_LOSS_USDC = 30.0  # 亏损超过此金额 (USDC) 且胜率低则加入
 WALLET_BLACKLIST_WIN_RATE = 0.4  # 亏损+胜率低于此加入黑名单
