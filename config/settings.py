@@ -150,7 +150,7 @@ PNL_CHECK_INTERVAL = 5  # 每 5 秒检查一次止盈/止损
 SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 
 # ==================== 猎手挖掘 (sm_searcher) ====================
-MIN_TOKEN_AGE_SEC = 900  # 最少上市 15 分钟 (排除纯土狗/貔貅)
+MIN_TOKEN_AGE_SEC = 3600  # 最少上市 1 小时 (太新的币数据少，难找好猎手)
 MAX_TOKEN_AGE_SEC = 43200  # 最多上市 12 小时 (放宽年龄)
 MAX_BACKTRACK_PAGES = 30  # 最多回溯 30 页 (3万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数

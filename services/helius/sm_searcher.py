@@ -548,7 +548,7 @@ class SmartMoneySearcher:
                     logger.debug(f"    通过 200%% 收益过滤: {candidate['address'][:12]}.. ROI={roi:.0f}%%")
                 await asyncio.sleep(0.3)
             hunters_candidates = profit_filtered
-            logger.info(f"  [初筛] 在该代币赚取≥{SM_MIN_TOKEN_PROFIT_PCT:.0f}%%: {len(hunters_candidates)} 个")
+            logger.info(f"  [初筛] 在该代币赚取≥{SM_MIN_TOKEN_PROFIT_PCT:.0f}%: {len(hunters_candidates)} 个")
 
             # 4. 深度审计 + 评分入库
             verified_hunters = []
@@ -597,7 +597,9 @@ class SmartMoneySearcher:
             for token in hot_tokens:
                 addr = token.get('address')
                 sym = token.get('symbol')
-                if addr in self.scanned_tokens: continue
+                if addr in self.scanned_tokens:
+                    logger.info("⏭️ 跳过已扫描代币: %s (%s)", sym, addr[:16] + "..")
+                    continue
                 logger.info(f"=== 正在挖掘: {sym} ===")
                 try:
                     hunters = await self.search_alpha_hunters(addr)
