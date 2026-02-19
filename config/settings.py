@@ -150,9 +150,9 @@ PNL_CHECK_INTERVAL = 5  # 每 5 秒检查一次止盈/止损
 SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 
 # ==================== 猎手挖掘 (sm_searcher) ====================
-MIN_TOKEN_AGE_SEC = 3600  # 最少上市 1 小时 (太新的币数据少，难找好猎手)
-MAX_TOKEN_AGE_SEC = 21600  # 最多上市 12 小时 (放宽年龄)
-MAX_BACKTRACK_PAGES = 50  # 最多回溯 50 页 (5万笔交易)
+MIN_TOKEN_AGE_SEC = 1800  # 最少上市 30分钟 (太新的币数据少，难找好猎手)
+MAX_TOKEN_AGE_SEC = 14400  # 最多上市 4 小时 (放宽年龄)
+MAX_BACKTRACK_PAGES = 100  # 最多回溯 100 页 (10万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
 MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算真实
