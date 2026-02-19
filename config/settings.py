@@ -149,7 +149,7 @@ SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 
 # ==================== 猎手挖掘 (sm_searcher) ====================
 MIN_TOKEN_AGE_SEC = 1800  # 最少上市 30 (太新的币数据少，难找好猎手)
-MAX_TOKEN_AGE_SEC = 14400  # 最多上市 4 小时 (放宽年龄)
+MAX_TOKEN_AGE_SEC = 21600  # 最多上市 6 小时 (放宽年龄)
 MAX_BACKTRACK_PAGES = 100  # 最多回溯 100 页 (10万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
 MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
@@ -164,6 +164,7 @@ SM_MIN_BUY_SOL = 0.1  # 初筛：单笔买入最少 SOL
 SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
 SM_MIN_WIN_RATE = 0.4  # 猎手入库：胜率至少 40%
 SM_MIN_TOTAL_PROFIT = 100.0  # 猎手入库：或总利润 ≥ 100 SOL 可放宽胜率
+SM_MIN_TRADE_COUNT = 5  # 猎手入库：历史有效交易（代币项目）数至少 5 笔
 SM_MIN_HUNTER_SCORE = 60  # 猎手入库最低分数
 # 盈利分：avg_roi_pct < 20% 零分，20%~100% 线性，≥100% 满分
 SM_PROFIT_SCORE_ZERO_PCT = 20.0   # < 20% → 盈利分=0

@@ -42,6 +42,7 @@ from config.settings import (
     SM_MIN_TOKEN_PROFIT_PCT,
     SM_MIN_WIN_RATE,
     SM_MIN_TOTAL_PROFIT,
+    SM_MIN_TRADE_COUNT,
     SM_MIN_HUNTER_SCORE, DEX_MIN_24H_GAIN_PCT,
     WALLET_BLACKLIST_FILE,
     WALLET_BLACKLIST_MIN_SCORE,
@@ -431,6 +432,7 @@ class SmartMoneySearcher:
             "total_profit": total_profit,
             "avg_roi_pct": avg_roi_pct,
             "pnl_ratio": pnl_ratio,
+            "count": len(valid_projects),
         }
 
     async def _get_usdc_price_sol(self, client) -> float | None:
@@ -699,7 +701,8 @@ class SmartMoneySearcher:
                     final_score = score_result["score"]
 
                     is_qualified = False
-                    if stats["total_profit"] > 0.1:
+                    trade_count = stats.get("count", 0)
+                    if stats["total_profit"] > 0.1 and trade_count >= SM_MIN_TRADE_COUNT:
                         if stats["win_rate"] >= SM_MIN_WIN_RATE:
                             is_qualified = True
                         elif stats["total_profit"] >= SM_MIN_TOTAL_PROFIT:
@@ -711,7 +714,8 @@ class SmartMoneySearcher:
                             (loss_usdc >= WALLET_BLACKLIST_LOSS_USDC and stats["win_rate"] < WALLET_BLACKLIST_WIN_RATE)):
                         self._add_to_wallet_blacklist(addr)
 
-                    if is_qualified:
+                    will_add = is_qualified and final_score >= SM_MIN_HUNTER_SCORE
+                    if will_add:
                         avg_roi = stats.get("avg_roi_pct", 0.0)
                         candidate.update({
                             "score": final_score,
@@ -723,9 +727,33 @@ class SmartMoneySearcher:
                         verified_hunters.append(candidate)
                         logger.info(
                             f"    ✅ 锁定猎手 {addr}.. | 利润: {candidate['total_profit']} | 评分: {final_score}")
+                    else:
+                        # 落榜：仅当距离要求 80% 以内时才打印（避免刷屏）
+                        NEAR_THRESHOLD = 0.8
+                        reasons = []
+                        if final_score < SM_MIN_HUNTER_SCORE and final_score >= SM_MIN_HUNTER_SCORE * NEAR_THRESHOLD:
+                            reasons.append(f"评分{final_score:.1f}分<{SM_MIN_HUNTER_SCORE}分")
+                        if stats["total_profit"] <= 0.1 and stats["total_profit"] >= 0.1 * NEAR_THRESHOLD:
+                            reasons.append(f"总利润{stats['total_profit']:.2f}SOL<=0.1 SOL")
+                        if trade_count < SM_MIN_TRADE_COUNT and trade_count >= SM_MIN_TRADE_COUNT * NEAR_THRESHOLD:
+                            reasons.append(f"交易笔数{trade_count}笔<{SM_MIN_TRADE_COUNT}笔")
+                        wr_ok = stats["win_rate"] >= SM_MIN_WIN_RATE
+                        profit_ok = stats["total_profit"] >= SM_MIN_TOTAL_PROFIT
+                        if not wr_ok and not profit_ok:
+                            wr_close = stats["win_rate"] >= SM_MIN_WIN_RATE * NEAR_THRESHOLD
+                            profit_close = stats["total_profit"] >= SM_MIN_TOTAL_PROFIT * NEAR_THRESHOLD
+                            if wr_close or profit_close:
+                                wr_pct = stats["win_rate"] * 100
+                                reasons.append(f"胜率{wr_pct:.1f}%<{SM_MIN_WIN_RATE*100:.0f}%且总利润{stats['total_profit']:.2f}SOL<{SM_MIN_TOTAL_PROFIT}SOL")
+                        if reasons:
+                            logger.info(
+                                "[落榜钱包地址] %s | 原因: %s",
+                                addr,
+                                " | ".join(reasons),
+                            )
                 await asyncio.sleep(0.5)
 
-            logger.info(f"  [收益+评分] 初筛 {total} → 符合PnL≥{SM_MIN_TOKEN_PROFIT_PCT:.0f}%%: {pnl_passed_count} 个 → 入库 {len(verified_hunters)} 个")
+            logger.info(f"  [收益+评分] 初筛 {total} → 符合PnL≥{SM_MIN_TOKEN_PROFIT_PCT:.0f}%: {pnl_passed_count} 个 → 入库 {len(verified_hunters)} 个")
             self._save_scanned_token(token_address)
             return verified_hunters
 
