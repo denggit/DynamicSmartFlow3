@@ -169,6 +169,10 @@ SM_MIN_TOTAL_PROFIT = 100.0  # 猎手入库：或总利润 ≥ 100 SOL 可放宽
 SM_MIN_HUNTER_SCORE = 60  # 猎手入库最低分数
 # 盈利分：代币维度平均盈利率 (%)，每个代币一单位；≥10% 满分，≤0% 零分
 SM_PROFIT_SCORE_REF_PCT = 10.0  # 平均盈利率 ≥ 10% → 盈利分=1
+# 胜率分映射：70%+ 满分，40% 得 0.6，10% 及以下 0 分
+SM_WIN_RATE_FULL_PCT = 70.0   # ≥70% → 胜率分=1
+SM_WIN_RATE_MID_PCT = 40.0    # 40% → 胜率分=0.6
+SM_WIN_RATE_ZERO_PCT = 20.0   # ≤20% → 胜率分=0
 SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
 # 钱包黑名单：劣质猎手不再分析，节省 Helius API
 WALLET_BLACKLIST_FILE = "data/wallet_blacklist.json"

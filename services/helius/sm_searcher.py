@@ -44,6 +44,7 @@ from config.settings import (
     SM_MIN_TOTAL_PROFIT,
     SM_MIN_HUNTER_SCORE, DEX_MIN_24H_GAIN_PCT,
     SM_PROFIT_SCORE_REF_PCT,
+    SM_WIN_RATE_FULL_PCT, SM_WIN_RATE_MID_PCT, SM_WIN_RATE_ZERO_PCT,
     WALLET_BLACKLIST_FILE,
     WALLET_BLACKLIST_MIN_SCORE,
     WALLET_BLACKLIST_LOSS_USDC,
@@ -689,7 +690,16 @@ class SmartMoneySearcher:
                 )
 
                 if stats:
-                    score_hit_rate = stats["win_rate"]
+                    # 胜率分：70%+ 满分，40% 得 0.6，10% 及以下 0；两段线性
+                    wr = stats["win_rate"] * 100  # 转为百分比
+                    if wr <= SM_WIN_RATE_ZERO_PCT:
+                        score_hit_rate = 0.0
+                    elif wr >= SM_WIN_RATE_FULL_PCT:
+                        score_hit_rate = 1.0
+                    elif wr <= SM_WIN_RATE_MID_PCT:
+                        score_hit_rate = 0.6 * (wr - SM_WIN_RATE_ZERO_PCT) / (SM_WIN_RATE_MID_PCT - SM_WIN_RATE_ZERO_PCT)
+                    else:
+                        score_hit_rate = 0.6 + 0.4 * (wr - SM_WIN_RATE_MID_PCT) / (SM_WIN_RATE_FULL_PCT - SM_WIN_RATE_MID_PCT)
                     # 盈利分：代币维度平均盈利率，≥10% 满分，≤0% 零分，线性插值
                     avg_roi_pct = stats.get("avg_roi_pct", 0.0)
                     if avg_roi_pct <= 0:
@@ -712,7 +722,7 @@ class SmartMoneySearcher:
                     # 劣质猎手加入黑名单，下次直接跳过以节省 API
                     loss_usdc = -stats["total_profit"] * USDC_PER_SOL if stats["total_profit"] < 0 else 0
                     if (final_score < WALLET_BLACKLIST_MIN_SCORE or
-                            (loss_usdc >= WALLET_BLACKLIST_LOSS_USDC and score_hit_rate < WALLET_BLACKLIST_WIN_RATE)):
+                            (loss_usdc >= WALLET_BLACKLIST_LOSS_USDC and stats["win_rate"] < WALLET_BLACKLIST_WIN_RATE)):
                         self._add_to_wallet_blacklist(addr)
 
                     if is_qualified:
