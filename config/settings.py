@@ -108,7 +108,8 @@ TRADING_SCORE_MULTIPLIER = 0.001  # 总分 * 倍数 = 买入SOL
 # 例如: 160分 * 0.001 = 0.16 SOL
 
 # 猎手加仓跟随阈值
-HUNTER_ADD_THRESHOLD_SOL = 1.0  # 猎手加仓超过 1 SOL 我们才跟
+# 猎手加仓或新增猎手买入 ≥ 1 SOL 即跟仓 0.1 SOL，单币上限 0.5 SOL
+HUNTER_ADD_THRESHOLD_SOL = 1.0
 
 # 止损：亏损超过此比例直接全仓清仓
 STOP_LOSS_PCT = 0.5  # 亏损 50% 止损

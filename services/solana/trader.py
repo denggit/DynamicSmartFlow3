@@ -170,6 +170,34 @@ class SolanaTrader:
             logger.debug("获取链上 Token 余额失败", exc_info=True)
             return None
 
+    async def ensure_fully_closed(self, token_address: str) -> None:
+        """
+        关闭监控前校验：链上仓位是否已归零。若未归零则执行清仓，避免遗漏 dust 或状态不同步。
+        """
+        if not self.keypair:
+            return
+        chain_bal = await self._fetch_own_token_balance(token_address)
+        if chain_bal is None:
+            return
+        if chain_bal < 1e-9:  # 视为 0
+            return
+        logger.warning(
+            "⚠️ 关闭监控前发现链上仍有持仓 %.6f，执行清仓",
+            chain_bal
+        )
+        decimals = await self._get_decimals(token_address)
+        decimals = decimals or 6
+        tx_sig, _ = await self._jupiter_swap(
+            input_mint=token_address,
+            output_mint=WSOL_MINT,
+            amount_in_ui=chain_bal,
+            slippage_bps=SLIPPAGE_BPS,
+            is_sell=True,
+            token_decimals=decimals
+        )
+        if not tx_sig:
+            logger.warning("❌ 关闭前清仓失败: %s", token_address)
+
     # ==========================================
     # 1. 核心交易接口 (逻辑层)
     # ==========================================
@@ -232,10 +260,19 @@ class SolanaTrader:
 
     async def execute_add_position(self, token_address: str, trigger_hunter: Dict, add_reason: str,
                                    current_price: float):
-        """加仓逻辑"""
+        """
+        加仓逻辑。止盈基于单 token 成本价 (average_price)：
+        - 首次 150%：单 token 价值 >= average_price * 2.5 时卖出 50%
+        - 加仓会抬高 average_price，阈值为新均价 * (1 + level)
+        一旦止盈触发，禁止再加仓（猎手加仓/新增猎手均不跟）
+        """
         if not self.keypair: return
         pos = self.positions.get(token_address)
         if not pos: return
+
+        if pos.tp_hit_levels:
+            logger.info("💰 [加仓跳过] %s 止盈已触发，禁止加仓", token_address[:8])
+            return
 
         if pos.total_cost_sol >= TRADING_MAX_SOL_PER_TOKEN: return
 
@@ -319,6 +356,11 @@ class SolanaTrader:
                     sell_amount_ui, chain_bal
                 )
                 sell_amount_ui = min(sell_amount_ui, chain_bal)
+        # 卖出前再拉一次链上余额，应对连续多笔跟卖时的延迟
+        chain_bal2 = await self._fetch_own_token_balance(token_address)
+        if chain_bal2 is not None and sell_amount_ui > chain_bal2:
+            sell_amount_ui = min(sell_amount_ui, chain_bal2)
+            logger.debug("二次校验链上余额 %.2f，最终卖出 %.2f", chain_bal2, sell_amount_ui)
             if chain_bal < pos.total_tokens * 0.99:
                 # 同步内部状态，避免后续卖出继续出错
                 old_total = pos.total_tokens
@@ -346,7 +388,9 @@ class SolanaTrader:
             token_decimals=pos.decimals  # 传入正确的精度
         )
 
-        if not tx_sig: return
+        if not tx_sig:
+            logger.warning("❌ 跟随卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount_ui)
+            return
 
         cost_this_sell = sell_amount_ui * pos.average_price
         pnl_sol = sol_got_ui - cost_this_sell
@@ -380,6 +424,18 @@ class SolanaTrader:
 
         pnl_pct = (current_price_ui - pos.average_price) / pos.average_price
 
+        # DexScreener 价格可能因 base/quote 解析错误虚高，当 pnl>200% 时用 Jupiter 校验真实可卖价
+        if pnl_pct > 2.0:
+            jupiter_implied_pnl = await self._get_jupiter_implied_pnl(
+                token_address, pos.average_price, pos.decimals
+            )
+            if jupiter_implied_pnl is not None and jupiter_implied_pnl < 0.5:
+                logger.warning(
+                    "止盈跳过: DexScreener 显示 +%.0f%% 但 Jupiter 校验仅 %.0f%%，以 Jupiter 为准",
+                    pnl_pct * 100, jupiter_implied_pnl * 100
+                )
+                pnl_pct = jupiter_implied_pnl
+
         if pnl_pct <= -STOP_LOSS_PCT:
             chain_bal = await self._fetch_own_token_balance(token_address)
             sell_amount = chain_bal if chain_bal is not None else pos.total_tokens * SELL_BUFFER
@@ -399,6 +455,9 @@ class SolanaTrader:
                 is_sell=True,
                 token_decimals=decimals
             )
+
+            if not tx_sig:
+                logger.warning("❌ 止损卖出失败 (无 tx_sig): %s", token_address)
 
             if tx_sig:
                 cost_this_sell = sell_amount * pos.average_price
@@ -423,10 +482,10 @@ class SolanaTrader:
                 chain_bal = await self._fetch_own_token_balance(token_address)
                 if chain_bal is not None:
                     sell_amount = min(sell_amount, chain_bal)
-                else:
-                    sell_amount = min(sell_amount, pos.total_tokens * SELL_BUFFER)  # 查余额失败，兜底 99.9%
                     if chain_bal < pos.total_tokens * 0.99:
                         logger.warning("⚠️ 止盈前状态与链上不一致: 内部 %.2f vs 链上 %.2f", pos.total_tokens, chain_bal)
+                else:
+                    sell_amount = min(sell_amount, pos.total_tokens * SELL_BUFFER)  # 查余额失败，兜底 99.9%
                 if sell_amount <= 0:
                     logger.warning("链上无持仓，跳过止盈")
                     continue
@@ -442,6 +501,9 @@ class SolanaTrader:
                     is_sell=True,
                     token_decimals=decimals
                 )
+
+                if not tx_sig:
+                    logger.warning("❌ 止盈卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount)
 
                 if tx_sig:
                     cost_this_sell = sell_amount * pos.average_price
@@ -541,6 +603,11 @@ class SolanaTrader:
                 logger.info("⏳ 交易已广播: %s", sig_str)
                 await asyncio.sleep(5)
 
+                # 验证交易是否真正确认，避免广播成功但链上执行失败时误更新状态
+                if not await self._verify_tx_confirmed(sig_str):
+                    logger.warning("❌ 交易链上确认失败: %s（可能滑点/余额不足）", sig_str)
+                    return None, 0
+
                 if not is_sell:
                     return sig_str, out_amount_raw
                 return sig_str, out_amount_raw / LAMPORTS_PER_SOL
@@ -554,6 +621,68 @@ class SolanaTrader:
                 logger.exception("Swap Exception")
                 return None, 0
         return None, 0
+
+    async def _get_jupiter_implied_pnl(
+        self, token_mint: str, average_price: float, decimals: int
+    ) -> Optional[float]:
+        """
+        用 Jupiter Quote 卖少量 token，推算真实可卖价，用于校验 DexScreener 是否虚高。
+        返回 (implied_price - avg) / avg，失败返回 None。
+        """
+        if average_price <= 0:
+            return None
+        sample_amount_ui = max(100.0, min(1e6, 0.00001 / average_price))  # 约 0.00001 SOL 等值，避免过大
+        try:
+            amount_raw = math.floor(sample_amount_ui * (10 ** decimals))
+            if amount_raw <= 0:
+                return None
+            params = {
+                "inputMint": token_mint,
+                "outputMint": WSOL_MINT,
+                "amount": str(amount_raw),
+                "slippageBps": 100,
+                "onlyDirectRoutes": "false",
+                "asLegacyTransaction": "false",
+            }
+            resp = await self.http_client.get(JUP_QUOTE_API, params=params, headers=self._jup_headers())
+            if resp.status_code != 200:
+                return None
+            out_raw = int((resp.json() or {}).get("outAmount", 0))
+            sol_out = out_raw / LAMPORTS_PER_SOL
+            if sol_out <= 0:
+                return None
+            implied_price = sol_out / sample_amount_ui
+            return (implied_price - average_price) / average_price
+        except Exception:
+            logger.debug("Jupiter 校验价格异常", exc_info=True)
+        return None
+
+    async def _verify_tx_confirmed(self, sig_str: str, max_wait_sec: int = 15) -> bool:
+        """轮询 get_signature_statuses，确认交易成功落地。链上失败（滑点等）时返回 False，不更新状态。"""
+        try:
+            from solders.signature import Signature
+            sig = Signature.from_string(sig_str) if isinstance(sig_str, str) else sig_str
+            for _ in range(max_wait_sec):
+                resp = await self.rpc_client.get_signature_statuses([sig])
+                vals = getattr(resp, "value", None) or []
+                if not vals:
+                    await asyncio.sleep(1)
+                    continue
+                st = vals[0]
+                if st is None:
+                    await asyncio.sleep(1)
+                    continue
+                err = getattr(st, "err", None)
+                if err is not None:
+                    logger.warning("交易链上执行失败 err=%s", err)
+                    return False
+                conf = getattr(st, "confirmation_status", None) or ""
+                if conf in ("confirmed", "finalized") or getattr(st, "confirmationStatus", "") in ("confirmed", "finalized"):
+                    return True
+                await asyncio.sleep(1)
+        except Exception:
+            logger.debug("验证交易确认异常", exc_info=True)
+        return False
 
     async def _get_decimals(self, mint_address: str) -> int:
         """

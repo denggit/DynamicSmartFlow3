@@ -46,9 +46,43 @@ class DexScanner:
                 logger.exception("get_token_pairs 请求异常")
         return []
 
-    async def get_token_price(self, token_address: str) -> float:
+    # Solana 上 WSOL 地址，用于校验 pair 是否为 token/SOL
+    _WSOL_ADDRESS = "So11111111111111111111111111111111111111112"
+
+    def _parse_sol_per_token(self, pair: dict, token_address: str):
         """
-        获取代币当前价格 (以 SOL 为单位, priceNative)
+        从 pair 解析「1 token = ? SOL」。
+        DexScreener: priceNative = quote 币 per 1 base 币。
+        若 token 为 base、quote 为 SOL → 直接用 priceNative；
+        若 token 为 quote、base 为 SOL → 需用 1/priceNative。
+        """
+        base = pair.get("baseToken") or {}
+        quote = pair.get("quoteToken") or {}
+        base_addr = (base.get("address") or "").strip()
+        quote_addr = (quote.get("address") or "").strip()
+        token_address = (token_address or "").strip()
+        price_native = pair.get("priceNative")
+        if price_native is None:
+            return None
+        try:
+            p = float(price_native)
+        except (TypeError, ValueError):
+            return None
+        if p <= 0:
+            return None
+        # 仅处理 token/SOL 或 SOL/token 的 pair
+        is_sol = lambda a: a == self._WSOL_ADDRESS or "11111111111111111111111111111111" in (a or "")
+        if base_addr == token_address and is_sol(quote_addr):
+            return p  # 1 token = p SOL
+        if quote_addr == token_address and is_sol(base_addr):
+            return 1.0 / p if p > 0 else None  # 1 SOL = p token → 1 token = 1/p SOL
+        return None
+
+    async def get_token_price(self, token_address: str):
+        """
+        获取代币当前价格 (1 token = ? SOL)。
+        优先选 Solana 上 token/SOL pair，正确解析 base/quote，避免 8317% 等错误。
+        成功返回 float；失败返回 None。
         """
         url = f"{self.base_url}/latest/dex/tokens/{token_address}"
         async with httpx.AsyncClient() as client:
@@ -56,15 +90,21 @@ class DexScanner:
                 response = await client.get(url, timeout=5.0)
                 if response.status_code == 200:
                     data = response.json()
-                    pairs = data.get('pairs', [])
-                    if pairs:
-                        # 找流动性最好的池子
-                        best_pair = max(pairs, key=lambda x: float(x.get('liquidity', {}).get('usd', 0) or 0))
-                        # priceNative: 1 Token = ? SOL
-                        return float(best_pair.get('priceNative', 0))
+                    pairs = data.get('pairs', []) or []
+                    # 只保留包含本 token 且为 token/SOL 的 pair
+                    sol_pairs = []
+                    for p in pairs:
+                        if p.get("chainId") != "solana":
+                            continue
+                        price = self._parse_sol_per_token(p, token_address)
+                        if price is not None:
+                            sol_pairs.append((p, price))
+                    if sol_pairs:
+                        best = max(sol_pairs, key=lambda x: float(x[0].get('liquidity', {}).get('usd', 0) or 0))
+                        return best[1]
             except Exception:
                 logger.exception("Error fetching price for %s", token_address)
-        return 0.0
+        return None
 
     async def scan(self):
         logger.info("正在扫描 Solana 潜力币...")

@@ -85,6 +85,9 @@ class HunterAgentController:
         # 用于 WebSocket 收到消息时快速找到是哪个 Token 的任务
         self.hunter_map = defaultdict(set)
 
+        # 新增猎手加仓节流：1 分钟内同一 token 只发一次 HUNTER_BUY，避免多人同时入场重复跟仓
+        self._last_new_hunter_signal_at: Dict[str, float] = {}
+
     async def start(self):
         """启动 Agent：只跑持仓同步兜底；交易信号由 Monitor 统一推送，避免自建 WS 漏单。"""
         logger.info("🕵️‍♂️ 启动 Hunter Agent (跟单管家，信号来自 Monitor)...")
@@ -93,24 +96,34 @@ class HunterAgentController:
     async def on_tx_from_monitor(self, tx: dict, active_hunters: set):
         """
         Monitor 消费队列命中钱包池后推送：同一笔 tx + 命中的猎手集合。
-        用 Helius 格式解析 token 变动，只处理 Agent 正在跟仓的 (hunter, token)，发 HUNTER_SELL/HUNTER_BUY。
+        用 Helius 格式解析 token 变动：
+        1. 已跟仓的 (hunter, token)：发 HUNTER_SELL / HUNTER_BUY
+        2. 新增猎手：池内猎手买入我们正在持有的 token 时，加入任务并发 HUNTER_BUY 触发加仓
         """
+        parser_cache = {}
         for hunter in active_hunters:
-            if hunter not in self.hunter_map:
-                continue
-            potential_tokens = self.hunter_map[hunter]
-            if not potential_tokens:
-                continue
-            parser = TransactionParser(hunter)
+            parser = parser_cache.get(hunter)
+            if parser is None:
+                parser = TransactionParser(hunter)
+                parser_cache[hunter] = parser
             _, token_changes, _ = parser.parse_transaction(tx)
             token_changes = {m: d for m, d in token_changes.items() if m not in IGNORE_MINTS and abs(d) >= 1e-9}
+
+            potential_tokens = self.hunter_map.get(hunter) or set()
             for mint, delta in token_changes.items():
-                if mint not in potential_tokens:
-                    continue
-                try:
-                    await self.analyze_action(hunter, mint, delta, None, time.time())
-                except Exception:
-                    logger.exception("on_tx_from_monitor analyze_action 异常 %s %s", hunter[:6], mint[:6])
+                if mint in potential_tokens:
+                    try:
+                        await self.analyze_action(hunter, mint, delta, None, time.time())
+                    except Exception:
+                        logger.exception("on_tx_from_monitor analyze_action 异常 %s %s", hunter[:6], mint[:6])
+                elif delta > 0:
+                    # 新增猎手：池内猎手买入我们持有的 token
+                    mission = self.active_missions.get(mint)
+                    if mission and hunter not in mission.hunter_states:
+                        try:
+                            await self._handle_new_hunter_join(hunter, mint, delta)
+                        except Exception:
+                            logger.exception("on_tx_from_monitor _handle_new_hunter_join 异常 %s %s", hunter[:6], mint[:6])
 
     # === 1. 任务管理接口 (供主程序调用) ===
 
@@ -136,6 +149,39 @@ class HunterAgentController:
 
         # 这里会触发 WebSocket 重连以更新订阅列表
         # (在 monitor_loop 里会自动处理)
+
+    async def _handle_new_hunter_join(self, hunter: str, token_address: str, delta_ui: float):
+        """
+        新增猎手入场：池内猎手买入我们持有的 token 时，加入任务并触发 HUNTER_BUY。
+        main 收到信号后加仓 0.1 SOL 并调用 add_hunter_to_mission（幂等）。
+        节流：1 分钟内同一 token 多名新猎手加入时，只发一次 HUNTER_BUY，避免重复跟仓。
+        """
+        mission = self.active_missions.get(token_address)
+        if not mission or hunter in mission.hunter_states:
+            return
+        balance = await self._fetch_token_balance(hunter, token_address)
+        mission.add_hunter(hunter, balance)
+        self.hunter_map[hunter].add(token_address)
+        trade_logger.info(f"🆕 [Agent] 新增猎手入场 {hunter[:6]} -> {token_address[:6]} | 买入: {delta_ui:.2f}")
+
+        now = time.time()
+        last_at = self._last_new_hunter_signal_at.get(token_address, 0)
+        if now - last_at < 60:
+            trade_logger.info("🔄 [Agent] 1 分钟内已有新猎手加仓信号，本次仅加入监控不重复跟仓")
+            return
+
+        if self.signal_callback:
+            self._last_new_hunter_signal_at[token_address] = now
+            signal = {
+                "type": "HUNTER_BUY",
+                "token": token_address,
+                "hunter": hunter,
+                "add_amount_ui": delta_ui,
+                "new_balance": balance,
+                "timestamp": now,
+                "is_new_hunter": True,
+            }
+            await self._trigger_callback(signal)
 
     async def add_hunter_to_mission(self, token_address: str, new_hunter: str):
         """
@@ -166,6 +212,7 @@ class HunterAgentController:
                     self.hunter_map[hunter].remove(token_address)
                     if not self.hunter_map[hunter]:
                         del self.hunter_map[hunter]
+            self._last_new_hunter_signal_at.pop(token_address, None)
 
     async def sync_positions_loop(self):
         """
@@ -311,49 +358,62 @@ class HunterAgentController:
                     potential_tokens = self.hunter_map[hunter]
                     token_changes = self._calculate_balance_changes(tx, hunter)
                     # 与 SmartFlow3 一致：只把非 SOL/USDC/USDT 的变动当作真实交易，忽略 IGNORE_MINTS
-                    token_changes = {m: d for m, d in token_changes.items() if m not in IGNORE_MINTS}
+                    token_changes = {m: v for m, v in token_changes.items() if m not in IGNORE_MINTS}
                     if not token_changes:
                         continue
 
-                    for token_addr, delta in token_changes.items():
-                        # 只处理我们在监控的 Token
-                        if token_addr in potential_tokens:
-                            await self.analyze_action(hunter, token_addr, delta, tx, block_time)
+                    for token_addr, (delta_raw, decimals) in token_changes.items():
+                        if token_addr not in potential_tokens:
+                            continue
+                        delta_ui = delta_raw / (10 ** decimals)
+                        await self.analyze_action(hunter, token_addr, delta_ui, tx, block_time)
 
         except Exception:
             logger.exception("日志处理失败")
 
     def _calculate_balance_changes(self, tx_data, hunter_address):
-        """从 RPC 格式的交易中计算 Token 余额变化"""
-        changes = defaultdict(float)
-        meta = tx_data["meta"]
-        if not meta: return changes
+        """
+        从 RPC 格式的交易中计算 Token 余额变化。
+        返回: Dict[mint, (delta_raw, decimals)]，主程序需转 UI 后传入 analyze_action。
+        """
+        result = {}
+        meta = tx_data.get("meta")
+        if not meta:
+            return result
 
-        # 建立索引: AccountIndex -> Mint
-        # 需要遍历 preTokenBalances 和 postTokenBalances
-
-        pre_balances = {}  # {mint: amount}
+        pre_balances = {}
         post_balances = {}
+        decimals_map = {}
 
         for bal in meta.get("preTokenBalances", []):
-            if bal["owner"] == hunter_address:
-                pre_balances[bal["mint"]] = float(
-                    bal["uiTokenAmount"]["amount"])  # 使用 raw amount (整数) 避免精度问题? 不，用 float 吧，方便
+            if bal["owner"] != hunter_address:
+                continue
+            mint = bal["mint"]
+            uita = bal.get("uiTokenAmount", {})
+            raw = float(uita.get("amount", 0) or 0)
+            dec = int(uita.get("decimals", 6) or 6)
+            pre_balances[mint] = raw
+            decimals_map[mint] = dec
 
         for bal in meta.get("postTokenBalances", []):
-            if bal["owner"] == hunter_address:
-                post_balances[bal["mint"]] = float(bal["uiTokenAmount"]["amount"])
+            if bal["owner"] != hunter_address:
+                continue
+            mint = bal["mint"]
+            uita = bal.get("uiTokenAmount", {})
+            raw = float(uita.get("amount", 0) or 0)
+            dec = int(uita.get("decimals", 6) or 6)
+            post_balances[mint] = raw
+            decimals_map[mint] = dec
 
-        # 计算差值
         all_mints = set(pre_balances.keys()).union(post_balances.keys())
         for mint in all_mints:
             pre = pre_balances.get(mint, 0)
             post = post_balances.get(mint, 0)
-            delta = post - pre
-            if abs(delta) > 0:
-                changes[mint] = delta
-
-        return changes
+            delta_raw = post - pre
+            dec = decimals_map.get(mint, 6)
+            if abs(delta_raw) > 0:
+                result[mint] = (delta_raw, dec)
+        return result
 
     async def analyze_action(self, hunter, token, delta, tx, timestamp):
         """核心：分析行为并生成信号"""
@@ -412,7 +472,7 @@ class HunterAgentController:
                     "type": "HUNTER_BUY",
                     "token": token,
                     "hunter": hunter,
-                    "add_amount_raw": delta,
+                    "add_amount_ui": delta,
                     "new_balance": new_bal,
                     "timestamp": timestamp
                 }

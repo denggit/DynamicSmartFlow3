@@ -91,8 +91,8 @@ async def on_monitor_signal(signal):
 
     # 2. 价格
     price = await price_scanner.get_token_price(token)
-    if not price:
-        logger.error("无法获取 %s 价格，取消开仓", token)
+    if price is None or price <= 0:
+        logger.error("无法获取 %s 价格或价格为 0，取消开仓", token)
         return
 
     # 3. 开仓
@@ -125,19 +125,22 @@ async def on_agent_signal(signal):
     hunter_addr = signal["hunter"]
 
     price = await price_scanner.get_token_price(token)
-    if not price:
-        return
+    if price is None:
+        return  # 无法获取价格才跳过；price=0 时也应跟卖（退出）
 
     if msg_type == "HUNTER_SELL":
         await trader.execute_follow_sell(token, hunter_addr, signal["sell_ratio"], price)
         if token not in trader.positions:
+            await trader.ensure_fully_closed(token)  # 关监控前校验链上归零，未归零则清仓
             await agent.stop_tracking(token)
 
     elif msg_type == "HUNTER_BUY":
-        add_amount_raw = signal["add_amount_raw"]
         pos = trader.positions.get(token)
-        decimals = pos.decimals if pos else 6
-        add_amount_ui = add_amount_raw / (10 ** decimals)
+        if not pos:
+            return
+        add_amount_ui = signal.get("add_amount_ui")
+        if add_amount_ui is None:
+            add_amount_ui = signal.get("add_amount_raw", 0) / (10 ** pos.decimals)
         add_sol_value = add_amount_ui * price
         if add_sol_value >= HUNTER_ADD_THRESHOLD_SOL:
             hunter_info = {"address": hunter_addr, "score": 50}
@@ -158,9 +161,10 @@ async def pnl_monitor_loop():
             if active_tokens:
                 for token in active_tokens:
                     price = await price_scanner.get_token_price(token)
-                    if price:
+                    if price is not None:  # 含 0：代币归零时也应触发止损
                         await trader.check_pnl_and_stop_profit(token, price)
                         if token not in trader.positions:
+                            await trader.ensure_fully_closed(token)  # 关监控前校验链上归零，未归零则清仓
                             await agent.stop_tracking(token)
                     await asyncio.sleep(0.5)
         except Exception:
