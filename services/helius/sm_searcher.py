@@ -43,8 +43,6 @@ from config.settings import (
     SM_MIN_WIN_RATE,
     SM_MIN_TOTAL_PROFIT,
     SM_MIN_HUNTER_SCORE, DEX_MIN_24H_GAIN_PCT,
-    SM_PROFIT_SCORE_REF_PCT,
-    SM_WIN_RATE_FULL_PCT, SM_WIN_RATE_MID_PCT, SM_WIN_RATE_ZERO_PCT,
     WALLET_BLACKLIST_FILE,
     WALLET_BLACKLIST_MIN_SCORE,
     WALLET_BLACKLIST_LOSS_USDC,
@@ -52,6 +50,7 @@ from config.settings import (
     USDC_PER_SOL,
 )
 from utils.logger import get_logger
+from utils.hunter_scoring import compute_hunter_score
 
 logger = get_logger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -690,27 +689,8 @@ class SmartMoneySearcher:
                 )
 
                 if stats:
-                    # 胜率分：70%+ 满分，40% 得 0.6，10% 及以下 0；两段线性
-                    wr = stats["win_rate"] * 100  # 转为百分比
-                    if wr <= SM_WIN_RATE_ZERO_PCT:
-                        score_hit_rate = 0.0
-                    elif wr >= SM_WIN_RATE_FULL_PCT:
-                        score_hit_rate = 1.0
-                    elif wr <= SM_WIN_RATE_MID_PCT:
-                        score_hit_rate = 0.6 * (wr - SM_WIN_RATE_ZERO_PCT) / (SM_WIN_RATE_MID_PCT - SM_WIN_RATE_ZERO_PCT)
-                    else:
-                        score_hit_rate = 0.6 + 0.4 * (wr - SM_WIN_RATE_MID_PCT) / (SM_WIN_RATE_FULL_PCT - SM_WIN_RATE_MID_PCT)
-                    # 盈利分：代币维度平均盈利率，≥10% 满分，≤0% 零分，线性插值
-                    avg_roi_pct = stats.get("avg_roi_pct", 0.0)
-                    if avg_roi_pct <= 0:
-                        score_profit = 0.0
-                    else:
-                        score_profit = min(1.0, avg_roi_pct / SM_PROFIT_SCORE_REF_PCT)
-                    score_drawdown = 1 - abs(stats["worst_roi"] / 100)
-                    score_drawdown = max(0, min(1, score_drawdown))
-
-                    final_score = (score_hit_rate * 30) + (score_profit * 40) + (score_drawdown * 30)
-                    final_score = round(final_score, 1)
+                    score_result = compute_hunter_score(stats)
+                    final_score = score_result["score"]
 
                     is_qualified = False
                     if stats["total_profit"] > 0.1:
@@ -733,7 +713,7 @@ class SmartMoneySearcher:
                             "worst_roi": f"{stats['worst_roi']:.1f}%",
                             "total_profit": f"{stats['total_profit']:.2f} SOL",
                             "avg_roi_pct": f"{avg_roi:.1f}%",
-                            "scores_detail": f"H:{score_hit_rate:.2f}/P:{score_profit:.2f}/D:{score_drawdown:.2f}"
+                            "scores_detail": score_result["scores_detail"],
                         })
                         verified_hunters.append(candidate)
                         logger.info(

@@ -43,6 +43,7 @@ from config.settings import (
 from services.dexscreener.dex_scanner import DexScanner
 from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
 from utils.logger import get_logger
+from utils.hunter_scoring import compute_hunter_score
 
 logger = get_logger(__name__)
 # 猎手交易单独写入 monitor.log，便于查看时间与交易币种
@@ -544,6 +545,52 @@ class HunterMonitorController:
                 else:
                     self.signal_callback(signal)
 
+    async def run_immediate_audit(self) -> None:
+        """
+        启动时可选执行：立即对 data/hunters.json 中所有猎手做一次审计体检。
+        60 分以下剔除，其余用最新数据更新。
+        """
+        from httpx import AsyncClient
+
+        current = list(self.storage.hunters.items())
+        if not current:
+            logger.info("📋 猎手池为空，跳过立即审计")
+            return
+
+        logger.info("🩺 [立即审计] 开始对 %d 名猎手逐一体检...", len(current))
+        removed = []
+        updated = 0
+
+        async with AsyncClient() as client:
+            for addr, info in current:
+                if addr not in self.storage.hunters:
+                    continue
+                try:
+                    new_stats = await self.sm_searcher.analyze_hunter_performance(client, addr)
+                    if new_stats is None:
+                        continue
+                    score_result = compute_hunter_score(new_stats)
+                    if score_result["score"] < SM_MIN_HUNTER_SCORE:
+                        del self.storage.hunters[addr]
+                        removed.append((addr, score_result["score"]))
+                        logger.info("🚫 剔除低分猎手 %s.. (分:%.1f < %d)", addr[:12], score_result["score"], SM_MIN_HUNTER_SCORE)
+                    else:
+                        info["total_profit"] = f"{new_stats['total_profit']:.2f} SOL"
+                        info["win_rate"] = f"{new_stats['win_rate']:.1%}"
+                        info["worst_roi"] = f"{new_stats['worst_roi']:.1f}%"
+                        info["avg_roi_pct"] = f"{new_stats.get('avg_roi_pct', 0):.1f}%"
+                        info["score"] = score_result["score"]
+                        info["scores_detail"] = score_result["scores_detail"]
+                        info["last_audit"] = time.time()
+                        updated += 1
+                        logger.info("✅ %s.. 体检完成 | 评分: %.1f | %s", addr[:12], score_result["score"], score_result["scores_detail"])
+                except Exception:
+                    logger.exception("审计猎手 %s 异常，跳过", addr[:12])
+                await asyncio.sleep(2)
+
+        self.storage.save_hunters()
+        logger.info("🩺 [立即审计] 完成 | 剔除 %d 名 | 更新 %d 名", len(removed), updated)
+
     # --- 线程 3: 维护 (Maintenance - 优化版) ---
     async def maintenance_loop(self):
         """
@@ -603,14 +650,19 @@ class HunterMonitorController:
                                 # 更新核心数据
                                 info['total_profit'] = f"{new_stats['total_profit']:.2f} SOL"
                                 info['win_rate'] = f"{new_stats['win_rate']:.1%}"
+                                info['worst_roi'] = f"{new_stats['worst_roi']:.1f}%"
+                                info['avg_roi_pct'] = f"{new_stats.get('avg_roi_pct', 0):.1f}%"
                                 info['last_audit'] = now  # 更新体检时间戳
 
-                                # 惩罚机制：如果以前很牛，现在亏钱了，分数归零等待淘汰
-                                if new_stats['total_profit'] < 0:
-                                    info['score'] = 0
+                                # 统一调用评分模块（与挖掘阶段同一逻辑）
+                                score_result = compute_hunter_score(new_stats)
+                                info['score'] = score_result['score']
+                                info['scores_detail'] = score_result['scores_detail']
+
+                                if score_result['score'] == 0:
                                     logger.warning(f"📉 猎手 {addr} 表现恶化 (负盈利)，分数归零")
                                 else:
-                                    logger.info(f"✅ 猎手 {addr} 体检完成，状态良好")
+                                    logger.info(f"✅ 猎手 {addr} 体检完成 | 评分: {score_result['score']} | {score_result['scores_detail']}")
 
                             needs_audit_count += 1
                             await asyncio.sleep(2)  # 慢慢跑，不着急

@@ -3,6 +3,7 @@
 """
 @Description: 主入口。协调 Monitor/Agent/Trader，接入风控、邮件（开仓/清仓/日报）。
 """
+import argparse
 import asyncio
 import json
 from datetime import datetime
@@ -222,7 +223,7 @@ async def restore_agent_from_trader() -> None:
             logger.info("🔄 恢复监控: %s (%s 名猎手)", token_address, len(hunter_addrs))
 
 
-async def main():
+async def main(immediate_audit: bool = False):
     _load_closed_pnl_log()
     trader.on_position_closed_callback = _on_position_closed
     await restore_agent_from_trader()
@@ -239,6 +240,9 @@ async def main():
     monitor.set_agent(agent)  # 跟仓信号由 Monitor 统一推送，避免 Agent 自建 WS 漏单
     agent.signal_callback = on_agent_signal
 
+    if immediate_audit:
+        await monitor.run_immediate_audit()
+
     await asyncio.gather(
         monitor.start(),
         agent.start(),
@@ -247,8 +251,20 @@ async def main():
     )
 
 
+def _parse_args():
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser(description="DynamicSmartFlow3 主程序")
+    parser.add_argument(
+        "--immediate-audit",
+        action="store_true",
+        help="启动时立即对 data/hunters.json 中所有猎手做一次审计体检，剔除 60 分以下并更新其余",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = _parse_args()
     try:
-        asyncio.run(main())
+        asyncio.run(main(immediate_audit=args.immediate_audit))
     except KeyboardInterrupt:
         logger.info("主程序被用户中断")
