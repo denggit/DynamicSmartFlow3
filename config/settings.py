@@ -99,7 +99,7 @@ SLIPPAGE_BPS = 200  # 滑点 2% (200 bps)
 PRIORITY_FEE_SETTINGS = "auto"
 
 # 仓位限制
-TRADING_MAX_SOL_PER_TOKEN = 0.5  # 单币最大持仓 (SOL)
+TRADING_MAX_SOL_PER_TOKEN = 0.3  # 单币最大持仓 (SOL)
 TRADING_MIN_BUY_SOL = 0.1  # 单次最低买入 (SOL)
 TRADING_ADD_BUY_SOL = 0.1  # 加仓固定金额 (SOL)
 
