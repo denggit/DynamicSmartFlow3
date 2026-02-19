@@ -150,7 +150,7 @@ PNL_CHECK_INTERVAL = 5  # 每 5 秒检查一次止盈/止损
 SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 
 # ==================== 猎手挖掘 (sm_searcher) ====================
-MIN_TOKEN_AGE_SEC = 1800  # 最少上市 15 (太新的币数据少，难找好猎手)
+MIN_TOKEN_AGE_SEC = 1800  # 最少上市 30 (太新的币数据少，难找好猎手)
 MAX_TOKEN_AGE_SEC = 14400  # 最多上市 4 小时 (放宽年龄)
 MAX_BACKTRACK_PAGES = 100  # 最多回溯 100 页 (10万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
@@ -167,12 +167,15 @@ SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
 SM_MIN_WIN_RATE = 0.4  # 猎手入库：胜率至少 40%
 SM_MIN_TOTAL_PROFIT = 100.0  # 猎手入库：或总利润 ≥ 100 SOL 可放宽胜率
 SM_MIN_HUNTER_SCORE = 60  # 猎手入库最低分数
-# 盈利分：代币维度平均盈利率 (%)，每个代币一单位；≥10% 满分，≤0% 零分
-SM_PROFIT_SCORE_REF_PCT = 10.0  # 平均盈利率 ≥ 10% → 盈利分=1
-# 胜率分映射：70%+ 满分，40% 得 0.6，10% 及以下 0 分
-SM_WIN_RATE_FULL_PCT = 70.0   # ≥70% → 胜率分=1
-SM_WIN_RATE_MID_PCT = 40.0    # 40% → 胜率分=0.6
-SM_WIN_RATE_ZERO_PCT = 20.0   # ≤20% → 胜率分=0
+# 盈利分：avg_roi_pct < 20% 零分，20%~100% 线性，≥100% 满分
+SM_PROFIT_SCORE_ZERO_PCT = 20.0   # < 20% → 盈利分=0
+SM_PROFIT_SCORE_FULL_PCT = 100.0  # ≥100% → 盈利分=1
+# 胜率分：< 15% 零分，15%~35% 线性 0.5~1，≥35% 满分
+SM_WIN_RATE_ZERO_PCT = 15.0   # < 15% → 胜率分=0
+SM_WIN_RATE_FULL_PCT = 35.0   # ≥35% → 胜率分=1
+# 盈亏比分：总盈亏比 = 盈利单利润和/亏损单亏损和；< 1.5 零分，1.5~3 线性，> 3 满分
+SM_PNL_RATIO_ZERO = 1.5   # < 1.5 → 盈亏比分=0
+SM_PNL_RATIO_FULL = 3.0   # > 3.0 → 盈亏比分=1
 SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
 # 钱包黑名单：劣质猎手不再分析，节省 Helius API
 WALLET_BLACKLIST_FILE = "data/wallet_blacklist.json"

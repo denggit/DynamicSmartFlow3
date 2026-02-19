@@ -417,15 +417,21 @@ class SmartMoneySearcher:
 
         if not valid_projects: return None
 
-        recent = valid_projects[-15:]
-        total_profit = sum(p["profit"] for p in recent)
-        wins = [p for p in recent if p["profit"] > 0]
-        win_rate = len(wins) / len(recent)
-        worst_roi = max(-100, min([p["roi"] for p in recent])) if recent else 0
-        # 每个代币作为一个单位，平均盈利率 (%)
-        avg_roi_pct = sum(p["roi"] for p in recent) / len(recent) if recent else 0.0
+        # 使用全部有效项目做评分，不限定 15 个
+        total_profit = sum(p["profit"] for p in valid_projects)
+        wins = [p for p in valid_projects if p["profit"] > 0]
+        win_rate = len(wins) / len(valid_projects)
+        avg_roi_pct = sum(p["roi"] for p in valid_projects) / len(valid_projects)
+        total_wins = sum(p["profit"] for p in valid_projects if p["profit"] > 0)
+        total_losses = sum(abs(p["profit"]) for p in valid_projects if p["profit"] < 0)
+        pnl_ratio = total_wins / total_losses if total_losses > 0 else (float("inf") if total_wins > 0 else 0.0)
 
-        return {"win_rate": win_rate, "worst_roi": worst_roi, "total_profit": total_profit, "count": len(recent), "avg_roi_pct": avg_roi_pct}
+        return {
+            "win_rate": win_rate,
+            "total_profit": total_profit,
+            "avg_roi_pct": avg_roi_pct,
+            "pnl_ratio": pnl_ratio,
+        }
 
     async def _get_usdc_price_sol(self, client) -> float | None:
         """从 DexScreener 获取 1 USDC = ? SOL，用于将 USDC 流动折算为 SOL 等价。"""
@@ -710,7 +716,6 @@ class SmartMoneySearcher:
                         candidate.update({
                             "score": final_score,
                             "win_rate": f"{stats['win_rate']:.1%}",
-                            "worst_roi": f"{stats['worst_roi']:.1f}%",
                             "total_profit": f"{stats['total_profit']:.2f} SOL",
                             "avg_roi_pct": f"{avg_roi:.1f}%",
                             "scores_detail": score_result["scores_detail"],

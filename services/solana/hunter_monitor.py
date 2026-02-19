@@ -577,7 +577,6 @@ class HunterMonitorController:
                     else:
                         info["total_profit"] = f"{new_stats['total_profit']:.2f} SOL"
                         info["win_rate"] = f"{new_stats['win_rate']:.1%}"
-                        info["worst_roi"] = f"{new_stats['worst_roi']:.1f}%"
                         info["avg_roi_pct"] = f"{new_stats.get('avg_roi_pct', 0):.1f}%"
                         info["score"] = score_result["score"]
                         info["scores_detail"] = score_result["scores_detail"]
@@ -650,7 +649,6 @@ class HunterMonitorController:
                                 # 更新核心数据
                                 info['total_profit'] = f"{new_stats['total_profit']:.2f} SOL"
                                 info['win_rate'] = f"{new_stats['win_rate']:.1%}"
-                                info['worst_roi'] = f"{new_stats['worst_roi']:.1f}%"
                                 info['avg_roi_pct'] = f"{new_stats.get('avg_roi_pct', 0):.1f}%"
                                 info['last_audit'] = now  # 更新体检时间戳
 
