@@ -19,7 +19,7 @@ import logging
 import os
 import time
 from collections import defaultdict
-from typing import Dict, Tuple, Set
+from typing import Dict, List, Tuple, Set
 
 import httpx
 
@@ -28,6 +28,7 @@ from config.settings import (
     MIN_TOKEN_AGE_SEC,
     MAX_TOKEN_AGE_SEC,
     MAX_BACKTRACK_PAGES,
+    SM_EARLY_TX_PARSE_LIMIT,
     RECENT_TX_COUNT_FOR_FREQUENCY,
     MIN_AVG_TX_INTERVAL_SEC,
     MIN_NATIVE_LAMPORTS_FOR_REAL,
@@ -35,6 +36,7 @@ from config.settings import (
     SM_MIN_DELAY_SEC,
     SM_MAX_DELAY_SEC,
     SM_AUDIT_TX_LIMIT,
+    SM_FREQUENCY_CHECK_TX_LIMIT,
     SM_MIN_BUY_SOL,
     SM_MAX_BUY_SOL,
     SM_MIN_TOKEN_PROFIT_PCT,
@@ -314,18 +316,28 @@ class SmartMoneySearcher:
                 logger.exception("fetch_parsed_transactions 批量请求异常")
         return all_txs
 
-    async def analyze_hunter_performance(self, client, hunter_address, exclude_token=None):
-        sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
-        if not sigs:
-            return None
-        txs = await self.fetch_parsed_transactions(client, sigs)
+    async def analyze_hunter_performance(
+        self, client, hunter_address, exclude_token=None, pre_fetched_txs: List[dict] | None = None
+    ):
+        """
+        体检猎手历史表现。若传入 pre_fetched_txs 则复用，避免重复拉取（节省 Helius credit）。
+        """
+        if pre_fetched_txs is not None:
+            txs = pre_fetched_txs
+            # 复用数据时，频率已在 get_hunter_profit_on_token 中检测过，跳过
+        else:
+            sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
+            if not sigs:
+                return None
+            txs = await self.fetch_parsed_transactions(client, sigs)
+            if not txs:
+                return None
+            # 频繁交易过滤：只统计「真实交易」，最近 100 笔真实买卖平均间隔 < 5 分钟则剔除
+            if _is_frequent_trader_by_real_txs(txs, hunter_address):
+                logger.info("⏭️ 剔除频繁交易地址 %s.. (真实交易平均间隔<5分钟)", hunter_address)
+                return None
         if not txs:
             return None
-        # 频繁交易过滤：只统计「真实交易」，最近 100 笔真实买卖平均间隔 < 5 分钟则剔除
-        if _is_frequent_trader_by_real_txs(txs, hunter_address):
-            logger.info("⏭️ 剔除频繁交易地址 %s.. (真实交易平均间隔<5分钟)", hunter_address)
-            return None
-        if not txs: return None
 
         parser = TransactionParser(hunter_address)
         calc = TokenAttributionCalculator()
@@ -401,17 +413,35 @@ class SmartMoneySearcher:
             logger.debug("获取代币价格失败", exc_info=True)
         return None
 
-    async def get_hunter_profit_on_token(self, client, hunter_address: str, token_address: str) -> float | None:
+    async def get_hunter_profit_on_token(
+        self, client, hunter_address: str, token_address: str
+    ) -> Tuple[float | None, List[dict] | None]:
         """
         计算猎手在该代币上的收益率 (ROI %)，已清仓用卖出收益算，未清仓用现价估算。
-        返回 ROI 百分比，若无法计算返回 None。
+        返回 (ROI 百分比, 交易列表)，若无法计算返回 (None, None)。
+        交易列表供后续 analyze_hunter_performance 复用，减少 Helius API 消耗。
+        先拉 120 笔做频率检测，频繁则直接淘汰，通过后再拉满 500 笔，节省 credit。
         """
         sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
         if not sigs:
-            return None
-        txs = await self.fetch_parsed_transactions(client, sigs)
+            return None, None
+
+        # 阶段 1：只拉前 N 笔做频率检测，频繁则直接淘汰，省后续 ~4 次 API
+        first_batch = sigs[:SM_FREQUENCY_CHECK_TX_LIMIT]
+        first_txs = await self.fetch_parsed_transactions(client, first_batch)
+        if first_txs and _is_frequent_trader_by_real_txs(first_txs, hunter_address):
+            logger.debug("⏭️ 频率淘汰 %s.. (先拉 %d 笔即判定频繁)", hunter_address[:12], len(first_batch))
+            return None, None
+
+        # 阶段 2：未频繁，拉满 500 笔算 ROI 并供评分复用
+        if len(sigs) <= SM_FREQUENCY_CHECK_TX_LIMIT:
+            txs = first_txs
+        else:
+            rest_sigs = sigs[SM_FREQUENCY_CHECK_TX_LIMIT:]
+            rest_txs = await self.fetch_parsed_transactions(client, rest_sigs)
+            txs = (first_txs or []) + (rest_txs or [])
         if not txs:
-            return None
+            return None, None
         parser = TransactionParser(hunter_address)
         calc = TokenAttributionCalculator()
         buy_sol, sell_sol, tokens_held = 0.0, 0.0, 0.0
@@ -433,14 +463,14 @@ class SmartMoneySearcher:
             except Exception:
                 continue
         if buy_sol < 0.01:
-            return None
+            return None, None
         total_value = sell_sol
         if tokens_held > 1e-9:
             price = await self._get_token_price_sol(client, token_address)
             if price is not None and price > 0:
                 total_value += tokens_held * price
         roi = (total_value - buy_sol) / buy_sol * 100
-        return roi
+        return roi, txs
 
     async def verify_token_age_via_dexscreener(self, client, token_address):
         """返回: (is_valid_window, start_time, reason)"""
@@ -510,51 +540,59 @@ class SmartMoneySearcher:
                 self._save_scanned_token(token_address)
                 return []
 
-            # 3. 解析交易 (同前)
+            # 3. 解析交易（含 native SOL + WSOL 买入）
             found_early_txs.sort(key=lambda x: x.get('blockTime', 0))
-            target_txs = found_early_txs[:100]
+            target_txs = found_early_txs[:SM_EARLY_TX_PARSE_LIMIT]
             txs = await self.fetch_parsed_transactions(client, target_txs)
 
             hunters_candidates = []
             seen_buyers = set()
 
+            wsol_mint = "So11111111111111111111111111111111111111112"
             for tx in txs:
                 block_time = tx.get('timestamp', 0)
                 delay = block_time - start_time
                 if delay < self.min_delay_sec: continue
 
-                spender = None
-                max_spend = 0
+                # 合并 native SOL + WSOL 转出，找出本笔交易中「付出最多 SOL」的地址（即买家）
+                spend_by_addr: Dict[str, float] = defaultdict(float)
                 for nt in tx.get('nativeTransfers', []):
-                    amt = nt.get('amount', 0)
-                    if amt > max_spend:
-                        max_spend = amt
-                        spender = nt.get('fromUserAccount')
+                    addr = nt.get('fromUserAccount')
+                    if addr:
+                        spend_by_addr[addr] += nt.get('amount', 0) / 1e9
+                for tt in tx.get('tokenTransfers', []):
+                    if tt.get('mint') == wsol_mint:
+                        addr = tt.get('fromUserAccount')
+                        if addr:
+                            amt = _normalize_token_amount(tt.get('tokenAmount'))
+                            spend_by_addr[addr] += amt
 
-                if not spender or spender in seen_buyers: continue
-                spend_sol = max_spend / 1e9
+                if not spend_by_addr:
+                    continue
+                spender = max(spend_by_addr, key=spend_by_addr.get)
+                spend_sol = spend_by_addr[spender]
+                if spender in seen_buyers:
+                    continue
                 if SM_MIN_BUY_SOL <= spend_sol <= SM_MAX_BUY_SOL:
                     seen_buyers.add(spender)
                     hunters_candidates.append({"address": spender, "entry_delay": delay, "cost": spend_sol})
 
             logger.info(f"  [初筛] 15秒后买入且金额合规: {len(hunters_candidates)} 个")
 
-            # 3.5 过滤：该代币上至少赚取 200%（已清仓或未清仓）
-            profit_filtered = []
-            for candidate in hunters_candidates:
-                roi = await self.get_hunter_profit_on_token(client, candidate["address"], token_address)
-                if roi is not None and roi >= SM_MIN_TOKEN_PROFIT_PCT:
-                    profit_filtered.append(candidate)
-                    logger.debug(f"    通过 200%% 收益过滤: {candidate['address'][:12]}.. ROI={roi:.0f}%%")
-                await asyncio.sleep(0.3)
-            hunters_candidates = profit_filtered
-            logger.info(f"  [初筛] 在该代币赚取≥{SM_MIN_TOKEN_PROFIT_PCT:.0f}%: {len(hunters_candidates)} 个")
-
-            # 4. 深度审计 + 评分入库
+            # 3.5 + 4 收益过滤 + 评分（生产者-消费者：拉取一次交易，复用于 ROI 与体检，节省 Helius credit）
             verified_hunters = []
             for candidate in hunters_candidates:
+                roi, txs = await self.get_hunter_profit_on_token(client, candidate["address"], token_address)
+                if roi is None or roi < SM_MIN_TOKEN_PROFIT_PCT:
+                    await asyncio.sleep(0.3)
+                    continue
+                logger.debug(f"    通过 200%% 收益过滤: {candidate['address'][:12]}.. ROI={roi:.0f}%%")
+
+                # 复用已拉取的 txs，不再重复请求 Helius
                 addr = candidate["address"]
-                stats = await self.analyze_hunter_performance(client, addr, exclude_token=token_address)
+                stats = await self.analyze_hunter_performance(
+                    client, addr, exclude_token=token_address, pre_fetched_txs=txs
+                )
 
                 if stats:
                     score_hit_rate = stats["win_rate"]
@@ -586,6 +624,7 @@ class SmartMoneySearcher:
                             f"    ✅ 锁定猎手 {addr}.. | 利润: {candidate['total_profit']} | 评分: {final_score}")
                 await asyncio.sleep(0.5)
 
+            logger.info(f"  [收益+评分] 入库 {len(verified_hunters)} 个猎手（交易数据复用，节省 Helius credit）")
             self._save_scanned_token(token_address)
             return verified_hunters
 

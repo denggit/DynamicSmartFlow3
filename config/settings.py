@@ -160,10 +160,12 @@ SM_MIN_DELAY_SEC = 15  # 初筛：开盘后至少 15 秒买入才计入
 SM_MAX_DELAY_SEC = 10800  # 3 小时内买入都算
 SM_MIN_TOKEN_PROFIT_PCT = 200.0  # 猎手/初筛买家在该代币至少赚 200% 才入库
 SM_AUDIT_TX_LIMIT = 500  # 体检时拉取交易笔数
+SM_FREQUENCY_CHECK_TX_LIMIT = 120  # 频率检测只需约 100 笔真实交易，先拉前 120 笔；通过后再拉满 500
+SM_EARLY_TX_PARSE_LIMIT = 360  # 初筛：最多解析多少笔早期交易（按时间取前 N 笔）
 SM_MIN_BUY_SOL = 0.1  # 初筛：单笔买入最少 SOL
 SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
 SM_MIN_WIN_RATE = 0.4  # 猎手入库：胜率至少 40%
-SM_MIN_TOTAL_PROFIT = 2.0  # 猎手入库：或总利润 ≥ 2 SOL 可放宽胜率
+SM_MIN_TOTAL_PROFIT = 100.0  # 猎手入库：或总利润 ≥ 100 SOL 可放宽胜率
 SM_MIN_HUNTER_SCORE = 60  # 猎手入库最低分数
 SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
 
