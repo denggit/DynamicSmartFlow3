@@ -726,11 +726,13 @@ class SmartMoneySearcher:
                         self._add_to_wallet_blacklist(addr)
 
                     if is_qualified:
+                        avg_roi = stats.get("avg_roi_pct", 0.0)
                         candidate.update({
                             "score": final_score,
                             "win_rate": f"{stats['win_rate']:.1%}",
                             "worst_roi": f"{stats['worst_roi']:.1f}%",
                             "total_profit": f"{stats['total_profit']:.2f} SOL",
+                            "avg_roi_pct": f"{avg_roi:.1f}%",
                             "scores_detail": f"H:{score_hit_rate:.2f}/P:{score_profit:.2f}/D:{score_drawdown:.2f}"
                         })
                         verified_hunters.append(candidate)
