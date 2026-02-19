@@ -152,7 +152,7 @@ SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 # ==================== 猎手挖掘 (sm_searcher) ====================
 MIN_TOKEN_AGE_SEC = 900  # 最少上市 15 分钟 (排除纯土狗/貔貅)
 MAX_TOKEN_AGE_SEC = 43200  # 最多上市 12 小时 (放宽年龄)
-MAX_BACKTRACK_PAGES = 20  # 最多回溯 20 页 (2万笔交易)
+MAX_BACKTRACK_PAGES = 30  # 最多回溯 30 页 (3万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
 MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算真实
