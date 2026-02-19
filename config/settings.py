@@ -168,6 +168,11 @@ SM_MIN_WIN_RATE = 0.4  # 猎手入库：胜率至少 40%
 SM_MIN_TOTAL_PROFIT = 100.0  # 猎手入库：或总利润 ≥ 100 SOL 可放宽胜率
 SM_MIN_HUNTER_SCORE = 60  # 猎手入库最低分数
 SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
+# 钱包黑名单：劣质猎手不再分析，节省 Helius API
+WALLET_BLACKLIST_FILE = "data/wallet_blacklist.json"
+WALLET_BLACKLIST_MIN_SCORE = 50  # 评分低于此加入黑名单
+WALLET_BLACKLIST_LOSS_USDC = 30.0  # 亏损超过此金额 (USDC) 且胜率低则加入
+WALLET_BLACKLIST_WIN_RATE = 0.4  # 亏损+胜率低于此加入黑名单
 
 # ==================== DexScreener 扫描 ====================
 DEX_MIN_LIQUIDITY_USD = 10000  # 最低流动性 (USD)

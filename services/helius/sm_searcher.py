@@ -43,6 +43,11 @@ from config.settings import (
     SM_MIN_WIN_RATE,
     SM_MIN_TOTAL_PROFIT,
     SM_MIN_HUNTER_SCORE, DEX_MIN_24H_GAIN_PCT,
+    WALLET_BLACKLIST_FILE,
+    WALLET_BLACKLIST_MIN_SCORE,
+    WALLET_BLACKLIST_LOSS_USDC,
+    WALLET_BLACKLIST_WIN_RATE,
+    USDC_PER_SOL,
 )
 from utils.logger import get_logger
 
@@ -223,7 +228,9 @@ class SmartMoneySearcher:
         self.audit_tx_limit = SM_AUDIT_TX_LIMIT
 
         self.scanned_tokens: Set[str] = set()
+        self.wallet_blacklist: Set[str] = set()
         self._load_scanned_history()
+        self._load_wallet_blacklist()
 
     def _ensure_data_dir(self):
         if not os.path.exists("data"):
@@ -247,6 +254,30 @@ class SmartMoneySearcher:
                 json.dump(list(self.scanned_tokens), f)
         except Exception:
             logger.exception("保存扫描历史失败")
+
+    def _load_wallet_blacklist(self):
+        """加载钱包黑名单：劣质猎手地址，扫描时直接跳过以节省 API。"""
+        self._ensure_data_dir()
+        if os.path.exists(WALLET_BLACKLIST_FILE):
+            try:
+                with open(WALLET_BLACKLIST_FILE, 'r') as f:
+                    self.wallet_blacklist = set(json.load(f))
+                if self.wallet_blacklist:
+                    logger.info(f"📂 已加载 {len(self.wallet_blacklist)} 个钱包黑名单")
+            except Exception:
+                logger.exception("⚠️ 加载钱包黑名单失败")
+
+    def _add_to_wallet_blacklist(self, address: str):
+        """将劣质猎手加入黑名单，下次扫描跳过。"""
+        if address in self.wallet_blacklist:
+            return
+        self.wallet_blacklist.add(address)
+        try:
+            with open(WALLET_BLACKLIST_FILE, 'w') as f:
+                json.dump(list(self.wallet_blacklist), f)
+            logger.debug("🖤 加入黑名单: %s..", address[:12])
+        except Exception:
+            logger.exception("保存钱包黑名单失败")
 
     async def _rpc_post(self, client, method, params):
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -636,15 +667,18 @@ class SmartMoneySearcher:
             for idx, candidate in enumerate(hunters_candidates, 1):
                 if idx == 1 or idx % progress_interval == 0 or idx == total:
                     pct = idx * 100 // total
-                    logger.info(f"  [进度] {idx}/{total} ({pct}%%) | 已入库 {len(verified_hunters)} 个")
-                roi, txs = await self.get_hunter_profit_on_token(client, candidate["address"], token_address)
+                    logger.info(f"  [进度] {idx}/{total} ({pct}%) | 已入库 {len(verified_hunters)} 个")
+                addr = candidate["address"]
+                if addr in self.wallet_blacklist:
+                    logger.debug("    跳过黑名单: %s..", addr[:12])
+                    continue
+                roi, txs = await self.get_hunter_profit_on_token(client, addr, token_address)
                 if roi is None or roi < SM_MIN_TOKEN_PROFIT_PCT:
                     await asyncio.sleep(0.3)
                     continue
-                logger.debug(f"    通过 200%% 收益过滤: {candidate['address'][:12]}.. ROI={roi:.0f}%%")
+                logger.debug(f"    通过 200%% 收益过滤: {addr[:12]}.. ROI={roi:.0f}%%")
 
                 # 复用已拉取的 txs，不再重复请求 Helius
-                addr = candidate["address"]
                 stats = await self.analyze_hunter_performance(
                     client, addr, exclude_token=token_address, pre_fetched_txs=txs
                 )
@@ -665,6 +699,12 @@ class SmartMoneySearcher:
                             is_qualified = True
                         elif stats["total_profit"] >= SM_MIN_TOTAL_PROFIT:
                             is_qualified = True
+
+                    # 劣质猎手加入黑名单，下次直接跳过以节省 API
+                    loss_usdc = -stats["total_profit"] * USDC_PER_SOL if stats["total_profit"] < 0 else 0
+                    if (final_score < WALLET_BLACKLIST_MIN_SCORE or
+                            (loss_usdc >= WALLET_BLACKLIST_LOSS_USDC and score_hit_rate < WALLET_BLACKLIST_WIN_RATE)):
+                        self._add_to_wallet_blacklist(addr)
 
                     if is_qualified:
                         candidate.update({
