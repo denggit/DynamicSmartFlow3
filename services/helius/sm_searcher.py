@@ -56,6 +56,7 @@ IGNORE_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",   # USDT
 }
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算「真实」
 
 
@@ -130,10 +131,17 @@ class TransactionParser:
         self.target_wallet = target_wallet
         self.wsol_mint = "So11111111111111111111111111111111111111112"
 
-    def parse_transaction(self, tx: dict) -> Tuple[float, Dict[str, float], int]:
+    def parse_transaction(
+        self, tx: dict, usdc_price_sol: float | None = None
+    ) -> Tuple[float, Dict[str, float], int]:
+        """
+        解析交易，返回 (sol_change, token_changes, timestamp)。
+        sol_change 含 native SOL + WSOL；若传入 usdc_price_sol，USDC 流动亦折算为 SOL 等价并入 sol_change。
+        """
         timestamp = tx.get('timestamp', 0)
         native_sol_change = 0.0
         wsol_change = 0.0
+        usdc_change = 0.0
         token_changes = defaultdict(float)
 
         for nt in tx.get('nativeTransfers', []):
@@ -150,6 +158,11 @@ class TransactionParser:
                     wsol_change -= amt
                 if tt.get('toUserAccount') == self.target_wallet:
                     wsol_change += amt
+            elif mint == USDC_MINT:
+                if tt.get('fromUserAccount') == self.target_wallet:
+                    usdc_change -= amt
+                if tt.get('toUserAccount') == self.target_wallet:
+                    usdc_change += amt
             else:
                 if tt.get('fromUserAccount') == self.target_wallet:
                     token_changes[mint] -= amt
@@ -165,6 +178,9 @@ class TransactionParser:
             sol_change = native_sol_change if abs(native_sol_change) > abs(wsol_change) else wsol_change
         else:
             sol_change = native_sol_change + wsol_change
+
+        if usdc_price_sol is not None and usdc_price_sol > 0 and abs(usdc_change) >= 1e-9:
+            sol_change += usdc_change * usdc_price_sol
 
         return sol_change, dict(token_changes), timestamp
 
@@ -339,6 +355,7 @@ class SmartMoneySearcher:
         if not txs:
             return None
 
+        usdc_price = await self._get_usdc_price_sol(client) if client else None
         parser = TransactionParser(hunter_address)
         calc = TokenAttributionCalculator()
         projects = defaultdict(lambda: {"buy_sol": 0.0, "sell_sol": 0.0, "tokens": 0.0})
@@ -346,7 +363,7 @@ class SmartMoneySearcher:
         txs.sort(key=lambda x: x.get('timestamp', 0))
         for tx in txs:
             try:
-                sol_change, token_changes, _ = parser.parse_transaction(tx)
+                sol_change, token_changes, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price)
                 if not token_changes: continue
                 buy_attrs, sell_attrs = calc.calculate_attribution(sol_change, token_changes)
                 for mint, delta in token_changes.items():
@@ -375,6 +392,10 @@ class SmartMoneySearcher:
         worst_roi = max(-100, min([p["roi"] for p in recent])) if recent else 0
 
         return {"win_rate": win_rate, "worst_roi": worst_roi, "total_profit": total_profit, "count": len(recent)}
+
+    async def _get_usdc_price_sol(self, client) -> float | None:
+        """从 DexScreener 获取 1 USDC = ? SOL，用于将 USDC 流动折算为 SOL 等价。"""
+        return await self._get_token_price_sol(client, USDC_MINT)
 
     async def _get_token_price_sol(self, client, token_address: str) -> float | None:
         """
@@ -442,13 +463,14 @@ class SmartMoneySearcher:
             txs = (first_txs or []) + (rest_txs or [])
         if not txs:
             return None, None
+        usdc_price = await self._get_usdc_price_sol(client)
         parser = TransactionParser(hunter_address)
         calc = TokenAttributionCalculator()
         buy_sol, sell_sol, tokens_held = 0.0, 0.0, 0.0
         txs.sort(key=lambda x: x.get("timestamp", 0))
         for tx in txs:
             try:
-                sol_change, token_changes, _ = parser.parse_transaction(tx)
+                sol_change, token_changes, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price)
                 if token_address not in token_changes:
                     continue
                 delta = token_changes[token_address]
@@ -547,6 +569,7 @@ class SmartMoneySearcher:
 
             hunters_candidates = []
             seen_buyers = set()
+            usdc_price = await self._get_usdc_price_sol(client)
 
             wsol_mint = "So11111111111111111111111111111111111111112"
             for tx in txs:
@@ -561,11 +584,15 @@ class SmartMoneySearcher:
                     if addr:
                         spend_by_addr[addr] += nt.get('amount', 0) / 1e9
                 for tt in tx.get('tokenTransfers', []):
-                    if tt.get('mint') == wsol_mint:
-                        addr = tt.get('fromUserAccount')
-                        if addr:
-                            amt = _normalize_token_amount(tt.get('tokenAmount'))
-                            spend_by_addr[addr] += amt
+                    mint = tt.get('mint')
+                    addr = tt.get('fromUserAccount')
+                    if not addr:
+                        continue
+                    amt = _normalize_token_amount(tt.get('tokenAmount'))
+                    if mint == wsol_mint:
+                        spend_by_addr[addr] += amt
+                    elif mint == USDC_MINT and usdc_price and usdc_price > 0:
+                        spend_by_addr[addr] += amt * usdc_price
 
                 if not spend_by_addr:
                     continue

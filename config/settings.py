@@ -106,7 +106,7 @@ def get_tier_config(score: float) -> dict:
     if score >= 80:
         return {"entry_sol": 0.1, "add_sol": 0.1, "max_sol": 0.5, "stop_loss_pct": 0.4}
     if score >= 60:
-        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.3, "stop_loss_pct": 0.3}
+        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.2, "stop_loss_pct": 0.3}
     return None
 
 # 猎手加仓跟随阈值：只跟对方买入 ≥ 1 SOL 的单
@@ -200,6 +200,9 @@ SIG_QUEUE_DRAIN_TIMEOUT = 0.3  # 凑批超时 (秒)
 WALLET_WS_RESUBSCRIBE_SEC = 300  # WebSocket 重连间隔
 HOLDINGS_TTL_SEC = 7200  # token 2 小时无新买入则清理
 HOLDINGS_PRUNE_INTERVAL_SEC = 43200  # 每 12 小时扫描清理
+
+# ==================== USDC 折算 (跟单 / 挖掘) ====================
+USDC_PER_SOL = 100.0  # 1 SOL ≈ 100 USDC，用于 USDC 折算 SOL（不请求 API，默认 100U）
 
 # ==================== 跟单管家 (hunter_agent) ====================
 SYNC_POSITIONS_INTERVAL_SEC = 30  # 持仓同步间隔

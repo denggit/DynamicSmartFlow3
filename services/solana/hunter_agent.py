@@ -27,6 +27,7 @@ from config.settings import (
     SYNC_MIN_DELTA_RATIO,
     SYNC_PROTECTION_AFTER_START_SEC,
     NEW_HUNTER_ADD_WINDOW_SEC,
+    USDC_PER_SOL,
 )
 from services.helius.sm_searcher import IGNORE_MINTS, TransactionParser
 from utils.logger import get_logger
@@ -77,7 +78,6 @@ class HunterAgentController:
 
     def __init__(self, signal_callback: Optional[Callable] = None):
         self.signal_callback = signal_callback
-
         # 活跃任务池: {token_address: TokenMission}
         self.active_missions: Dict[str, TokenMission] = {}
 
@@ -101,12 +101,13 @@ class HunterAgentController:
         2. 新增猎手：池内猎手买入我们正在持有的 token 时，加入任务并发 HUNTER_BUY 触发加仓
         """
         parser_cache = {}
+        usdc_price_sol = 1.0 / USDC_PER_SOL if USDC_PER_SOL > 0 else 0.01
         for hunter in active_hunters:
             parser = parser_cache.get(hunter)
             if parser is None:
                 parser = TransactionParser(hunter)
                 parser_cache[hunter] = parser
-            _, token_changes, _ = parser.parse_transaction(tx)
+            _, token_changes, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price_sol)
             token_changes = {m: d for m, d in token_changes.items() if m not in IGNORE_MINTS and abs(d) >= 1e-9}
 
             potential_tokens = self.hunter_map.get(hunter) or set()

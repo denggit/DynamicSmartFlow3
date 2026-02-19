@@ -22,6 +22,7 @@ import websockets
 # 导入配置和依赖模块
 from config.settings import (
     helius_key_pool,
+    USDC_PER_SOL,
     MAX_ENTRY_PUMP_MULTIPLIER,
     DISCOVERY_INTERVAL,
     MAINTENANCE_INTERVAL,
@@ -435,10 +436,15 @@ class HunterMonitorController:
                 logger.exception("消费队列异常")
                 await asyncio.sleep(1)
 
+    def _get_usdc_price_sol(self) -> float:
+        """1 USDC = ? SOL，使用配置固定值，不请求 API。"""
+        return 1.0 / USDC_PER_SOL if USDC_PER_SOL > 0 else 0.01
+
     async def _process_one_tx(self, hunter: str, tx: dict):
         """单笔命中猎手的 tx：解析买卖、写 monitor.log、触发共振。"""
+        usdc_price = self._get_usdc_price_sol()
         parser = TransactionParser(hunter)
-        sol_change, token_changes, _ = parser.parse_transaction(tx)
+        sol_change, token_changes, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price)
         for mint, delta in token_changes.items():
             if abs(delta) < 1e-9:
                 continue
@@ -468,8 +474,9 @@ class HunterMonitorController:
             await self.check_resonance(mint)
 
     async def analyze_action(self, hunter, tx):
+        usdc_price = self._get_usdc_price_sol()
         parser = TransactionParser(hunter)
-        sol_change, token_changes, ts = parser.parse_transaction(tx)
+        sol_change, token_changes, ts = parser.parse_transaction(tx, usdc_price_sol=usdc_price)
 
         for mint, delta in token_changes.items():
             if abs(delta) < 1e-9: continue
