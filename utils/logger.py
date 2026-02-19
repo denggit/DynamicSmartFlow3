@@ -26,8 +26,7 @@ LOGS_ROOT = _BASE_DIR / "logs"
 # 已创建的 logger 实例，避免重复添加 handler
 _logger_handlers: dict = {}
 
-# 严重错误邮件：1 小时最多发一封，整合该时段内所有 ERROR/exception
-_CRITICAL_EMAIL_COOLDOWN_SEC = 3600  # 1 小时
+from config.settings import CRITICAL_EMAIL_COOLDOWN_SEC as _CRITICAL_EMAIL_COOLDOWN_SEC
 _critical_error_buffer: List[dict] = []
 _buffer_lock = threading.Lock()
 _flush_timer: Optional[threading.Timer] = None

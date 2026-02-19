@@ -11,9 +11,10 @@ import subprocess
 import sys
 import time
 
+from config.settings import WATCHDOG_RESTART_DELAY
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 MAIN_SCRIPT = os.path.join(ROOT, "main.py")
-RESTART_DELAY = 5  # 退出后等待几秒再重启
 
 _child_proc = None
 
@@ -69,8 +70,8 @@ def main():
             on_exit(None, None)
         except Exception as e:
             print(f"[Watchdog] 运行异常: {e}", file=sys.stderr)
-        print(f"[Watchdog] main.py 已退出，{RESTART_DELAY} 秒后重启...")
-        time.sleep(RESTART_DELAY)
+        print(f"[Watchdog] main.py 已退出，{WATCHDOG_RESTART_DELAY} 秒后重启...")
+        time.sleep(WATCHDOG_RESTART_DELAY)
 
 
 if __name__ == "__main__":

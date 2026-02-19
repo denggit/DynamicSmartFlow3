@@ -34,6 +34,7 @@ from config.settings import (
     SOLANA_PRIVATE_KEY_BASE58,
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS,
     BASE_DIR, helius_key_pool, jup_key_pool,
+    TX_VERIFY_MAX_WAIT_SEC, TRADER_RPC_TIMEOUT,
 )
 from utils.logger import get_logger
 
@@ -103,7 +104,7 @@ class SolanaTrader:
         self._helius_pool = helius_key_pool
         self._jup_pool = jup_key_pool
         self.rpc_client = AsyncClient(helius_key_pool.get_rpc_url(), commitment=Confirmed)
-        self.http_client = httpx.AsyncClient(timeout=10.0)
+        self.http_client = httpx.AsyncClient(timeout=TRADER_RPC_TIMEOUT)
 
     def _jup_headers(self) -> dict:
         """Jupiter 请求头，与 SmartFlow3 一致；若有 JUP Key 则带上 x-api-key。"""
@@ -153,7 +154,7 @@ class SolanaTrader:
                 ]
             }
             resp = await self.http_client.post(
-                self._helius_pool.get_rpc_url(), json=payload, timeout=5
+                self._helius_pool.get_rpc_url(), json=payload, timeout=TRADER_RPC_TIMEOUT
             )
             if resp.status_code == 429 and self._helius_pool.size > 1:
                 self._helius_pool.mark_current_failed()
@@ -623,7 +624,7 @@ class SolanaTrader:
                 await asyncio.sleep(5)
 
                 # 验证交易是否真正确认，避免广播成功但链上执行失败时误更新状态
-                if not await self._verify_tx_confirmed(sig_str):
+                if not await self._verify_tx_confirmed(sig_str, max_wait_sec=TX_VERIFY_MAX_WAIT_SEC):
                     logger.warning("❌ 交易链上确认失败: %s（可能滑点/余额不足）", sig_str)
                     return None, 0
 
@@ -676,8 +677,10 @@ class SolanaTrader:
             logger.debug("Jupiter 校验价格异常", exc_info=True)
         return None
 
-    async def _verify_tx_confirmed(self, sig_str: str, max_wait_sec: int = 15) -> bool:
+    async def _verify_tx_confirmed(self, sig_str: str, max_wait_sec: int | None = None) -> bool:
         """轮询 get_signature_statuses，确认交易成功落地。链上失败（滑点等）时返回 False，不更新状态。"""
+        if max_wait_sec is None:
+            max_wait_sec = TX_VERIFY_MAX_WAIT_SEC
         try:
             from solders.signature import Signature
             sig = Signature.from_string(sig_str) if isinstance(sig_str, str) else sig_str

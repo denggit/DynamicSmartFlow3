@@ -8,27 +8,21 @@
 from typing import Tuple
 
 import httpx
+
+from config.settings import (
+    MAX_ACCEPTABLE_BUY_TAX_PCT,
+    MAX_SAFE_SCORE,
+    MIN_LIQUIDITY_USD,
+    MAX_TOP2_10_COMBINED_PCT,
+    MAX_SINGLE_HOLDER_PCT,
+    MAX_ENTRY_FDV_USD,
+    MIN_LIQUIDITY_TO_FDV_RATIO,
+)
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
-
-# 买入税超过此比例则拒绝（避免一买就亏一大块）
-MAX_ACCEPTABLE_BUY_TAX_PCT = 25.0
-# RugCheck 风险分超过此值拒绝
-MAX_SAFE_SCORE = 2000
-# 池子流动性最低门槛（防撤池）：低于此值坚决不买
-MIN_LIQUIDITY_USD = 10000.0
-# 防老鼠仓：排除 LP 后，第 2~10 名合计持仓不得超过「剩余供应」的此比例
-MAX_TOP2_10_COMBINED_PCT = 0.30
-# 防老鼠仓：排除 LP 后，单一地址不得超过「剩余供应」的此比例
-MAX_SINGLE_HOLDER_PCT = 0.10
-
-# 最大可接受入场市值 (FDV)：超过此市值坚决不追高（建议 50万 - 150万美金）
-MAX_ENTRY_FDV_USD = 1000000.0
-# 流动性/市值健康比：池子太小但市值很高属于"虚胖控盘"，极易暴跌
-MIN_LIQUIDITY_TO_FDV_RATIO = 0.03  # 池子资金至少占市值的 3%
 
 
 async def check_is_safe_token(token_mint: str) -> bool:

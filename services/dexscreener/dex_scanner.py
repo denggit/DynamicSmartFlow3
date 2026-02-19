@@ -10,6 +10,7 @@ import asyncio
 
 import httpx
 
+from config.settings import DEX_MIN_LIQUIDITY_USD, DEX_MIN_VOL_1H_USD
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -19,8 +20,8 @@ class DexScanner:
     def __init__(self):
         self.base_url = "https://api.dexscreener.com"
         self.target_chain = "solana"
-        self.min_liquidity = 10000  # 最低流动性 10,000 USD
-        self.min_vol_1h = 50000  # 1小时最低成交额 50,000 USD
+        self.min_liquidity = DEX_MIN_LIQUIDITY_USD
+        self.min_vol_1h = DEX_MIN_VOL_1H_USD
 
     async def fetch_latest_tokens(self):
         """获取最近有社交信息更新的代币"""

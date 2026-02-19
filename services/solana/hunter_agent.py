@@ -21,19 +21,19 @@ from typing import Dict, List, Callable, Optional
 import httpx
 import websockets
 
-from config.settings import helius_key_pool
+from config.settings import (
+    helius_key_pool,
+    SYNC_POSITIONS_INTERVAL_SEC,
+    SYNC_MIN_DELTA_RATIO,
+    SYNC_PROTECTION_AFTER_START_SEC,
+    NEW_HUNTER_ADD_WINDOW_SEC,
+)
 from services.helius.sm_searcher import IGNORE_MINTS, TransactionParser
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 # 猎手交易单独写入 monitor.log，便于查看时间与交易币种
 trade_logger = get_logger("trade")
-
-# 与 SmartFlow3 一致：定时同步持仓，防止漏订阅导致错过猎手卖出
-SYNC_POSITIONS_INTERVAL_SEC = 30  # 每 30 秒拉一次链上余额做兜底
-SYNC_MIN_DELTA_RATIO = 0.01  # 变化比例小于 1% 视为误差，不触发信号
-SYNC_PROTECTION_AFTER_START_SEC = 60  # 任务启动后 60 秒内不同步，避免链上延迟误判
-
 
 class TokenMission:
     """
@@ -147,9 +147,6 @@ class HunterAgentController:
         # 这里会触发 WebSocket 重连以更新订阅列表
         # (在 monitor_loop 里会自动处理)
 
-    # 开仓后超过此时间的新增猎手不再触发加仓，仅加入监控（用于跟卖）
-    NEW_HUNTER_ADD_WINDOW_SEC = 600  # 10 分钟
-
     async def _handle_new_hunter_join(self, hunter: str, token_address: str, delta_ui: float):
         """
         新增猎手入场：池内猎手买入我们持有的 token 时，加入任务并触发 HUNTER_BUY。
@@ -162,7 +159,7 @@ class HunterAgentController:
             return
 
         now = time.time()
-        if now - mission.creation_time > self.NEW_HUNTER_ADD_WINDOW_SEC:
+        if now - mission.creation_time > NEW_HUNTER_ADD_WINDOW_SEC:
             trade_logger.info("🔄 [Agent] 开仓已超 10 分钟，新增猎手 %s 不加入监控", hunter[:8])
             return
 

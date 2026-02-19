@@ -20,7 +20,25 @@ from typing import Dict, List, Callable, Optional, Set
 import websockets
 
 # 导入配置和依赖模块
-from config.settings import helius_key_pool, MAX_ENTRY_PUMP_MULTIPLIER
+from config.settings import (
+    helius_key_pool,
+    MAX_ENTRY_PUMP_MULTIPLIER,
+    DISCOVERY_INTERVAL,
+    MAINTENANCE_INTERVAL,
+    POOL_SIZE_LIMIT,
+    ZOMBIE_THRESHOLD,
+    AUDIT_EXPIRATION,
+    RECENT_SIG_TTL_SEC,
+    DISCOVERY_INTERVAL_WHEN_FULL_SEC,
+    FETCH_TX_MAX_RETRIES,
+    FETCH_TX_RETRY_DELAY_BASE,
+    SIG_QUEUE_BATCH_SIZE,
+    SIG_QUEUE_DRAIN_TIMEOUT,
+    WALLET_WS_RESUBSCRIBE_SEC,
+    HOLDINGS_TTL_SEC,
+    HOLDINGS_PRUNE_INTERVAL_SEC,
+    SM_MIN_HUNTER_SCORE,
+)
 from services.dexscreener.dex_scanner import DexScanner
 from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
 from utils.logger import get_logger
@@ -32,28 +50,7 @@ trade_logger = get_logger("trade")
 # 常量配置
 HUNTER_DATA_FILE = "data/hunters.json"
 HUNTER_DATA_BACKUP = "data/hunters_backup.json"
-DISCOVERY_INTERVAL = 900  # 挖掘间隔 15分钟
-MAINTENANCE_INTERVAL = 86400  # 维护间隔 1天 (大幅降低频率)
-POOL_SIZE_LIMIT = 300  # 地址库上限
-ZOMBIE_THRESHOLD = 86400 * 10  # 10天不交易视为僵尸 (清理标准)
-AUDIT_EXPIRATION = 86400 * 15  # 体检有效期 15天 (重算分数标准)
-
-# Helius 消耗控制：仅做去重，不限制监听数量
-RECENT_SIG_TTL_SEC = 90  # 同一 signature 在此时间内不重复拉取（去重）
-DISCOVERY_INTERVAL_WHEN_FULL_SEC = 43200  # 猎手池已满(50)时，挖掘间隔改为 12 小时
-
-# 与 SmartFlow3 一致：拉取交易详情时重试（WebSocket 推送时 Helius 可能尚未索引）
-FETCH_TX_MAX_RETRIES = 3
-FETCH_TX_RETRY_DELAY_BASE = 2  # 第 i 次重试前等待 2+i 秒
 WS_COMMITMENT = "processed"
-# Helius Enhanced WebSocket：transactionSubscribe 支持 accountInclude 一次传入最多 5 万地址，只收这些钱包相关交易
-SIG_QUEUE_BATCH_SIZE = 15       # 批量拉取时每批最多 15 个 signature
-SIG_QUEUE_DRAIN_TIMEOUT = 0.3   # 凑批时每次 get 的超时（秒）
-WALLET_WS_RESUBSCRIBE_SEC = 300  # wallet 模式下每 5 分钟重连并按当前猎手池重新订阅
-
-# active_holdings 清理：2 小时无新猎手买入且持续 12 小时未跟仓则删除，避免内存占用
-HOLDINGS_TTL_SEC = 7200           # 该 token 最近一次猎手买入超过 2 小时
-HOLDINGS_PRUNE_INTERVAL_SEC = 43200  # 每 12 小时扫描一次
 
 
 class HunterStorage:
@@ -124,7 +121,7 @@ class HunterStorage:
         # 2. 处理新猎手（只入库 60 分以上）
         if new_hunters:
             for h in new_hunters:
-                if h.get('score', 0) < 60:
+                if h.get('score', 0) < SM_MIN_HUNTER_SCORE:
                     continue
                 addr = h['address']
                 h['last_active'] = h.get('last_active', now)
@@ -499,8 +496,8 @@ class HunterMonitorController:
             trade_logger.debug("共振跳过: %s 无首买者", mint[:8])
             return
         lead_score = self.storage.get_hunter_score(first_buyer)
-        if lead_score < 60:
-            trade_logger.debug("共振跳过: %s 首买者 %.0f 分 < 60", mint[:8], lead_score)
+        if lead_score < SM_MIN_HUNTER_SCORE:
+            trade_logger.debug("共振跳过: %s 首买者 %.0f 分 < %d", mint[:8], lead_score, SM_MIN_HUNTER_SCORE)
             return
 
         lead_addr = first_buyer
@@ -564,12 +561,12 @@ class HunterMonitorController:
                     # 0. 低分剔除：60 分以下全部踢出，以后只跟单 60 分以上
                     low_score_removed = []
                     for addr, info in list(self.storage.hunters.items()):
-                        if info.get('score', 0) < 60:
+                        if info.get('score', 0) < SM_MIN_HUNTER_SCORE:
                             low_score_removed.append((addr, info.get('score', 0)))
                     for addr, score in low_score_removed:
                         if addr in self.storage.hunters:
                             del self.storage.hunters[addr]
-                            logger.info("🚫 踢出低分猎手 %s.. (分:%.0f < 60)", addr[:12], score)
+                            logger.info("🚫 踢出低分猎手 %s.. (分:%.0f < %d)", addr[:12], score, SM_MIN_HUNTER_SCORE)
                     if low_score_removed:
                         self.storage.save_hunters()
                         current_hunters = list(self.storage.hunters.items())

@@ -21,23 +21,29 @@ from typing import Dict, Tuple, Set
 
 import httpx
 
-from config.settings import helius_key_pool
+from config.settings import (
+    helius_key_pool,
+    MIN_TOKEN_AGE_SEC,
+    MAX_TOKEN_AGE_SEC,
+    MAX_BACKTRACK_PAGES,
+    RECENT_TX_COUNT_FOR_FREQUENCY,
+    MIN_AVG_TX_INTERVAL_SEC,
+    MIN_NATIVE_LAMPORTS_FOR_REAL,
+    SCANNED_HISTORY_FILE,
+    SM_MIN_DELAY_SEC,
+    SM_MAX_DELAY_SEC,
+    SM_AUDIT_TX_LIMIT,
+    SM_MIN_BUY_SOL,
+    SM_MAX_BUY_SOL,
+    SM_MIN_WIN_RATE,
+    SM_MIN_TOTAL_PROFIT,
+    SM_MIN_HUNTER_SCORE,
+)
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
-
-# === 核心策略参数 ===
-MIN_TOKEN_AGE_SEC = 900  # 最少上市 15分钟 (排除纯土狗/貔貅)
-MAX_TOKEN_AGE_SEC = 10800  # 最多上市 3小时 (太老的币数据太深，不挖了)
-MAX_BACKTRACK_PAGES = 10  # 最多回溯10页 (1万笔交易)，对于3小时内的币通常足够
-
-# 频繁交易过滤：平均间隔 < 5 分钟的地址不纳入/踢出猎手池（只统计「真实交易」）
-RECENT_TX_COUNT_FOR_FREQUENCY = 100
-MIN_AVG_TX_INTERVAL_SEC = 180
 
 # 与 SmartFlow3 一致：只把「真实买卖」算作交易，忽略 SOL/USDC/USDT 等
 IGNORE_MINTS = {
@@ -190,10 +196,10 @@ class SmartMoneySearcher:
         self.rpc_url = self._pool.get_rpc_url()
         self.base_api_url = "https://api.helius.xyz/v0"
 
-        # 初筛参数
-        self.min_delay_sec = 5
-        self.max_delay_sec = 900  # 15分钟
-        self.audit_tx_limit = 500
+        # 初筛参数 (来自 config/settings.py)
+        self.min_delay_sec = SM_MIN_DELAY_SEC
+        self.max_delay_sec = SM_MAX_DELAY_SEC
+        self.audit_tx_limit = SM_AUDIT_TX_LIMIT
 
         self.scanned_tokens: Set[str] = set()
         self._load_scanned_history()
@@ -446,7 +452,7 @@ class SmartMoneySearcher:
 
                 if not spender or spender in seen_buyers: continue
                 spend_sol = max_spend / 1e9
-                if 0.1 <= spend_sol <= 50.0:
+                if SM_MIN_BUY_SOL <= spend_sol <= SM_MAX_BUY_SOL:
                     seen_buyers.add(spender)
                     hunters_candidates.append({"address": spender, "entry_delay": delay, "cost": spend_sol})
 
@@ -470,9 +476,9 @@ class SmartMoneySearcher:
 
                     is_qualified = False
                     if stats["total_profit"] > 0.1:
-                        if stats["win_rate"] >= 0.4:
+                        if stats["win_rate"] >= SM_MIN_WIN_RATE:
                             is_qualified = True
-                        elif stats["total_profit"] >= 2.0:
+                        elif stats["total_profit"] >= SM_MIN_TOTAL_PROFIT:
                             is_qualified = True
 
                     if is_qualified:
@@ -509,7 +515,7 @@ class SmartMoneySearcher:
                 await asyncio.sleep(1)
         all_hunters.sort(key=lambda x: x.get('score', 0), reverse=True)
         # 只保留 60 分及以上猎手，与猎手池入库规则一致
-        return [h for h in all_hunters if h.get('score', 0) >= 60]
+        return [h for h in all_hunters if h.get('score', 0) >= SM_MIN_HUNTER_SCORE]
 
 
 if __name__ == "__main__":

@@ -85,7 +85,7 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.qq.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-BOT_NAME = os.getenv("BOT_NAME", "DSF3")  # 邮件标题前缀
+BOT_NAME = os.getenv("BOT_NAME", "DynamicSmartFlow3")  # 邮件标题前缀
 
 # --- 日报配置 ---
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "8"))  # 每日几点发日报 (0-23)
@@ -148,3 +148,65 @@ PNL_CHECK_INTERVAL = 5  # 每 5 秒检查一次止盈/止损
 
 # 钱包配置 (请替换为真实私钥)
 SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
+
+# ==================== 猎手挖掘 (sm_searcher) ====================
+MIN_TOKEN_AGE_SEC = 900  # 最少上市 15 分钟 (排除纯土狗/貔貅)
+MAX_TOKEN_AGE_SEC = 10800  # 最多上市 3 小时 (太老的币数据太深不挖)
+MAX_BACKTRACK_PAGES = 10  # 最多回溯 10 页 (1万笔交易)
+RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
+MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
+MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算真实
+SM_MIN_DELAY_SEC = 5  # 开盘后至少 N 秒买入才计入
+SM_MAX_DELAY_SEC = 900  # 15 分钟内买入才算早期
+SM_AUDIT_TX_LIMIT = 500  # 体检时拉取交易笔数
+SM_MIN_BUY_SOL = 0.1  # 初筛：单笔买入最少 SOL
+SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
+SM_MIN_WIN_RATE = 0.4  # 猎手入库：胜率至少 40%
+SM_MIN_TOTAL_PROFIT = 2.0  # 猎手入库：或总利润 ≥ 2 SOL 可放宽胜率
+SM_MIN_HUNTER_SCORE = 60  # 猎手入库最低分数
+SCANNED_HISTORY_FILE = "data/scanned_tokens.json"
+
+# ==================== DexScreener 扫描 ====================
+DEX_MIN_LIQUIDITY_USD = 10000  # 最低流动性 (USD)
+DEX_MIN_VOL_1H_USD = 50000  # 1 小时最低成交额 (USD)
+
+# ==================== 风控 (risk_control) ====================
+MAX_ACCEPTABLE_BUY_TAX_PCT = 25.0  # 买入税超过此比例拒绝
+MAX_SAFE_SCORE = 2000  # RugCheck 风险分超过此值拒绝
+MIN_LIQUIDITY_USD = 10000.0  # 池子流动性最低门槛防撤池 ($10k)
+MAX_TOP2_10_COMBINED_PCT = 0.30  # 防老鼠仓：第 2~10 名合计上限
+MAX_SINGLE_HOLDER_PCT = 0.10  # 防老鼠仓：单一地址上限
+MAX_ENTRY_FDV_USD = 1000000.0  # 最大可接受入场 FDV (USD)
+MIN_LIQUIDITY_TO_FDV_RATIO = 0.03  # 流动性/市值比至少 3%
+
+# ==================== 猎手监控 (hunter_monitor) ====================
+DISCOVERY_INTERVAL = 900  # 挖掘间隔 15 分钟
+MAINTENANCE_INTERVAL = 86400  # 维护间隔 1 天
+POOL_SIZE_LIMIT = 300  # 猎手池上限
+ZOMBIE_THRESHOLD_DAYS = 15  # 多少天未交易视为僵尸
+AUDIT_EXPIRATION_DAYS = 5  # 体检有效期 (天)
+ZOMBIE_THRESHOLD = 86400 * ZOMBIE_THRESHOLD_DAYS
+AUDIT_EXPIRATION = 86400 * AUDIT_EXPIRATION_DAYS
+DISCOVERY_INTERVAL_WHEN_FULL_SEC = 86400  # 池满时挖掘间隔 24 小时
+RECENT_SIG_TTL_SEC = 90  # 同一 signature 去重 TTL
+FETCH_TX_MAX_RETRIES = 3  # 拉取交易重试次数
+FETCH_TX_RETRY_DELAY_BASE = 2  # 重试延迟基数 (秒)
+SIG_QUEUE_BATCH_SIZE = 15  # 批量拉取每批 signature 数
+SIG_QUEUE_DRAIN_TIMEOUT = 0.3  # 凑批超时 (秒)
+WALLET_WS_RESUBSCRIBE_SEC = 300  # WebSocket 重连间隔
+HOLDINGS_TTL_SEC = 7200  # token 2 小时无新买入则清理
+HOLDINGS_PRUNE_INTERVAL_SEC = 43200  # 每 12 小时扫描清理
+
+# ==================== 跟单管家 (hunter_agent) ====================
+SYNC_POSITIONS_INTERVAL_SEC = 30  # 持仓同步间隔
+SYNC_MIN_DELTA_RATIO = 0.01  # 变化 < 1% 视为误差不触发
+SYNC_PROTECTION_AFTER_START_SEC = 60  # 启动后 60 秒内不同步
+NEW_HUNTER_ADD_WINDOW_SEC = 600  # 开仓 10 分钟内才处理新猎手 (单猎手模式已禁用)
+
+# ==================== 交易 (trader) ====================
+TX_VERIFY_MAX_WAIT_SEC = 15  # 交易确认最大等待秒
+TRADER_RPC_TIMEOUT = 30.0  # RPC 请求超时
+
+# ==================== 其他 ====================
+CRITICAL_EMAIL_COOLDOWN_SEC = 3600  # 严重错误邮件冷却 1 小时
+WATCHDOG_RESTART_DELAY = 5  # 看门狗重启延迟 (秒)
