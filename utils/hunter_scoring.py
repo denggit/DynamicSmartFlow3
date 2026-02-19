@@ -66,7 +66,7 @@ def compute_hunter_score(stats: Dict[str, Any]) -> Dict[str, Any]:
             SM_WIN_RATE_FULL_PCT - SM_WIN_RATE_ZERO_PCT
         )
 
-    # 盈利分：< 20% 零分，20%~100% 线性，≥100% 满分
+    # 盈利分：< 20% 零分，20%~60% 线性，≥60% 满分
     avg_roi_pct = stats.get("avg_roi_pct", 0.0)
     if avg_roi_pct < SM_PROFIT_SCORE_ZERO_PCT:
         score_profit = 0.0

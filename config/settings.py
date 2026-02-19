@@ -98,16 +98,20 @@ JUP_SWAP_API = "https://api.jup.ag/swap/v1/swap"
 SLIPPAGE_BPS = 200  # 滑点 2% (200 bps)
 PRIORITY_FEE_SETTINGS = "auto"
 
-# 单猎手跟单分档 (60-80 / 80-90 / 90+)，只跟一个猎手
+# 单猎手跟单分档 (<60 / 60-80 / 80-90 / 90+)，只跟一个猎手
 def get_tier_config(score: float) -> dict:
-    """根据猎手分数返回该档位的 entry/add/max/stop_loss。60 分以下返回 None。"""
+    """
+    根据猎手分数返回 entry/add/max/stop_loss。
+    <60: 0.03×3=0.09 | 60-80: 0.05×4=0.2 | 80-90: 0.1×5=0.5 | 90+: 0.2×5=1.0
+    """
     if score >= 90:
         return {"entry_sol": 0.2, "add_sol": 0.2, "max_sol": 1.0, "stop_loss_pct": 0.5}
     if score >= 80:
         return {"entry_sol": 0.1, "add_sol": 0.1, "max_sol": 0.5, "stop_loss_pct": 0.4}
     if score >= 60:
         return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.2, "stop_loss_pct": 0.3}
-    return None
+    # 60 分以下也跟，但额度小
+    return {"entry_sol": 0.03, "add_sol": 0.03, "max_sol": 0.09, "stop_loss_pct": 0.3}
 
 # 猎手加仓跟随阈值：只跟对方买入 ≥ 1 SOL 的单
 HUNTER_ADD_THRESHOLD_SOL = 1.0
@@ -156,19 +160,29 @@ MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算真实
 SM_MIN_DELAY_SEC = 15  # 初筛：开盘后至少 15 秒买入才计入
 SM_MAX_DELAY_SEC = 10800  # 3 小时内买入都算
-SM_MIN_TOKEN_PROFIT_PCT = 200.0  # 猎手/初筛买家在该代币至少赚 200% 才入库
+SM_MIN_TOKEN_PROFIT_PCT = 100.0  # 入库门槛：该代币当下至少赚 100% 才能入池；≥200%×1，100%~200%×0.9；体检时 30 天内若掉到 <50% 则踢出
 SM_AUDIT_TX_LIMIT = 500  # 体检时拉取交易笔数
 SM_FREQUENCY_CHECK_TX_LIMIT = 120  # 频率检测只需约 100 笔真实交易，先拉前 120 笔；通过后再拉满 500
 SM_EARLY_TX_PARSE_LIMIT = 360  # 初筛：最多解析多少笔早期交易（按时间取前 N 笔）
 SM_MIN_BUY_SOL = 0.1  # 初筛：单笔买入最少 SOL
 SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
-SM_MIN_WIN_RATE = 0.4  # 猎手入库：胜率至少 40%
-SM_MIN_TOTAL_PROFIT = 100.0  # 猎手入库：或总利润 ≥ 100 SOL 可放宽胜率
-SM_MIN_TRADE_COUNT = 5  # 猎手入库：历史有效交易（代币项目）数至少 5 笔
-SM_MIN_HUNTER_SCORE = 60  # 猎手入库最低分数
-# 盈利分：avg_roi_pct < 20% 零分，20%~100% 线性，≥100% 满分
+# 入库硬门槛（取代原 40% 胜率 / 100 SOL）
+SM_ENTRY_MIN_PNL_RATIO = 2.0    # 总盈亏比 >= 2
+SM_ENTRY_MIN_WIN_RATE = 0.2     # 胜率 >= 20%
+SM_ENTRY_MIN_TRADE_COUNT = 10   # 有效代币项目数 >= 10
+# 盈利分：< 20% 零分，20%~60% 线性，≥60% 满分
 SM_PROFIT_SCORE_ZERO_PCT = 20.0   # < 20% → 盈利分=0
-SM_PROFIT_SCORE_FULL_PCT = 100.0  # ≥100% → 盈利分=1
+SM_PROFIT_SCORE_FULL_PCT = 60.0   # ≥60% → 盈利分=1
+# ROI 软门槛乘数：≥200%×1，100%~200%×0.9，50%~100%×0.75
+SM_ROI_MULT_200 = 1.0
+SM_ROI_MULT_100_200 = 0.9
+SM_ROI_MULT_50_100 = 0.75
+# 体检踢出：盈亏比<2 或 胜率<20% 或 利润<=0
+SM_AUDIT_MIN_PNL_RATIO = 2.0
+SM_AUDIT_MIN_WIN_RATE = 0.2
+# 体检踢出：最近 30 天最大收益 < 50% 直接踢出（入库需 100%+，可能未结算，结算后若掉到 50% 以下则踢出）
+SM_AUDIT_KICK_MAX_ROI_30D_PCT = 50.0
+SM_MIN_HUNTER_SCORE = 0  # 入库不设最低分（满足四项门槛即可）；池子按分数排序替换
 # 胜率分：< 15% 零分，15%~35% 线性 0.5~1，≥35% 满分
 SM_WIN_RATE_ZERO_PCT = 15.0   # < 15% → 胜率分=0
 SM_WIN_RATE_FULL_PCT = 35.0   # ≥35% → 胜率分=1
@@ -198,10 +212,10 @@ MIN_LIQUIDITY_TO_FDV_RATIO = 0.03  # 流动性/市值比至少 3%
 
 # ==================== 猎手监控 (hunter_monitor) ====================
 DISCOVERY_INTERVAL = 900  # 挖掘间隔 15 分钟
-MAINTENANCE_INTERVAL = 86400  # 维护间隔 1 天
+MAINTENANCE_INTERVAL = 86400 * 10  # 维护间隔 10 天，每 10 天检查一次是否要体检
 POOL_SIZE_LIMIT = 100  # 猎手池上限
 ZOMBIE_THRESHOLD_DAYS = 15  # 多少天未交易视为僵尸
-AUDIT_EXPIRATION_DAYS = 5  # 体检有效期 (天)
+AUDIT_EXPIRATION_DAYS = 20  # 体检有效期 (天)，超过需重新体检
 ZOMBIE_THRESHOLD = 86400 * ZOMBIE_THRESHOLD_DAYS
 AUDIT_EXPIRATION = 86400 * AUDIT_EXPIRATION_DAYS
 DISCOVERY_INTERVAL_WHEN_FULL_SEC = 86400  # 池满时挖掘间隔 24 小时

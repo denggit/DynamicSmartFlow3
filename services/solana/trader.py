@@ -214,9 +214,6 @@ class SolanaTrader:
         lead = hunters[0]  # 只跟单猎手（共振时已取最高分）
         score = float(lead.get('score', 0))
         tier = get_tier_config(score)
-        if not tier:
-            logger.warning("⚠️ 猎手分数 %.0f < 60，跳过开仓", score)
-            return
 
         # 1. 获取精度
         decimals = await self._get_decimals(token_address)

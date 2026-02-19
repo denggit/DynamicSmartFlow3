@@ -9,8 +9,8 @@
               1. 热门币筛选: DexScreener 过去24小时涨幅 > 1000%
               2. 代币年龄: 放宽至 12 小时内
               3. 回溯: 最多 20 页
-              4. 初筛买家: 开盘 15 秒后买入，且在该代币至少赚取 200%（已清仓或未清仓）
-              5. 筛选后的钱包做评分入库
+              4. 初筛买家: 开盘 15 秒后买入，该代币 ROI 入库门槛 ≥100%（×1/×0.9）；体检时 30d<50% 踢出
+              5. 入库硬门槛: 盈亏比≥2、胜率≥20%、代币数≥10、总盈利>0
 """
 
 import asyncio
@@ -40,10 +40,14 @@ from config.settings import (
     SM_MIN_BUY_SOL,
     SM_MAX_BUY_SOL,
     SM_MIN_TOKEN_PROFIT_PCT,
-    SM_MIN_WIN_RATE,
-    SM_MIN_TOTAL_PROFIT,
-    SM_MIN_TRADE_COUNT,
-    SM_MIN_HUNTER_SCORE, DEX_MIN_24H_GAIN_PCT,
+    SM_ENTRY_MIN_PNL_RATIO,
+    SM_ENTRY_MIN_WIN_RATE,
+    SM_ENTRY_MIN_TRADE_COUNT,
+    SM_ROI_MULT_200,
+    SM_ROI_MULT_100_200,
+    SM_ROI_MULT_50_100,
+    SM_MIN_HUNTER_SCORE,
+    DEX_MIN_24H_GAIN_PCT,
     WALLET_BLACKLIST_FILE,
     WALLET_BLACKLIST_MIN_SCORE,
     WALLET_BLACKLIST_LOSS_USDC,
@@ -98,6 +102,13 @@ def is_real_trade_for_address(tx: dict, address: str) -> bool:
     return False
 
 
+def _get_tx_timestamp(tx: dict) -> float:
+    """
+    Helius 解析交易可能返回 timestamp 或 blockTime，统一取 Unix 时间戳（秒）。
+    """
+    return tx.get("timestamp") or tx.get("blockTime") or 0
+
+
 def _is_frequent_trader_by_real_txs(txs: list, address: str) -> bool:
     """
     根据「真实交易」时间戳计算平均间隔；只统计该地址参与的真实买卖。
@@ -109,8 +120,8 @@ def _is_frequent_trader_by_real_txs(txs: list, address: str) -> bool:
             break
         if not is_real_trade_for_address(tx, address):
             continue
-        ts = tx.get("timestamp")
-        if ts is not None:
+        ts = _get_tx_timestamp(tx)
+        if ts > 0:
             real_ts.append(ts)
     if len(real_ts) < 2:
         return False
@@ -145,7 +156,7 @@ class TransactionParser:
         解析交易，返回 (sol_change, token_changes, timestamp)。
         sol_change 含 native SOL + WSOL；若传入 usdc_price_sol，USDC 流动亦折算为 SOL 等价并入 sol_change。
         """
-        timestamp = tx.get('timestamp', 0)
+        timestamp = int(_get_tx_timestamp(tx))
         native_sol_change = 0.0
         wsol_change = 0.0
         usdc_change = 0.0
@@ -365,11 +376,40 @@ class SmartMoneySearcher:
                 logger.exception("fetch_parsed_transactions 批量请求异常")
         return all_txs
 
+    def _build_projects_from_txs(
+        self, txs: List[dict], exclude_token: str, usdc_price: float, hunter_address: str
+    ) -> dict:
+        """从交易列表构建 projects {mint: {buy_sol, sell_sol, tokens}}，供统计用。"""
+        parser = TransactionParser(hunter_address)
+        calc = TokenAttributionCalculator()
+        projects = defaultdict(lambda: {"buy_sol": 0.0, "sell_sol": 0.0, "tokens": 0.0})
+        txs = sorted(txs, key=lambda x: _get_tx_timestamp(x))
+        for tx in txs:
+            try:
+                sol_change, token_changes, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price)
+                if not token_changes:
+                    continue
+                buy_attrs, sell_attrs = calc.calculate_attribution(sol_change, token_changes)
+                for mint, delta in token_changes.items():
+                    if exclude_token and mint == exclude_token:
+                        continue
+                    if abs(delta) < 1e-9:
+                        continue
+                    projects[mint]["tokens"] += delta
+                    if mint in buy_attrs:
+                        projects[mint]["buy_sol"] += buy_attrs[mint]
+                    if mint in sell_attrs:
+                        projects[mint]["sell_sol"] += sell_attrs[mint]
+            except Exception:
+                logger.debug("解析单笔交易跳过", exc_info=True)
+        return projects
+
     async def analyze_hunter_performance(
         self, client, hunter_address, exclude_token=None, pre_fetched_txs: List[dict] | None = None
     ):
         """
         体检猎手历史表现。若传入 pre_fetched_txs 则复用，避免重复拉取（节省 Helius credit）。
+        返回包含 max_roi_30d, max_roi_60d（仅统计窗口内项目）。
         """
         if pre_fetched_txs is not None:
             txs = pre_fetched_txs
@@ -389,25 +429,7 @@ class SmartMoneySearcher:
             return None
 
         usdc_price = await self._get_usdc_price_sol(client) if client else None
-        parser = TransactionParser(hunter_address)
-        calc = TokenAttributionCalculator()
-        projects = defaultdict(lambda: {"buy_sol": 0.0, "sell_sol": 0.0, "tokens": 0.0})
-
-        txs.sort(key=lambda x: x.get('timestamp', 0))
-        for tx in txs:
-            try:
-                sol_change, token_changes, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price)
-                if not token_changes: continue
-                buy_attrs, sell_attrs = calc.calculate_attribution(sol_change, token_changes)
-                for mint, delta in token_changes.items():
-                    if exclude_token and mint == exclude_token: continue
-                    if abs(delta) < 1e-9: continue
-                    projects[mint]["tokens"] += delta
-                    if mint in buy_attrs: projects[mint]["buy_sol"] += buy_attrs[mint]
-                    if mint in sell_attrs: projects[mint]["sell_sol"] += sell_attrs[mint]
-            except Exception:
-                logger.debug("解析单笔交易跳过", exc_info=True)
-                continue
+        projects = self._build_projects_from_txs(txs, exclude_token, usdc_price, hunter_address)
 
         valid_projects = []
         for mint, data in projects.items():
@@ -427,12 +449,35 @@ class SmartMoneySearcher:
         total_losses = sum(abs(p["profit"]) for p in valid_projects if p["profit"] < 0)
         pnl_ratio = total_wins / total_losses if total_losses > 0 else (float("inf") if total_wins > 0 else 0.0)
 
+        # 最近 30/60 天最大收益：按时间过滤 tx 后重建 projects
+        now = time.time()
+        max_roi_30d = 0.0
+        max_roi_60d = 0.0
+        for max_age_sec in (30 * 86400, 60 * 86400):
+            txs_window = [tx for tx in txs if (now - _get_tx_timestamp(tx)) <= max_age_sec]
+            if not txs_window:
+                continue
+            proj = self._build_projects_from_txs(txs_window, exclude_token, usdc_price, hunter_address)
+            rois = []
+            for _, data in proj.items():
+                if data["buy_sol"] > 0.05:
+                    net = data["sell_sol"] - data["buy_sol"]
+                    rois.append((net / data["buy_sol"]) * 100)
+            if rois:
+                val = max(rois)
+                if max_age_sec == 30 * 86400:
+                    max_roi_30d = val
+                else:
+                    max_roi_60d = val
+
         return {
             "win_rate": win_rate,
             "total_profit": total_profit,
             "avg_roi_pct": avg_roi_pct,
             "pnl_ratio": pnl_ratio,
             "count": len(valid_projects),
+            "max_roi_30d": max_roi_30d,
+            "max_roi_60d": max_roi_60d,
         }
 
     async def _get_usdc_price_sol(self, client) -> float | None:
@@ -509,7 +554,7 @@ class SmartMoneySearcher:
         parser = TransactionParser(hunter_address)
         calc = TokenAttributionCalculator()
         buy_sol, sell_sol, tokens_held = 0.0, 0.0, 0.0
-        txs.sort(key=lambda x: x.get("timestamp", 0))
+        txs.sort(key=lambda x: _get_tx_timestamp(x))
         for tx in txs:
             try:
                 sol_change, token_changes, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price)
@@ -638,7 +683,7 @@ class SmartMoneySearcher:
 
             wsol_mint = "So11111111111111111111111111111111111111112"
             for tx in txs:
-                block_time = tx.get('timestamp', 0)
+                block_time = _get_tx_timestamp(tx)
                 delay = block_time - start_time
                 if delay < self.min_delay_sec: continue
 
@@ -689,7 +734,12 @@ class SmartMoneySearcher:
                     await asyncio.sleep(0.3)
                     continue
                 pnl_passed_count += 1
-                logger.debug(f"    通过 200%% 收益过滤: {addr[:12]}.. ROI={roi:.0f}%%")
+                # 入库时用该代币 ROI 乘数：≥200%×1，100%~200%×0.9（入库门槛 100%+，故无 50~100%）
+                if roi >= 200:
+                    roi_mult = SM_ROI_MULT_200
+                else:
+                    roi_mult = SM_ROI_MULT_100_200
+                logger.debug(f"    通过收益过滤: {addr[:12]}.. ROI={roi:.0f}%% ×{roi_mult}")
 
                 # 复用已拉取的 txs，不再重复请求 Helius
                 stats = await self.analyze_hunter_performance(
@@ -698,62 +748,54 @@ class SmartMoneySearcher:
 
                 if stats:
                     score_result = compute_hunter_score(stats)
-                    final_score = score_result["score"]
+                    base_score = score_result["score"]
+                    final_score = round(base_score * roi_mult, 1)
 
-                    is_qualified = False
+                    # 新入库硬门槛：pnl_ratio>=2, wr>=20%, count>=10, profit>0
                     trade_count = stats.get("count", 0)
-                    if stats["total_profit"] > 0.1 and trade_count >= SM_MIN_TRADE_COUNT:
-                        if stats["win_rate"] >= SM_MIN_WIN_RATE:
-                            is_qualified = True
-                        elif stats["total_profit"] >= SM_MIN_TOTAL_PROFIT:
-                            is_qualified = True
+                    pnl_ok = stats.get("pnl_ratio", 0) >= SM_ENTRY_MIN_PNL_RATIO
+                    wr_ok = stats["win_rate"] >= SM_ENTRY_MIN_WIN_RATE
+                    count_ok = trade_count >= SM_ENTRY_MIN_TRADE_COUNT
+                    profit_ok = stats["total_profit"] > 0
+                    is_qualified = pnl_ok and wr_ok and count_ok and profit_ok
 
-                    # 劣质猎手加入黑名单，下次直接跳过以节省 API
+                    # 劣质猎手加入黑名单
                     loss_usdc = -stats["total_profit"] * USDC_PER_SOL if stats["total_profit"] < 0 else 0
-                    if (final_score < WALLET_BLACKLIST_MIN_SCORE or
+                    if (base_score < WALLET_BLACKLIST_MIN_SCORE or
                             (loss_usdc >= WALLET_BLACKLIST_LOSS_USDC and stats["win_rate"] < WALLET_BLACKLIST_WIN_RATE)):
                         self._add_to_wallet_blacklist(addr)
 
-                    will_add = is_qualified and final_score >= SM_MIN_HUNTER_SCORE
-                    if will_add:
+                    if is_qualified:
                         avg_roi = stats.get("avg_roi_pct", 0.0)
+                        # 入库时该代币 ROI 作为 max_roi_30d 初始值
+                        max_roi_30d = max(roi, stats.get("max_roi_30d", 0))
                         candidate.update({
                             "score": final_score,
                             "win_rate": f"{stats['win_rate']:.1%}",
                             "total_profit": f"{stats['total_profit']:.2f} SOL",
                             "avg_roi_pct": f"{avg_roi:.1f}%",
                             "scores_detail": score_result["scores_detail"],
+                            "max_roi_30d": max_roi_30d,
                         })
                         verified_hunters.append(candidate)
                         logger.info(
-                            f"    ✅ 锁定猎手 {addr}.. | 利润: {candidate['total_profit']} | 评分: {final_score}")
+                            f"    ✅ 锁定猎手 {addr}.. | 利润: {candidate['total_profit']} | 评分: {final_score} (×{roi_mult})")
                     else:
-                        # 落榜：仅当距离要求 80% 以内时才打印（避免刷屏）
                         NEAR_THRESHOLD = 0.8
                         reasons = []
-                        if final_score < SM_MIN_HUNTER_SCORE and final_score >= SM_MIN_HUNTER_SCORE * NEAR_THRESHOLD:
-                            reasons.append(f"评分{final_score:.1f}分<{SM_MIN_HUNTER_SCORE}分")
-                        if stats["total_profit"] <= 0.1 and stats["total_profit"] >= 0.1 * NEAR_THRESHOLD:
-                            reasons.append(f"总利润{stats['total_profit']:.2f}SOL<=0.1 SOL")
-                        if trade_count < SM_MIN_TRADE_COUNT and trade_count >= SM_MIN_TRADE_COUNT * NEAR_THRESHOLD:
-                            reasons.append(f"交易笔数{trade_count}笔<{SM_MIN_TRADE_COUNT}笔")
-                        wr_ok = stats["win_rate"] >= SM_MIN_WIN_RATE
-                        profit_ok = stats["total_profit"] >= SM_MIN_TOTAL_PROFIT
-                        if not wr_ok and not profit_ok:
-                            wr_close = stats["win_rate"] >= SM_MIN_WIN_RATE * NEAR_THRESHOLD
-                            profit_close = stats["total_profit"] >= SM_MIN_TOTAL_PROFIT * NEAR_THRESHOLD
-                            if wr_close or profit_close:
-                                wr_pct = stats["win_rate"] * 100
-                                reasons.append(f"胜率{wr_pct:.1f}%<{SM_MIN_WIN_RATE*100:.0f}%且总利润{stats['total_profit']:.2f}SOL<{SM_MIN_TOTAL_PROFIT}SOL")
+                        if not pnl_ok and stats.get("pnl_ratio", 0) >= SM_ENTRY_MIN_PNL_RATIO * NEAR_THRESHOLD:
+                            reasons.append(f"盈亏比{stats.get('pnl_ratio', 0):.2f}<{SM_ENTRY_MIN_PNL_RATIO}")
+                        if not wr_ok and stats["win_rate"] >= SM_ENTRY_MIN_WIN_RATE * NEAR_THRESHOLD:
+                            reasons.append(f"胜率{stats['win_rate']*100:.1f}%<{SM_ENTRY_MIN_WIN_RATE*100:.0f}%")
+                        if not count_ok and trade_count >= SM_ENTRY_MIN_TRADE_COUNT * NEAR_THRESHOLD:
+                            reasons.append(f"交易笔数{trade_count}<{SM_ENTRY_MIN_TRADE_COUNT}")
+                        if not profit_ok and stats["total_profit"] > -0.5:
+                            reasons.append("总盈利非正")
                         if reasons:
-                            logger.info(
-                                "[落榜钱包地址] %s | 原因: %s",
-                                addr,
-                                " | ".join(reasons),
-                            )
+                            logger.info("[落榜钱包地址] %s | 原因: %s", addr, " | ".join(reasons))
                 await asyncio.sleep(0.5)
 
-            logger.info(f"  [收益+评分] 初筛 {total} → 符合PnL≥{SM_MIN_TOKEN_PROFIT_PCT:.0f}%: {pnl_passed_count} 个 → 入库 {len(verified_hunters)} 个")
+            logger.info(f"  [收益+评分] 初筛 {total} → ROI≥{SM_MIN_TOKEN_PROFIT_PCT:.0f}%: {pnl_passed_count} 个 → 入库 {len(verified_hunters)} 个")
             self._save_scanned_token(token_address)
             return verified_hunters
 
@@ -779,7 +821,7 @@ class SmartMoneySearcher:
                 await asyncio.sleep(1)
         all_hunters.sort(key=lambda x: x.get('score', 0), reverse=True)
         # 只保留 60 分及以上猎手，与猎手池入库规则一致
-        return [h for h in all_hunters if h.get('score', 0) >= SM_MIN_HUNTER_SCORE]
+        return all_hunters
 
 
 if __name__ == "__main__":

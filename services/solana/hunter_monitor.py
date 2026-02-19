@@ -6,7 +6,7 @@
 @Description: 猎手监控核心模块 (Hunter Monitor V3 - 低功耗版)
               1. [线程A] 挖掘: 定时补充新猎手
               2. [线程B] 监控: 实时监听交易 + 更新活跃时间 + 触发共振
-              3. [线程C] 维护: 每日巡检，仅对超过 15 天未体检的猎手重算分数
+              3. [线程C] 维护: 每 10 天检查，对超过 20 天未体检的猎手重算分数
 """
 
 import asyncio
@@ -39,7 +39,15 @@ from config.settings import (
     WALLET_WS_RESUBSCRIBE_SEC,
     HOLDINGS_TTL_SEC,
     HOLDINGS_PRUNE_INTERVAL_SEC,
-    SM_MIN_HUNTER_SCORE,
+    SM_ENTRY_MIN_PNL_RATIO,
+    SM_ENTRY_MIN_WIN_RATE,
+    SM_ENTRY_MIN_TRADE_COUNT,
+    SM_AUDIT_MIN_PNL_RATIO,
+    SM_AUDIT_MIN_WIN_RATE,
+    SM_AUDIT_KICK_MAX_ROI_30D_PCT,
+    SM_ROI_MULT_200,
+    SM_ROI_MULT_100_200,
+    SM_ROI_MULT_50_100,
 )
 from services.dexscreener.dex_scanner import DexScanner
 from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
@@ -51,6 +59,41 @@ logger = get_logger(__name__)
 
 # 猎手数据文件绝对路径（邮件附件用）
 HUNTER_JSON_PATH = str(BASE_DIR / "data" / "hunters.json")
+
+
+def _roi_multiplier(roi_pct: float) -> float:
+    """
+    体检时用「最近 30 天最大收益率」给评分乘数：
+    ≥200%×1，100%~200%×0.9，50~100%×0.75
+    （<50% 已在体检前直接踢出，不会调用此处）
+    """
+    if roi_pct >= 200:
+        return SM_ROI_MULT_200
+    if roi_pct >= 100:
+        return SM_ROI_MULT_100_200
+    if roi_pct >= 50:
+        return SM_ROI_MULT_50_100
+    return 0.75
+
+
+def _apply_audit_update(info: dict, new_stats: dict, now: float, addr: str) -> None:
+    """体检通过：用最近 30 天最大收益率 max_roi_30d 做评分乘数后更新猎手信息"""
+    score_result = compute_hunter_score(new_stats)
+    base_score = score_result["score"]
+    max_roi_30d = new_stats.get("max_roi_30d", 0)
+    mult = _roi_multiplier(max_roi_30d)
+    final_score = round(base_score * mult, 1)
+    info["total_profit"] = f"{new_stats['total_profit']:.2f} SOL"
+    info["win_rate"] = f"{new_stats['win_rate']:.1%}"
+    info["avg_roi_pct"] = f"{new_stats.get('avg_roi_pct', 0):.1f}%"
+    info["score"] = final_score
+    info["scores_detail"] = score_result["scores_detail"]
+    info["max_roi_30d"] = max_roi_30d
+    info["last_audit"] = now
+    if score_result["score"] == 0:
+        logger.warning("📉 猎手 %s 表现恶化 (负盈利)，分数归零", addr[:12])
+    else:
+        logger.info("✅ 猎手 %s 体检完成 | 评分: %.1f (×%.2f) | %s", addr[:12], final_score, mult, score_result["scores_detail"])
 # 猎手交易单独写入 monitor.log，便于查看时间与交易币种
 trade_logger = get_logger("trade")
 
@@ -128,11 +171,9 @@ class HunterStorage:
             del self.hunters[z]
         removed_zombie = len(zombies)
 
-        # 2. 处理新猎手（只入库 60 分以上）
+        # 2. 处理新猎手（sm_searcher 已过滤，满足四项门槛即可）
         if new_hunters:
             for h in new_hunters:
-                if h.get('score', 0) < SM_MIN_HUNTER_SCORE:
-                    continue
                 addr = h['address']
                 h['last_active'] = h.get('last_active', now)
                 h['last_audit'] = h.get('last_audit', now)  # 新人入库算作刚体检
@@ -518,17 +559,14 @@ class HunterMonitorController:
         holders = self.active_holdings[mint]
         if not holders: return
 
-        # 只跟最早交易该 token 的猎手，且其分数 ≥ 60；其余猎手不跟
+        # 只跟最早交易该 token 的猎手，其余猎手不跟（分数决定跟仓额度，无最低分限制）
         first_buyer = self._first_buyer.get(mint)
         if not first_buyer or first_buyer not in holders:
             trade_logger.debug("共振跳过: %s 无首买者", mint[:8])
             return
-        lead_score = self.storage.get_hunter_score(first_buyer)
-        if lead_score < SM_MIN_HUNTER_SCORE:
-            trade_logger.debug("共振跳过: %s 首买者 %.0f 分 < %d", mint[:8], lead_score, SM_MIN_HUNTER_SCORE)
-            return
 
         lead_addr = first_buyer
+        lead_score = self.storage.get_hunter_score(first_buyer)
         if True:  # 单猎手共振条件：有一个 ≥60 分猎手持仓即可
             if self.position_check and self.position_check(mint):
                 return
@@ -568,7 +606,7 @@ class HunterMonitorController:
     async def run_immediate_audit(self) -> None:
         """
         启动时可选执行：立即对 data/hunters.json 中所有猎手做一次审计体检。
-        60 分以下剔除，其余用最新数据更新。
+        体检规则：pnl/wr/profit 未达标踢出；30 天最大收益 < 50% 直接踢出；其余按 max_roi_30d 加权更新。
         """
         from httpx import AsyncClient
 
@@ -578,7 +616,7 @@ class HunterMonitorController:
             return
 
         logger.info("🩺 [立即审计] 开始对 %d 名猎手逐一体检...", len(current))
-        removed = []
+        removed = 0
         updated = 0
 
         async with AsyncClient() as client:
@@ -589,29 +627,31 @@ class HunterMonitorController:
                     new_stats = await self.sm_searcher.analyze_hunter_performance(client, addr)
                     if new_stats is None:
                         continue
-                    score_result = compute_hunter_score(new_stats)
-                    if score_result["score"] < SM_MIN_HUNTER_SCORE:
+                    pnl_ok = new_stats.get("pnl_ratio", 0) >= SM_AUDIT_MIN_PNL_RATIO
+                    wr_ok = new_stats["win_rate"] >= SM_AUDIT_MIN_WIN_RATE
+                    profit_ok = new_stats["total_profit"] > 0
+                    max_roi_30d = new_stats.get("max_roi_30d", 0)
+
+                    if not (pnl_ok and wr_ok and profit_ok):
                         del self.storage.hunters[addr]
-                        removed.append((addr, score_result["score"]))
-                        logger.info("🚫 剔除低分猎手 %s.. (分:%.1f < %d)", addr[:12], score_result["score"], SM_MIN_HUNTER_SCORE)
+                        removed += 1
+                        logger.info("🚫 剔除 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
+                    elif max_roi_30d < SM_AUDIT_KICK_MAX_ROI_30D_PCT:
+                        del self.storage.hunters[addr]
+                        removed += 1
+                        logger.info("🚫 剔除 %s.. (30天最大收益 %.0f%% < 50%%)", addr[:12], max_roi_30d)
                     else:
-                        info["total_profit"] = f"{new_stats['total_profit']:.2f} SOL"
-                        info["win_rate"] = f"{new_stats['win_rate']:.1%}"
-                        info["avg_roi_pct"] = f"{new_stats.get('avg_roi_pct', 0):.1f}%"
-                        info["score"] = score_result["score"]
-                        info["scores_detail"] = score_result["scores_detail"]
-                        info["last_audit"] = time.time()
+                        _apply_audit_update(info, new_stats, time.time(), addr)
                         updated += 1
-                        logger.info("✅ %s.. 体检完成 | 评分: %.1f | %s", addr[:12], score_result["score"], score_result["scores_detail"])
                 except Exception:
                     logger.exception("审计猎手 %s 异常，跳过", addr[:12])
                 await asyncio.sleep(2)
 
         self.storage.save_hunters()
-        logger.info("🩺 [立即审计] 完成 | 剔除 %d 名 | 更新 %d 名", len(removed), updated)
-        if len(removed) > 0 or updated > 0:
+        logger.info("🩺 [立即审计] 完成 | 剔除 %d 名 | 更新 %d 名", removed, updated)
+        if removed > 0 or updated > 0:
             notification.send_hunter_changes_email(
-                removed=len(removed),
+                removed=removed,
                 updated=updated,
                 total_count=len(self.storage.hunters),
                 attachment_path=HUNTER_JSON_PATH,
@@ -622,14 +662,14 @@ class HunterMonitorController:
         """
         [优化] 每日巡检 + 15天体检逻辑
         """
-        logger.info("🛠️ [线程3] 维护线程启动 (每日运行)")
+        logger.info("🛠️ [线程3] 维护线程启动 (每 %d 天检查体检)", MAINTENANCE_INTERVAL // 86400)
 
         # 启动时先睡一会，错开高峰，或者直接运行一次也行
         # 这里选择立即运行第一次，然后按天循环
 
         while True:
             try:
-                logger.info("🏥 开始每日例行维护...")
+                logger.info("🏥 开始例行维护（检查体检、清理僵尸）...")
                 now = time.time()
 
                 # 1. 遍历检查是否需要体检
@@ -638,19 +678,8 @@ class HunterMonitorController:
 
                 from httpx import AsyncClient
                 async with AsyncClient() as client:
-                    # 0. 低分剔除：60 分以下全部踢出，以后只跟单 60 分以上
-                    low_score_removed = []
-                    for addr, info in list(self.storage.hunters.items()):
-                        if info.get('score', 0) < SM_MIN_HUNTER_SCORE:
-                            low_score_removed.append((addr, info.get('score', 0)))
-                    for addr, score in low_score_removed:
-                        if addr in self.storage.hunters:
-                            del self.storage.hunters[addr]
-                            logger.info("🚫 踢出低分猎手 %s.. (分:%.0f < %d)", addr[:12], score, SM_MIN_HUNTER_SCORE)
-                    if low_score_removed:
-                        self.storage.save_hunters()
-                        current_hunters = list(self.storage.hunters.items())
-
+                    # 0. 体检剔除：pnl_ratio<2 或 wr<20% 或 profit<=0 或 30天最大收益<50%
+                    audit_removed = []
                     # 1. 频繁交易剔除：最近 100 笔平均间隔 < 5 分钟的踢出猎手池
                     frequent_removed = []
                     for addr, _ in current_hunters:
@@ -663,31 +692,34 @@ class HunterMonitorController:
                     if frequent_removed:
                         current_hunters = list(self.storage.hunters.items())
 
+                    # 合并 audit_removed 与 frequent_removed 供后续统计；audit 时动态踢人
                     for addr, info in current_hunters:
                         last_audit = info.get('last_audit', 0)
 
-                        # 核心逻辑：超过 15 天才重新打分
+                        # 核心逻辑：超过 20 天才重新打分
                         if (now - last_audit) > AUDIT_EXPIRATION:
-                            logger.info(f"🩺 猎手 {addr} 超过15天未体检，正在重新审计...")
+                            logger.info(f"🩺 猎手 {addr} 超过{AUDIT_EXPIRATION // 86400}天未体检，正在重新审计...")
 
                             # 重新跑一遍分析
                             new_stats = await self.sm_searcher.analyze_hunter_performance(client, addr)
                             if new_stats:
-                                # 更新核心数据
-                                info['total_profit'] = f"{new_stats['total_profit']:.2f} SOL"
-                                info['win_rate'] = f"{new_stats['win_rate']:.1%}"
-                                info['avg_roi_pct'] = f"{new_stats.get('avg_roi_pct', 0):.1f}%"
-                                info['last_audit'] = now  # 更新体检时间戳
+                                pnl_ok = new_stats.get("pnl_ratio", 0) >= SM_AUDIT_MIN_PNL_RATIO
+                                wr_ok = new_stats["win_rate"] >= SM_AUDIT_MIN_WIN_RATE
+                                profit_ok = new_stats["total_profit"] > 0
+                                max_roi_30d = new_stats.get("max_roi_30d", 0)
 
-                                # 统一调用评分模块（与挖掘阶段同一逻辑）
-                                score_result = compute_hunter_score(new_stats)
-                                info['score'] = score_result['score']
-                                info['scores_detail'] = score_result['scores_detail']
-
-                                if score_result['score'] == 0:
-                                    logger.warning(f"📉 猎手 {addr} 表现恶化 (负盈利)，分数归零")
+                                if not (pnl_ok and wr_ok and profit_ok):
+                                    if addr in self.storage.hunters:
+                                        del self.storage.hunters[addr]
+                                        audit_removed.append(addr)
+                                        logger.info("🚫 体检踢出 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
+                                elif max_roi_30d < SM_AUDIT_KICK_MAX_ROI_30D_PCT:
+                                    if addr in self.storage.hunters:
+                                        del self.storage.hunters[addr]
+                                        audit_removed.append(addr)
+                                        logger.info("🚫 体检踢出 %s.. (30天最大收益 %.0f%% < 50%%)", addr[:12], max_roi_30d)
                                 else:
-                                    logger.info(f"✅ 猎手 {addr} 体检完成 | 评分: {score_result['score']} | {score_result['scores_detail']}")
+                                    _apply_audit_update(info, new_stats, now, addr)
 
                             needs_audit_count += 1
                             await asyncio.sleep(2)  # 慢慢跑，不着急
@@ -697,7 +729,7 @@ class HunterMonitorController:
 
                 # 2. 清理僵尸 & 存盘 (每次维护都做一次清理)
                 delta = self.storage.prune_and_update([])
-                removed_total = len(low_score_removed) + len(frequent_removed) + delta["removed_zombie"]
+                removed_total = len(audit_removed) + len(frequent_removed) + delta["removed_zombie"]
                 if removed_total > 0 or delta["replaced"] > 0 or needs_audit_count > 0:
                     notification.send_hunter_changes_email(
                         removed=removed_total,
@@ -711,8 +743,8 @@ class HunterMonitorController:
             except Exception:
                 logger.exception("❌ 维护失败")
 
-            # 每天睡一次
-            logger.info(f"💤 维护线程休眠 1 天...")
+            # 每 10 天检查一次是否要体检
+            logger.info(f"💤 维护线程休眠 {MAINTENANCE_INTERVAL // 86400} 天...")
             await asyncio.sleep(MAINTENANCE_INTERVAL)
 
 
