@@ -19,7 +19,7 @@ MAX_ACCEPTABLE_BUY_TAX_PCT = 25.0
 # RugCheck 风险分超过此值拒绝
 MAX_SAFE_SCORE = 2000
 # 池子流动性最低门槛（防撤池）：低于此值坚决不买
-MIN_LIQUIDITY_USD = 5000.0
+MIN_LIQUIDITY_USD = 10000.0
 # 防老鼠仓：排除 LP 后，第 2~10 名合计持仓不得超过「剩余供应」的此比例
 MAX_TOP2_10_COMBINED_PCT = 0.30
 # 防老鼠仓：排除 LP 后，单一地址不得超过「剩余供应」的此比例
