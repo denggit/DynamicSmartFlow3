@@ -112,7 +112,7 @@ TRADING_SCORE_MULTIPLIER = 0.001  # 总分 * 倍数 = 买入SOL
 HUNTER_ADD_THRESHOLD_SOL = 1.0
 
 # 止损：亏损超过此比例直接全仓清仓
-STOP_LOSS_PCT = 0.5  # 亏损 50% 止损
+STOP_LOSS_PCT = 0.3  # 亏损 30% 止损
 
 # 卖出精度保护：全仓/接近全仓卖出时仅卖 99.9%，避免浮点转 int 时多出 1 wei 导致链上失败
 SELL_BUFFER = 0.999  # 留 0.1% 缓冲，防止 rounding overflow
@@ -132,7 +132,7 @@ MIN_SELL_RATIO = 0.3  # 跟随卖出时我方最低减仓比例 (如文档: 猎�
 FOLLOW_SELL_THRESHOLD = 0.05  # 猎手卖出比例低于此不跟 (微调忽略，文档: 大于5%才跟)
 
 # 系统循环配置
-PNL_CHECK_INTERVAL = 5  # 每 5 秒检查一次价格止盈
+PNL_CHECK_INTERVAL = 5  # 每 5 秒检查一次止盈/止损
 
 # 钱包配置 (请替换为真实私钥)
 SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")

@@ -414,7 +414,7 @@ class SolanaTrader:
         self._save_state_safe()
 
     async def check_pnl_and_stop_profit(self, token_address: str, current_price_ui: float):
-        """止盈与止损逻辑：亏损超 50% 全仓止损，盈利达标则分批止盈。"""
+        """止盈与止损逻辑：亏损超 30% 全仓止损，盈利达标则分批止盈。"""
         if not self.keypair: return
         pos = self.positions.get(token_address)
         if not pos or pos.total_tokens <= 0: return
@@ -468,7 +468,7 @@ class SolanaTrader:
                     "sol_spent": 0.0,
                     "sol_received": sol_received,
                     "token_amount": sell_amount,
-                    "note": "止损50%",
+                    "note": f"止损{STOP_LOSS_PCT*100:.0f}%",
                     "pnl_sol": pnl_sol,
                 })
                 self._emit_position_closed(token_address, pos)
