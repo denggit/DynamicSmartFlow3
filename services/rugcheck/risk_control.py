@@ -3,7 +3,8 @@
 """
 @Description: 风控模块 - 早期跟单场景下主要避免：貔貅/蜜罐、不能卖、一买入就高税导致大额亏损、
               铸币权/冻结权未放弃（Mint Authority、Freeze Authority 必须为 Renounced/None）、
-              老鼠仓（Top2-10 控盘过高）、撤池风险（池子 < $5k）、FDV 过高追高、流动性/市值比过低（虚胖控盘）。
+              老鼠仓（Top2-10 控盘过高）、撤池风险（池子 < $5k）、FDV 过高追高、流动性/市值比过低（虚胖控盘）、
+              LP 未充分锁仓（< 70%）、三无盘（无官网/Twitter/Telegram 等社交绑定）。
 """
 import asyncio
 from typing import Optional, Tuple
@@ -14,6 +15,7 @@ from config.settings import (
     MAX_ACCEPTABLE_BUY_TAX_PCT,
     MAX_SAFE_SCORE,
     MIN_LIQUIDITY_USD,
+    MIN_LP_LOCKED_PCT,
     MAX_TOP2_10_COMBINED_PCT,
     MAX_SINGLE_HOLDER_PCT,
     MAX_ENTRY_FDV_USD,
@@ -141,7 +143,34 @@ async def check_is_safe_token(token_mint: str) -> bool:
             logger.warning("⚠️ 买入税过高 (%.1f%%): %s", buy_tax, token_mint[:16] + "..")
             return False
 
-        # 5. 池子大小（防撤池）+ FDV + 流动性/市值比
+        # 5. LP 锁仓检查：流动性最大的池子至少 70% 锁仓或销毁，否则拒跟
+        markets = data.get("markets") or []
+        if markets:
+            main_market = markets[0]
+            lp_locked_pct = _parse_lp_locked_pct(main_market.get("lpLockedPct"))
+            if lp_locked_pct is not None and lp_locked_pct < MIN_LP_LOCKED_PCT:
+                logger.warning(
+                    "⚠️ 流动性未充分锁定 (仅 %.1f%% < %.0f%%): %s",
+                    lp_locked_pct, MIN_LP_LOCKED_PCT, token_mint[:16] + ".."
+                )
+                return False
+
+        # 6. 三无盘检查：无 Twitter/X、无 Telegram 的土狗视为春 PVP 割草盘，拒绝
+        links = token_meta.get("links") or []
+        has_twitter = any(
+            "twitter.com" in (str(link.get("url") or "")).lower()
+            or "x.com" in (str(link.get("url") or "")).lower()
+            for link in links if isinstance(link, dict)
+        )
+        has_tg = any(
+            "t.me" in (str(link.get("url") or "")).lower()
+            for link in links if isinstance(link, dict)
+        )
+        if not (has_twitter or has_tg):
+            logger.warning("⚠️ 缺乏社交媒体绑定（三无盘），拒绝入场: %s", token_mint[:16] + "..")
+            return False
+
+        # 7. 池子大小（防撤池）+ FDV + 流动性/市值比
         has_pool, liq_usd, fdv_usd = await check_token_liquidity(token_mint)
         if not has_pool or liq_usd < MIN_LIQUIDITY_USD:
             logger.warning("⚠️ 池子过小 (Liquidity $%.0f < $%.0f): %s", liq_usd, MIN_LIQUIDITY_USD, token_mint[:16] + "..")
@@ -156,7 +185,7 @@ async def check_is_safe_token(token_mint: str) -> bool:
             )
             return False
 
-        # 6. Top 10 持仓（防老鼠仓）：排除 LP 后，第 2~10 名不得控盘过高
+        # 9. Top 10 持仓（防老鼠仓）：排除 LP 后，第 2~10 名不得控盘过高
         if not _check_top_holders_safe(data, token_mint):
             return False
 
@@ -216,6 +245,24 @@ def _check_top_holders_safe(data: dict, token_mint: str) -> bool:
             )
             return False
     return True
+
+
+def _parse_lp_locked_pct(v) -> Optional[float]:
+    """
+    从 API 返回的 lpLockedPct 字段解析出百分比数字。
+    支持 int、float、字符串（如 "85.5"、"85.5%"）。
+    无法解析返回 None（调用方将跳过 LP 锁仓检查）。
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(str(v).replace("%", "").strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _parse_tax(v):

@@ -26,7 +26,6 @@ import httpx
 
 from config.settings import (
     BASE_DIR,
-    helius_key_pool,
     MIN_TOKEN_AGE_SEC,
     MAX_TOKEN_AGE_SEC,
     MAX_BACKTRACK_PAGES,
@@ -38,7 +37,7 @@ from config.settings import (
     SM_MIN_DELAY_SEC,
     SM_MAX_DELAY_SEC,
     SM_AUDIT_TX_LIMIT,
-    SM_FREQUENCY_CHECK_TX_LIMIT,
+    SM_LP_CHECK_TX_LIMIT,
     SM_MIN_BUY_SOL,
     SM_MAX_BUY_SOL,
     SM_MIN_TOKEN_PROFIT_PCT,
@@ -55,6 +54,7 @@ from config.settings import (
     WALLET_BLACKLIST_WIN_RATE,
     USDC_PER_SOL,
 )
+from services.helius import helius_client
 from utils.logger import get_logger
 from utils.hunter_scoring import compute_hunter_score
 
@@ -108,6 +108,73 @@ def _get_tx_timestamp(tx: dict) -> float:
     Helius 解析交易可能返回 timestamp 或 blockTime，统一取 Unix 时间戳（秒）。
     """
     return tx.get("timestamp") or tx.get("blockTime") or 0
+
+
+def tx_is_remove_liquidity(tx: dict) -> bool:
+    """
+    判断该笔交易是否为 REMOVE LIQUIDITY（移除流动性）。
+    Helius 解析交易在 description 或 type 中标注此类操作。
+    老鼠仓：LP 先加流动性，代币拉盘后移除流动性砸盘，散户接盘。
+    """
+    desc = (tx.get("description") or "").upper()
+    tx_type = (tx.get("type") or "").upper()
+    # 兼容 Helius 常见格式：description 含 "REMOVE LIQUIDITY" / "Remove Liquidity"
+    if "REMOVE" in desc and "LIQUIDITY" in desc:
+        return True
+    if tx_type in ("REMOVE_LIQUIDITY", "REMOVE LIQUIDITY"):
+        return True
+    return False
+
+
+def tx_is_any_lp_behavior(tx: dict) -> bool:
+    """
+    判断该笔交易是否包含任何 LP 行为（加池/撤池等）。
+    只要涉及 ADD LIQUIDITY 或 REMOVE LIQUIDITY 即视为 LP 参与，直接淘汰该猎手。
+    """
+    desc = (tx.get("description") or "").upper()
+    tx_type = (tx.get("type") or "").upper()
+    if "LIQUIDITY" in desc:
+        return True
+    if tx_type in ("ADD_LIQUIDITY", "ADD LIQUIDITY", "REMOVE_LIQUIDITY", "REMOVE LIQUIDITY"):
+        return True
+    return False
+
+
+def hunter_had_any_lp_on_token(
+    txs: list, hunter_address: str, token_address: str
+) -> bool:
+    """
+    检查该猎手在该代币上是否有任何 LP 行为（加池/撤池）。
+    有则视为项目方或老鼠仓，返回 True，直接淘汰并拉黑。
+    """
+    for tx in (txs or []):
+        if not tx_is_any_lp_behavior(tx):
+            continue
+        for tt in tx.get("tokenTransfers", []):
+            if tt.get("mint") != token_address:
+                continue
+            if tt.get("fromUserAccount") == hunter_address or tt.get("toUserAccount") == hunter_address:
+                return True
+    return False
+
+
+def hunter_had_remove_liquidity_on_token(
+    txs: list, hunter_address: str, token_address: str
+) -> bool:
+    """
+    检查该猎手在该代币上是否有 REMOVE LIQUIDITY 历史（老鼠仓）。
+    若该地址参与过针对该 token 的移除流动性，返回 True。
+    """
+    for tx in (txs or []):
+        if not tx_is_remove_liquidity(tx):
+            continue
+        # 确认该交易涉及目标代币且猎手参与
+        for tt in tx.get("tokenTransfers", []):
+            if tt.get("mint") != token_address:
+                continue
+            if tt.get("fromUserAccount") == hunter_address or tt.get("toUserAccount") == hunter_address:
+                return True
+    return False
 
 
 def _is_frequent_trader_by_real_txs(txs: list, address: str) -> bool:
@@ -227,15 +294,7 @@ class TokenAttributionCalculator:
 
 class SmartMoneySearcher:
     def __init__(self):
-        self._pool = helius_key_pool
-        self._update_urls()
-
-    def _update_urls(self):
-        """从 Key 池更新当前 RPC / API URL。"""
-        self.api_key = self._pool.get_api_key()
-        self.rpc_url = self._pool.get_rpc_url()
-        self.base_api_url = "https://api.helius.xyz/v0"
-
+        # Helius API 统一通过 services.helius.helius_client 调用
         # 初筛参数 (来自 config/settings.py)
         self.min_delay_sec = SM_MIN_DELAY_SEC
         self.max_delay_sec = SM_MAX_DELAY_SEC
@@ -289,6 +348,10 @@ class SmartMoneySearcher:
             except Exception:
                 logger.exception("⚠️ 加载钱包黑名单失败")
 
+    def is_blacklisted(self, address: str) -> bool:
+        """判断地址是否在黑名单内（供 Monitor 等调用，共振前过滤）。"""
+        return address in self.wallet_blacklist
+
     def _add_to_wallet_blacklist(self, address: str):
         """将劣质猎手加入黑名单并后台写入，不阻塞挖掘。"""
         if address in self.wallet_blacklist:
@@ -307,59 +370,11 @@ class SmartMoneySearcher:
 
         threading.Thread(target=_write, daemon=True).start()
 
-    async def _rpc_post(self, client, method, params):
-        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-
-        # === [新增] 重试机制 (最多试 3 次) ===
-        max_retries = 3
-        base_delay = 1.0
-
-        for attempt in range(max_retries):
-            try:
-                # [优化] 增加 timeout 到 30秒，防止深翻页时超时
-                resp = await client.post(self.rpc_url, json=payload, timeout=30.0)
-
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if "result" in data:
-                        return data["result"]
-                    elif "error" in data:
-                        # 如果是限流错误 (429)，记录并重试
-                        err_msg = data.get("error", {}).get("message", "")
-                        if "Rate limit" in err_msg or "429" in str(resp.status_code):
-                            logger.warning("⚠️ RPC 限流 (尝试 %s/%s)，切换 Key: %s", attempt + 1, max_retries, err_msg)
-                            self._pool.mark_current_failed()
-                            self._update_urls()
-                        else:
-                            # 其他业务错误直接返回 None
-                            # logger.warning(f"RPC 业务错误: {err_msg}")
-                            return None
-                elif resp.status_code == 429:
-                    logger.warning("⚠️ RPC HTTP 429 限流 (尝试 %s/%s)，切换 Key", attempt + 1, max_retries)
-                    self._pool.mark_current_failed()
-                    self._update_urls()
-                else:
-                    logger.warning(f"RPC 请求失败: {resp.status_code}")
-
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
-                logger.warning("⚠️ RPC 网络波动 (尝试 %s/%s): %s", attempt + 1, max_retries, e)
-            except Exception:
-                logger.exception("❌ RPC 未知错误")
-                return None
-
-            # 指数退避：每次失败多睡一会儿 (1s -> 2s -> 4s)
-            if attempt < max_retries - 1:
-                sleep_time = base_delay * (2 ** attempt)
-                await asyncio.sleep(sleep_time)
-
-        logger.error(f"❌ RPC {method} 最终失败，已重试 {max_retries} 次")
-        return None
-
     async def get_signatures(self, client, address, limit=100, before=None):
-        params = [address, {"limit": limit}]
-        if before:
-            params[1]["before"] = before
-        return await self._rpc_post(client, "getSignaturesForAddress", params)
+        """通过 HeliusClient 获取地址签名列表。"""
+        return await helius_client.get_signatures_for_address(
+            address, limit=limit, before=before, http_client=client
+        )
 
     async def is_frequent_trader(self, client, address: str) -> bool:
         """
@@ -373,31 +388,10 @@ class SmartMoneySearcher:
         return _is_frequent_trader_by_real_txs(txs or [], address)
 
     async def fetch_parsed_transactions(self, client, signatures):
-        if not signatures: return []
-        chunk_size = 90
-        all_txs = []
-        for i in range(0, len(signatures), chunk_size):
-            batch = signatures[i:i + chunk_size]
-            # 兼容 RPC 返回 dict 或 str：dict 取 signature，str 直接使用
-            sigs = [
-                s.get("signature") or (s if isinstance(s, str) else None)
-                for s in batch
-            ]
-            sigs = [x for x in sigs if x]
-            if not sigs:
-                continue
-            payload = {"transactions": sigs}
-            url = f"{self.base_api_url}/transactions?api-key={self.api_key}"
-            try:
-                resp = await client.post(url, json=payload, timeout=30.0)
-                if resp.status_code == 200:
-                    all_txs.extend(resp.json())
-                elif resp.status_code == 429 and self._pool.size > 1:
-                    self._pool.mark_current_failed()
-                    self._update_urls()
-            except Exception:
-                logger.exception("fetch_parsed_transactions 批量请求异常")
-        return all_txs
+        """通过 HeliusClient 批量拉取解析后的交易。"""
+        if not signatures:
+            return []
+        return await helius_client.fetch_parsed_transactions(signatures, http_client=client)
 
     def _build_projects_from_txs(
         self, txs: List[dict], exclude_token: str, usdc_price: float, hunter_address: str
@@ -551,24 +545,35 @@ class SmartMoneySearcher:
         计算猎手在该代币上的收益率 (ROI %)，已清仓用卖出收益算，未清仓用现价估算。
         返回 (ROI 百分比, 交易列表)，若无法计算返回 (None, None)。
         交易列表供后续 analyze_hunter_performance 复用，减少 Helius API 消耗。
-        先拉 120 笔做频率检测，频繁则直接淘汰，通过后再拉满 500 笔，节省 credit。
+        阶段顺序：先 100 笔 LP 预检 -> 120 笔频率检测 -> 拉满 500 笔。
         """
         sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
         if not sigs:
             return None, None
 
-        # 阶段 1：只拉前 N 笔做频率检测，频繁则直接淘汰，省后续 ~4 次 API
-        first_batch = sigs[:SM_FREQUENCY_CHECK_TX_LIMIT]
+        # 阶段 0+1：先拉 100 笔做 LP 预检 + 频率检测，复用以节省 API
+        first_batch = sigs[:SM_LP_CHECK_TX_LIMIT]
         first_txs = await self.fetch_parsed_transactions(client, first_batch)
-        if first_txs and _is_frequent_trader_by_real_txs(first_txs, hunter_address):
+        if not first_txs:
+            return None, None
+        # LP 预检：有任何 LP 行为（加池/撤池）直接淘汰并拉黑
+        if hunter_had_any_lp_on_token(first_txs, hunter_address, token_address):
+            logger.warning(
+                "⚠️ LP 行为淘汰: %s.. 曾对该代币有 LP 操作（加池/撤池），已加入黑名单，永不跟仓",
+                hunter_address[:12],
+            )
+            self._add_to_wallet_blacklist(hunter_address)
+            return None, None
+        # 频率检测：频繁则直接淘汰
+        if _is_frequent_trader_by_real_txs(first_txs, hunter_address):
             logger.debug("⏭️ 频率淘汰 %s.. (先拉 %d 笔即判定频繁)", hunter_address[:12], len(first_batch))
             return None, None
 
-        # 阶段 2：未频繁，拉满 500 笔算 ROI 并供评分复用
-        if len(sigs) <= SM_FREQUENCY_CHECK_TX_LIMIT:
+        # 阶段 2：LP 和频率均通过，拉满 500 笔算 ROI 并供评分复用
+        if len(sigs) <= SM_LP_CHECK_TX_LIMIT:
             txs = first_txs
         else:
-            rest_sigs = sigs[SM_FREQUENCY_CHECK_TX_LIMIT:]
+            rest_sigs = sigs[SM_LP_CHECK_TX_LIMIT:]
             rest_txs = await self.fetch_parsed_transactions(client, rest_sigs)
             txs = (first_txs or []) + (rest_txs or [])
         if not txs:
@@ -756,6 +761,7 @@ class SmartMoneySearcher:
                     logger.debug("    跳过黑名单: %s..", addr[:12])
                     continue
                 roi, txs = await self.get_hunter_profit_on_token(client, addr, token_address)
+                # LP 行为（加池/撤池）已在 get_hunter_profit_on_token 前 100 笔预检中淘汰并拉黑
                 if roi is None or roi < SM_MIN_TOKEN_PROFIT_PCT:
                     await asyncio.sleep(0.3)
                     continue

@@ -192,7 +192,7 @@ async def test_risk_control():
     """[3/7] 风控接口：DexScreener 流动性 + RugCheck 可选。"""
     logger.info("🛡️ [3/%d] 测试 DexScreener 风控接口...", TOTAL_STEPS)
     try:
-        from services.risk_control import check_token_liquidity
+        from services.rugcheck.risk_control import check_token_liquidity
 
         # 使用 JUP 代币作为已知有流动性的标的
         jup_mint = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
@@ -325,7 +325,7 @@ async def test_project_imports():
         from config.settings import helius_key_pool, jup_key_pool
         from services.dexscreener.dex_scanner import DexScanner
         from services.solana.trader import SolanaTrader
-        from services import risk_control
+        from services.rugcheck import risk_control
         from services import notification
         from utils.logger import get_logger
         logger.info("✅ 项目模块导入正常 (config, services, utils)")

@@ -22,7 +22,6 @@ import websockets
 # 导入配置和依赖模块
 from config.settings import (
     BASE_DIR,
-    helius_key_pool,
     USDC_PER_SOL,
     MAX_ENTRY_PUMP_MULTIPLIER,
     DISCOVERY_INTERVAL,
@@ -39,9 +38,6 @@ from config.settings import (
     WALLET_WS_RESUBSCRIBE_SEC,
     HOLDINGS_TTL_SEC,
     HOLDINGS_PRUNE_INTERVAL_SEC,
-    SM_ENTRY_MIN_PNL_RATIO,
-    SM_ENTRY_MIN_WIN_RATE,
-    SM_ENTRY_MIN_TRADE_COUNT,
     SM_AUDIT_MIN_PNL_RATIO,
     SM_AUDIT_MIN_WIN_RATE,
     SM_AUDIT_KICK_MAX_ROI_30D_PCT,
@@ -50,7 +46,7 @@ from config.settings import (
     SM_ROI_MULT_50_100,
 )
 from services.dexscreener.dex_scanner import DexScanner
-from services.helius.sm_searcher import SmartMoneySearcher, TransactionParser
+from services.sm_searcher import SmartMoneySearcher, TransactionParser
 from utils.logger import get_logger
 from utils.hunter_scoring import compute_hunter_score
 
@@ -322,7 +318,7 @@ class HunterMonitorController:
                     continue
 
                 async with websockets.connect(
-                    helius_key_pool.get_wss_url(),
+                    helius_client.get_wss_url(),
                     ping_interval=20,
                     ping_timeout=10,
                     close_timeout=None,
@@ -401,7 +397,7 @@ class HunterMonitorController:
             except Exception as e:
                 status_code = getattr(e, "status_code", None)
                 if status_code == 429 or "429" in str(e).lower():
-                    helius_key_pool.mark_current_failed()
+                    helius_client.mark_current_failed()
                     logger.warning("⚠️ Helius WebSocket 429 限流，已切换 Key，5 秒后重试")
                 else:
                     logger.exception("⚠️ WS 重连异常")
@@ -460,13 +456,13 @@ class HunterMonitorController:
                     if now - self._recent_sigs[sig] > RECENT_SIG_TTL_SEC * 2:
                         del self._recent_sigs[sig]
 
-                url = helius_key_pool.get_http_endpoint()
+                url = helius_client.get_http_endpoint()
                 async with AsyncClient(timeout=15.0) as client:
                     for attempt in range(FETCH_TX_MAX_RETRIES):
                         resp = await client.post(url, json={"transactions": to_fetch[:20]})
-                        if resp.status_code == 429 and helius_key_pool.size >= 1:
-                            helius_key_pool.mark_current_failed()
-                            url = helius_key_pool.get_http_endpoint()
+                        if resp.status_code == 429 and helius_client.size >= 1:
+                            helius_client.mark_current_failed()
+                            url = helius_client.get_http_endpoint()
                         if resp.status_code != 200:
                             if attempt < FETCH_TX_MAX_RETRIES - 1:
                                 await asyncio.sleep(FETCH_TX_RETRY_DELAY_BASE + attempt)
@@ -570,6 +566,10 @@ class HunterMonitorController:
 
         lead_addr = first_buyer
         lead_score = self.storage.get_hunter_score(first_buyer)
+        # 黑名单过滤：老鼠仓等永不跟仓
+        if self.sm_searcher and self.sm_searcher.is_blacklisted(lead_addr):
+            trade_logger.warning("🚫 共振跳过: %s 猎手 %s.. 在黑名单内（如老鼠仓）", mint[:8], lead_addr[:12])
+            return
         if True:  # 单猎手共振条件：有一个 ≥60 分猎手持仓即可
             if self.position_check and self.position_check(mint):
                 return

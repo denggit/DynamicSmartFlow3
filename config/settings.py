@@ -18,10 +18,14 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=ENV_PATH)
 
-# --- Helius / Jupiter API Key 池（各自独立：谁不可用谁自己换下一个，用尽后回到第一个重试）---
+# --- Helius / Alchemy / Birdeye / Jupiter API Key 池（各自独立：谁不可用谁自己换下一个）---
 _raw_helius = os.getenv("HELIUS_API_KEY", "") or ""
+_raw_alchemy = os.getenv("ALCHEMY_API_KEY", "") or ""
+_raw_birdeye = os.getenv("BIRDEYE_API_KEY", "") or ""
 _raw_jup = os.getenv("JUP_API_KEY", "") or ""
 HELIUS_API_KEYS = [k.strip() for k in _raw_helius.split(",") if k.strip()]
+ALCHEMY_API_KEYS = [k.strip() for k in _raw_alchemy.split(",") if k.strip()]
+BIRDEYE_API_KEYS = [k.strip() for k in _raw_birdeye.split(",") if k.strip()]
 JUP_API_KEYS = [k.strip() for k in _raw_jup.split(",") if k.strip()]
 
 
@@ -71,8 +75,39 @@ class HeliusKeyPool(_KeyPool):
         return f"https://api.helius.xyz/v0/transactions/?api-key={key}" if key else ""
 
 
+class AlchemyKeyPool(_KeyPool):
+    """Alchemy Key 池，提供 Solana RPC/WSS URL。Alchemy 使用标准 Solana JSON-RPC。"""
+
+    def __init__(self, keys: list):
+        super().__init__(keys, "Alchemy")
+
+    def get_rpc_url(self) -> str:
+        key = self.get_api_key()
+        return f"https://solana-mainnet.g.alchemy.com/v2/{key}" if key else ""
+
+    def get_wss_url(self) -> str:
+        key = self.get_api_key()
+        return f"wss://solana-mainnet.g.alchemy.com/v2/{key}" if key else ""
+
+    def get_http_endpoint(self) -> str:
+        """Alchemy 无独立解析交易 HTTP 端点，返回空。"""
+        return ""
+
+
+class BirdeyeKeyPool(_KeyPool):
+    """Birdeye Key 池，提供行情/价格 API。"""
+
+    def __init__(self, keys: list):
+        super().__init__(keys, "Birdeye")
+
+
 helius_key_pool = HeliusKeyPool(HELIUS_API_KEYS)
+alchemy_key_pool = AlchemyKeyPool(ALCHEMY_API_KEYS)
+birdeye_key_pool = BirdeyeKeyPool(BIRDEYE_API_KEYS)
 jup_key_pool = _KeyPool(JUP_API_KEYS, "Jupiter")
+
+# 统一 Solana RPC 入口：helius | alchemy | auto（有 Helius 用 Helius，否则 Alchemy）
+SOLANA_PRIMARY_PROVIDER = (os.getenv("SOLANA_PRIMARY_PROVIDER", "auto") or "auto").strip().lower()
 
 HELIUS_API_KEY = helius_key_pool.get_api_key()
 WSS_ENDPOINT = helius_key_pool.get_wss_url()
@@ -154,15 +189,15 @@ SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 # ==================== 猎手挖掘 (sm_searcher) ====================
 MIN_TOKEN_AGE_SEC = 1800  # 最少上市 30 (太新的币数据少，难找好猎手)
 MAX_TOKEN_AGE_SEC = 21600  # 最多上市 6 小时 (放宽年龄)
-MAX_BACKTRACK_PAGES = 100  # 最多回溯 100 页 (10万笔交易)
+MAX_BACKTRACK_PAGES = 30  # 最多回溯 30 页 (3万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
 MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算真实
-SM_MIN_DELAY_SEC = 15  # 初筛：开盘后至少 15 秒买入才计入
+SM_MIN_DELAY_SEC = 30  # 初筛：开盘后至少 30 秒买入才计入
 SM_MAX_DELAY_SEC = 10800  # 3 小时内买入都算
 SM_MIN_TOKEN_PROFIT_PCT = 100.0  # 入库门槛：该代币当下至少赚 100% 才能入池；≥200%×1，100%~200%×0.9；体检时 30 天内若掉到 <50% 则踢出
 SM_AUDIT_TX_LIMIT = 500  # 体检时拉取交易笔数
-SM_FREQUENCY_CHECK_TX_LIMIT = 120  # 频率检测只需约 100 笔真实交易，先拉前 120 笔；通过后再拉满 500
+SM_LP_CHECK_TX_LIMIT = 100  # LP 预检 + 频率检测：先拉 100 笔查 LP 行为（加池/撤池）及频率，有则直接淘汰，通过后再拉满 500
 SM_EARLY_TX_PARSE_LIMIT = 360  # 初筛：最多解析多少笔早期交易（按时间取前 N 笔）
 SM_MIN_BUY_SOL = 0.1  # 初筛：单笔买入最少 SOL
 SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
@@ -205,6 +240,7 @@ DEX_MIN_24H_GAIN_PCT = 500.0  # 年龄在范围内时，涨幅 > 500% 才执行�
 MAX_ACCEPTABLE_BUY_TAX_PCT = 25.0  # 买入税超过此比例拒绝
 MAX_SAFE_SCORE = 2000  # RugCheck 风险分超过此值拒绝
 MIN_LIQUIDITY_USD = 10000.0  # 池子流动性最低门槛防撤池 ($10k)
+MIN_LP_LOCKED_PCT = 70.0  # LP 至少锁仓或销毁比例，否则拒绝（防撤池）
 MAX_TOP2_10_COMBINED_PCT = 0.30  # 防老鼠仓：第 2~10 名合计上限
 MAX_SINGLE_HOLDER_PCT = 0.10  # 防老鼠仓：单一地址上限
 MAX_ENTRY_FDV_USD = 1000000.0  # 最大可接受入场 FDV (USD)

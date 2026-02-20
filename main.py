@@ -8,7 +8,6 @@ import asyncio
 import json
 import threading
 from datetime import datetime
-from pathlib import Path
 
 from config.settings import (
     PNL_CHECK_INTERVAL,
@@ -22,7 +21,7 @@ from services.dexscreener.dex_scanner import DexScanner
 from services.solana.hunter_agent import HunterAgentController
 from services.solana.hunter_monitor import HunterMonitorController
 from services.solana.trader import SolanaTrader
-from services import risk_control
+from services.rugcheck import risk_control
 from services import notification
 from utils.logger import get_logger
 from utils.trading_history import append_trade, append_trade_in_background, load_history, load_data_for_report
@@ -91,18 +90,29 @@ def _on_position_closed(snapshot: dict) -> None:
 # 事件回调
 # =========================================
 
+# 黑名单校验用（main() 中注入 monitor.sm_searcher）
+_sm_searcher_for_blacklist: list = []
+
+
 async def on_monitor_signal(signal):
     """[Monitor -> Trader] 发现开仓信号：风控 -> 开仓 -> 发首次跟单邮件 -> 启动 Agent。"""
     try:
-        await _on_monitor_signal_impl(signal)
+        sm_searcher = _sm_searcher_for_blacklist[0] if _sm_searcher_for_blacklist else None
+        await _on_monitor_signal_impl(signal, sm_searcher)
     except Exception:
         logger.exception("on_monitor_signal 处理异常，单次失败不影响主循环")
 
 
-async def _on_monitor_signal_impl(signal):
+async def _on_monitor_signal_impl(signal, sm_searcher=None):
     """on_monitor_signal 实际逻辑，便于 try/except 隔离。"""
     token = signal["token_address"]
     hunters = signal["hunters"]
+    # 黑名单二次过滤（老鼠仓等永不跟仓）
+    if sm_searcher:
+        hunters = [h for h in hunters if not sm_searcher.is_blacklisted(h.get("address", ""))]
+    if not hunters:
+        logger.warning("风控/黑名单过滤后无有效猎手，跳过开仓: %s", token)
+        return
     total_score = signal["total_score"]
 
     # 1. 风控：避免貔貅/不能卖/高税
@@ -393,6 +403,7 @@ async def main(immediate_audit: bool = False):
         tracked_tokens_getter=get_tracked_tokens,
         position_check=lambda t: t in trader.positions,
     )
+    _sm_searcher_for_blacklist.append(monitor.sm_searcher)  # 供开仓前黑名单二次过滤
     monitor.set_agent(agent)  # 跟仓信号由 Monitor 统一推送，避免 Agent 自建 WS 漏单
     agent.signal_callback = on_agent_signal
 

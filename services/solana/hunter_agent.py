@@ -29,7 +29,7 @@ from config.settings import (
     NEW_HUNTER_ADD_WINDOW_SEC,
     USDC_PER_SOL,
 )
-from services.helius.sm_searcher import IGNORE_MINTS, TransactionParser
+from services.sm_searcher import IGNORE_MINTS, TransactionParser
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
