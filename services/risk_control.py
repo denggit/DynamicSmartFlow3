@@ -5,7 +5,8 @@
               铸币权/冻结权未放弃（Mint Authority、Freeze Authority 必须为 Renounced/None）、
               老鼠仓（Top2-10 控盘过高）、撤池风险（池子 < $5k）、FDV 过高追高、流动性/市值比过低（虚胖控盘）。
 """
-from typing import Tuple
+import asyncio
+from typing import Optional, Tuple
 
 import httpx
 
@@ -24,6 +25,51 @@ logger = get_logger(__name__)
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
+# HTTP 请求超时配置（秒）
+RUGCHECK_TIMEOUT = 20.0
+DEXSCREENER_TIMEOUT = 15.0
+HTTP_MAX_RETRIES = 3
+HTTP_RETRY_DELAY = 1.5
+
+
+async def _fetch_with_retry(
+    url: str,
+    timeout: float = 15.0,
+    max_retries: int = HTTP_MAX_RETRIES,
+    retry_delay: float = HTTP_RETRY_DELAY,
+) -> Optional[httpx.Response]:
+    """
+    带重试的 HTTP GET 请求，用于应对 ReadTimeout、ConnectTimeout 等瞬态网络异常。
+
+    Args:
+        url: 请求 URL
+        timeout: 单次请求超时（秒）
+        max_retries: 最大重试次数
+        retry_delay: 重试间隔（秒）
+
+    Returns:
+        成功时返回 Response，失败时返回 None
+    """
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout, connect=10.0)
+            ) as client:
+                return await client.get(url)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+            if attempt < max_retries - 1:
+                logger.warning(
+                    "HTTP 请求超时 (尝试 %d/%d)，%s 秒后重试: %s",
+                    attempt + 1, max_retries, retry_delay, url[:60] + ".." if len(url) > 60 else url
+                )
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.warning("HTTP 请求超时，已达最大重试次数: %s", type(e).__name__)
+        except Exception as e:
+            logger.warning("HTTP 请求异常: %s", e)
+            return None
+    return None
+
 
 async def check_is_safe_token(token_mint: str) -> bool:
     """
@@ -35,88 +81,90 @@ async def check_is_safe_token(token_mint: str) -> bool:
         return True
 
     url = f"https://api.rugcheck.xyz/v1/tokens/{token_mint}/report"
+    resp = await _fetch_with_retry(url, timeout=RUGCHECK_TIMEOUT)
+    if resp is None:
+        logger.warning("RugCheck API 请求失败（超时或网络异常），保守拒绝: %s", token_mint[:16] + "..")
+        return False
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                logger.warning("RugCheck 未收录该代币: %s", token_mint[:16] + "..")
-                has_pool, liq_usd, fdv_usd = await check_token_liquidity(token_mint)
-                if not has_pool or liq_usd < MIN_LIQUIDITY_USD:
-                    logger.warning("⚠️ 未收录且池子过小 ($%.0f)，拒绝: %s", liq_usd, token_mint[:16] + "..")
-                    return False
-                if fdv_usd > MAX_ENTRY_FDV_USD:
-                    logger.warning("⚠️ 未收录且 FDV 过高 ($%.0f)，拒绝: %s", fdv_usd, token_mint[:16] + "..")
-                    return False
-                if fdv_usd > 0 and liq_usd / fdv_usd < MIN_LIQUIDITY_TO_FDV_RATIO:
-                    logger.warning("⚠️ 未收录且流动性/市值比过低，拒绝: %s", token_mint[:16] + "..")
-                    return False
-                return True
-
-            data = resp.json()
-
-            # 1. 风险分
-            score = data.get("score", 0)
-            if score > MAX_SAFE_SCORE:
-                logger.warning("⚠️ 风险分过高 (Score: %s): %s", score, token_mint[:16] + "..")
-                return False
-
-            # 2. 致命风险（含蜜罐/不能卖等）
-            risks = data.get("risks", [])
-            if isinstance(risks, list):
-                for r in risks:
-                    level = (r or {}).get("level") or ""
-                    name = (r or {}).get("name") or ""
-                    if level == "danger":
-                        logger.warning("☠️ 发现致命风险: %s", name)
-                        return False
-                    # 名称中含 honeypot / cannot sell / 卖 等也拦截
-                    lower = name.lower()
-                    if "honeypot" in lower or "cannot sell" in lower or "unable to sell" in lower:
-                        logger.warning("☠️ 疑似不可卖/蜜罐: %s", name)
-                        return False
-
-            # 3. 铸币权/冻结权：安全 Meme 币必须两者皆为 Renounced (null)
-            mint_authority = data.get("mintAuthority")
-            freeze_authority = data.get("freezeAuthority")
-            if mint_authority not in (None, ""):
-                logger.warning("⚠️ 铸币权未放弃 (Mint Authority 未 Renounced): %s", token_mint[:16] + "..")
-                return False
-            if freeze_authority not in (None, ""):
-                logger.warning("⚠️ 冻结权未放弃 (Freeze Authority 未 Renounced): %s", token_mint[:16] + "..")
-                return False
-
-            # 4. 买入/卖出税（若 API 有返回）
-            token_meta = data.get("tokenMeta") or data.get("meta") or {}
-            buy_tax = _parse_tax(token_meta.get("buyTax") or token_meta.get("buy_tax"))
-            if buy_tax is not None and buy_tax > MAX_ACCEPTABLE_BUY_TAX_PCT:
-                logger.warning("⚠️ 买入税过高 (%.1f%%): %s", buy_tax, token_mint[:16] + "..")
-                return False
-
-            # 5. 池子大小（防撤池）+ FDV + 流动性/市值比
+        if resp.status_code != 200:
+            logger.warning("RugCheck 未收录该代币: %s", token_mint[:16] + "..")
             has_pool, liq_usd, fdv_usd = await check_token_liquidity(token_mint)
             if not has_pool or liq_usd < MIN_LIQUIDITY_USD:
-                logger.warning("⚠️ 池子过小 (Liquidity $%.0f < $%.0f): %s", liq_usd, MIN_LIQUIDITY_USD, token_mint[:16] + "..")
+                logger.warning("⚠️ 未收录且池子过小 ($%.0f)，拒绝: %s", liq_usd, token_mint[:16] + "..")
                 return False
             if fdv_usd > MAX_ENTRY_FDV_USD:
-                logger.warning("⚠️ FDV 过高 ($%.0f > $%.0f)，不追高: %s", fdv_usd, MAX_ENTRY_FDV_USD, token_mint[:16] + "..")
+                logger.warning("⚠️ 未收录且 FDV 过高 ($%.0f)，拒绝: %s", fdv_usd, token_mint[:16] + "..")
                 return False
             if fdv_usd > 0 and liq_usd / fdv_usd < MIN_LIQUIDITY_TO_FDV_RATIO:
-                logger.warning(
-                    "⚠️ 流动性/市值比过低 (%.2f%% < %.0f%%)，虚胖控盘: %s",
-                    liq_usd / fdv_usd * 100, MIN_LIQUIDITY_TO_FDV_RATIO * 100, token_mint[:16] + ".."
-                )
+                logger.warning("⚠️ 未收录且流动性/市值比过低，拒绝: %s", token_mint[:16] + "..")
                 return False
-
-            # 6. Top 10 持仓（防老鼠仓）：排除 LP 后，第 2~10 名不得控盘过高
-            if not _check_top_holders_safe(data, token_mint):
-                return False
-
-            logger.info("✅ 风控通过 (Score: %s): %s", score, token_mint)
             return True
 
+        data = resp.json()
+
+        # 1. 风险分
+        score = data.get("score", 0)
+        if score > MAX_SAFE_SCORE:
+            logger.warning("⚠️ 风险分过高 (Score: %s): %s", score, token_mint[:16] + "..")
+            return False
+
+        # 2. 致命风险（含蜜罐/不能卖等）
+        risks = data.get("risks", [])
+        if isinstance(risks, list):
+            for r in risks:
+                level = (r or {}).get("level") or ""
+                name = (r or {}).get("name") or ""
+                if level == "danger":
+                    logger.warning("☠️ 发现致命风险: %s", name)
+                    return False
+                # 名称中含 honeypot / cannot sell / 卖 等也拦截
+                lower = name.lower()
+                if "honeypot" in lower or "cannot sell" in lower or "unable to sell" in lower:
+                    logger.warning("☠️ 疑似不可卖/蜜罐: %s", name)
+                    return False
+
+        # 3. 铸币权/冻结权：安全 Meme 币必须两者皆为 Renounced (null)
+        mint_authority = data.get("mintAuthority")
+        freeze_authority = data.get("freezeAuthority")
+        if mint_authority not in (None, ""):
+            logger.warning("⚠️ 铸币权未放弃 (Mint Authority 未 Renounced): %s", token_mint[:16] + "..")
+            return False
+        if freeze_authority not in (None, ""):
+            logger.warning("⚠️ 冻结权未放弃 (Freeze Authority 未 Renounced): %s", token_mint[:16] + "..")
+            return False
+
+        # 4. 买入/卖出税（若 API 有返回）
+        token_meta = data.get("tokenMeta") or data.get("meta") or {}
+        buy_tax = _parse_tax(token_meta.get("buyTax") or token_meta.get("buy_tax"))
+        if buy_tax is not None and buy_tax > MAX_ACCEPTABLE_BUY_TAX_PCT:
+            logger.warning("⚠️ 买入税过高 (%.1f%%): %s", buy_tax, token_mint[:16] + "..")
+            return False
+
+        # 5. 池子大小（防撤池）+ FDV + 流动性/市值比
+        has_pool, liq_usd, fdv_usd = await check_token_liquidity(token_mint)
+        if not has_pool or liq_usd < MIN_LIQUIDITY_USD:
+            logger.warning("⚠️ 池子过小 (Liquidity $%.0f < $%.0f): %s", liq_usd, MIN_LIQUIDITY_USD, token_mint[:16] + "..")
+            return False
+        if fdv_usd > MAX_ENTRY_FDV_USD:
+            logger.warning("⚠️ FDV 过高 ($%.0f > $%.0f)，不追高: %s", fdv_usd, MAX_ENTRY_FDV_USD, token_mint[:16] + "..")
+            return False
+        if fdv_usd > 0 and liq_usd / fdv_usd < MIN_LIQUIDITY_TO_FDV_RATIO:
+            logger.warning(
+                "⚠️ 流动性/市值比过低 (%.2f%% < %.0f%%)，虚胖控盘: %s",
+                liq_usd / fdv_usd * 100, MIN_LIQUIDITY_TO_FDV_RATIO * 100, token_mint[:16] + ".."
+            )
+            return False
+
+        # 6. Top 10 持仓（防老鼠仓）：排除 LP 后，第 2~10 名不得控盘过高
+        if not _check_top_holders_safe(data, token_mint):
+            return False
+
+        logger.info("✅ 风控通过 (Score: %s): %s", score, token_mint)
+        return True
+
     except Exception as e:
-        logger.exception("风控检测异常: %s", e)
-        # 网络异常时保守策略：不放行
+        logger.warning("风控检测异常（解析或逻辑错误）: %s", e)
         return False
 
 
@@ -194,21 +242,20 @@ async def check_token_liquidity(token_mint: str) -> Tuple[bool, float, float]:
 
     url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                return False, 0.0, 0.0
-            data = resp.json()
-            pairs = data.get("pairs", [])
-            if not pairs:
-                return False, 0.0, 0.0
-            solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-            if not solana_pairs:
-                return False, 0.0, 0.0
-            best = max(solana_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd") or 0))
-            liq = float(best.get("liquidity", {}).get("usd") or 0)
-            fdv = float(best.get("fdv", 0) or 0)
-            return True, liq, fdv
+        resp = await _fetch_with_retry(url, timeout=DEXSCREENER_TIMEOUT)
+        if resp is None or resp.status_code != 200:
+            return False, 0.0, 0.0
+        data = resp.json()
+        pairs = data.get("pairs", [])
+        if not pairs:
+            return False, 0.0, 0.0
+        solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+        if not solana_pairs:
+            return False, 0.0, 0.0
+        best = max(solana_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd") or 0))
+        liq = float(best.get("liquidity", {}).get("usd") or 0)
+        fdv = float(best.get("fdv", 0) or 0)
+        return True, liq, fdv
     except Exception as e:
         logger.warning("流动性查询异常: %s", e)
         return False, 0.0, 0.0

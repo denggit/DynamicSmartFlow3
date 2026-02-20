@@ -1,4 +1,5 @@
 solana==0.34.3
+httpx>=0.25.0
 solders==0.21.0
 aiohttp==3.9.5
 base58==2.1.1
