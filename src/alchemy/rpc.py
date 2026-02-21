@@ -71,7 +71,10 @@ class AlchemyRpc:
             client = own_client
 
         try:
+            from src.alchemy.rate_limit import wait_before_request
             for attempt in range(self.MAX_RETRIES):
+                await wait_before_request()  # 限流：避免 startup 多任务并发导致 429
+
                 url = self.get_rpc_url()
                 if not self._validate_rpc_url(url):
                     logger.error(

@@ -292,6 +292,10 @@ TX_VERIFY_RECONCILIATION_DELAY_SEC = 30  # 验证失败后先等待此秒数再�
 TX_VERIFY_RECONCILIATION_RETRIES = 5  # 余额查询重试次数，每次切换 Key + 退避
 TRADER_RPC_TIMEOUT = 30.0  # RPC 请求超时
 
+# ==================== RPC 限流（防 429）====================
+ALCHEMY_MIN_INTERVAL_SEC = float(os.getenv("ALCHEMY_MIN_INTERVAL_SEC", "0.5"))  # Alchemy RPC 请求最小间隔，免费版约 330 CU/s
+HELIUS_MIN_INTERVAL_SEC = float(os.getenv("HELIUS_MIN_INTERVAL_SEC", "2"))  # Helius 解析请求最小间隔，还未被真正使用
+
 # ==================== 其他 ====================
 CRITICAL_EMAIL_COOLDOWN_SEC = 3600  # 严重错误邮件冷却 1 小时
 WATCHDOG_RESTART_DELAY = 5  # 看门狗重启延迟 (秒)
