@@ -26,7 +26,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from config.settings import (
-    get_tier_config, TAKE_PROFIT_LEVELS, STOP_LOSS_PCT,
+    get_tier_config, TAKE_PROFIT_LEVELS,
     MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
     SOLANA_PRIVATE_KEY_BASE58,
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, BASE_DIR, jup_key_pool,
@@ -474,10 +474,8 @@ class SolanaTrader:
                 )
                 pnl_pct = jupiter_implied_pnl
 
-        stop_loss_pct = STOP_LOSS_PCT
-        tier = get_tier_config(pos.lead_hunter_score)
-        if tier:
-            stop_loss_pct = tier["stop_loss_pct"]
+        tier = get_tier_config(pos.lead_hunter_score) or {}
+        stop_loss_pct = tier.get("stop_loss_pct", 0.4)
         if pnl_pct <= -stop_loss_pct:
             # Birdeye 二次验价：DexScreener 可能因假暴涨/假暴跌插针误触发止损，用 Birdeye 交叉验证
             proceed_stop_loss = True

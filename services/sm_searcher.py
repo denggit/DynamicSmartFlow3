@@ -50,10 +50,6 @@ from config.settings import (
     SM_ROI_MULT_50_100,
     DEX_MIN_24H_GAIN_PCT,
     WALLET_BLACKLIST_FILE,
-    WALLET_BLACKLIST_MIN_SCORE,
-    WALLET_BLACKLIST_LOSS_USDC,
-    WALLET_BLACKLIST_WIN_RATE,
-    USDC_PER_SOL,
 )
 from src.alchemy import alchemy_client
 from src.helius import helius_client
@@ -774,12 +770,6 @@ class SmartMoneySearcher:
                     await asyncio.sleep(0.3)
                     continue
                 pnl_passed_count += 1
-                # 入库时用该代币 ROI 乘数：≥200%×1，100%~200%×0.9（入库门槛 100%+，故无 50~100%）
-                if roi >= 200:
-                    roi_mult = SM_ROI_MULT_200
-                else:
-                    roi_mult = SM_ROI_MULT_100_200
-                logger.debug(f"    通过收益过滤: {addr[:12]}.. ROI={roi:.0f}%% ×{roi_mult}")
 
                 # 复用已拉取的 txs，不再重复请求 Helius
                 stats = await self.analyze_hunter_performance(
@@ -787,11 +777,22 @@ class SmartMoneySearcher:
                 )
 
                 if stats:
+                    # 入库乘数：用 max_roi_30d（含当前代币），与体检一致，比单代币 ROI 更合理
+                    max_roi_30d = max(roi, stats.get("max_roi_30d", 0))
+                    if max_roi_30d >= 200:
+                        roi_mult = SM_ROI_MULT_200
+                    elif max_roi_30d >= 100:
+                        roi_mult = SM_ROI_MULT_100_200
+                    else:
+                        roi_mult = SM_ROI_MULT_50_100
+                    logger.debug(f"    通过收益过滤: {addr[:12]}.. max_roi_30d={max_roi_30d:.0f}%% ×{roi_mult}")
+
                     score_result = compute_hunter_score(stats)
                     base_score = score_result["score"]
                     final_score = round(base_score * roi_mult, 1)
 
-                    # 新入库硬门槛：pnl_ratio>=2, wr>=20%, count>=10, profit>0
+                    # 入库与拉黑独立：拉黑仅因 LP 行为（加池/撤池），在 get_hunter_profit_on_token 中执行
+                    # 入库硬门槛：盈亏比≥2、胜率≥20%、代币数≥10、总盈利>0；低分可入库，亏损不可入库
                     trade_count = stats.get("count", 0)
                     pnl_ok = stats.get("pnl_ratio", 0) >= SM_ENTRY_MIN_PNL_RATIO
                     wr_ok = stats["win_rate"] >= SM_ENTRY_MIN_WIN_RATE
@@ -799,24 +800,22 @@ class SmartMoneySearcher:
                     profit_ok = stats["total_profit"] > 0
                     is_qualified = pnl_ok and wr_ok and count_ok and profit_ok
 
-                    # 劣质猎手加入黑名单
-                    loss_usdc = -stats["total_profit"] * USDC_PER_SOL if stats["total_profit"] < 0 else 0
-                    if (base_score < WALLET_BLACKLIST_MIN_SCORE or
-                            (loss_usdc >= WALLET_BLACKLIST_LOSS_USDC and stats["win_rate"] < WALLET_BLACKLIST_WIN_RATE)):
-                        self._add_to_wallet_blacklist(addr)
-
                     if is_qualified:
                         avg_roi = stats.get("avg_roi_pct", 0.0)
-                        # 入库时该代币 ROI 作为 max_roi_30d 初始值
-                        max_roi_30d = max(roi, stats.get("max_roi_30d", 0))
+                        # max_roi_30d 已在上方计算（含当前代币）
+                        pnl_ratio_val = stats.get("pnl_ratio", 0)
+                        pnl_ratio_str = f"{pnl_ratio_val:.2f}" if pnl_ratio_val != float("inf") else "∞"
                         candidate.update({
                             "score": final_score,
                             "win_rate": f"{stats['win_rate']:.1%}",
+                            "pnl_ratio": pnl_ratio_str,
                             "total_profit": f"{stats['total_profit']:.2f} SOL",
                             "avg_roi_pct": f"{avg_roi:.1f}%",
                             "scores_detail": score_result["scores_detail"],
                             "max_roi_30d": max_roi_30d,
                         })
+                        candidate.pop("entry_delay", None)
+                        candidate.pop("cost", None)
                         verified_hunters.append(candidate)
                         logger.info(
                             f"    ✅ 锁定猎手 {addr}.. | 利润: {candidate['total_profit']} | 评分: {final_score} (×{roi_mult})")

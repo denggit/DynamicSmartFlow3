@@ -81,6 +81,8 @@ def _apply_audit_update(info: dict, new_stats: dict, now: float, addr: str) -> N
     final_score = round(base_score * mult, 1)
     info["total_profit"] = f"{new_stats['total_profit']:.2f} SOL"
     info["win_rate"] = f"{new_stats['win_rate']:.1%}"
+    pnl_r = new_stats.get("pnl_ratio", 0)
+    info["pnl_ratio"] = f"{pnl_r:.2f}" if pnl_r != float("inf") else "∞"
     info["avg_roi_pct"] = f"{new_stats.get('avg_roi_pct', 0):.1f}%"
     info["score"] = final_score
     info["scores_detail"] = score_result["scores_detail"]
@@ -207,6 +209,11 @@ class HunterStorage:
                         del self.hunters[lowest_addr]
                         self.hunters[addr] = h
                         replaced += 1
+
+        # 移除已废弃字段（无业务引用）
+        for info in self.hunters.values():
+            info.pop("entry_delay", None)
+            info.pop("cost", None)
 
         self.save_hunters()
         return {"added": added, "removed_zombie": removed_zombie, "replaced": replaced}

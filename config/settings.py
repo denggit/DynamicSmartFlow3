@@ -142,13 +142,13 @@ def get_tier_config(score: float) -> dict:
     <60: 0.03×3=0.09 | 60-80: 0.05×4=0.2 | 80-90: 0.1×5=0.5 | 90+: 0.2×5=1.0
     """
     if score >= 90:
-        return {"entry_sol": 0.2, "add_sol": 0.2, "max_sol": 1.0, "stop_loss_pct": 0.5}
+        return {"entry_sol": 0.2, "add_sol": 0.2, "max_sol": 1.0, "stop_loss_pct": 0.65}
     if score >= 80:
-        return {"entry_sol": 0.1, "add_sol": 0.1, "max_sol": 0.5, "stop_loss_pct": 0.4}
+        return {"entry_sol": 0.1, "add_sol": 0.1, "max_sol": 0.5, "stop_loss_pct": 0.65}
     if score >= 60:
-        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.2, "stop_loss_pct": 0.3}
+        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.2, "stop_loss_pct": 0.65}
     # 60 分以下也跟，但额度小
-    return {"entry_sol": 0.03, "add_sol": 0.03, "max_sol": 0.09, "stop_loss_pct": 0.3}
+    return {"entry_sol": 0.03, "add_sol": 0.03, "max_sol": 0.09, "stop_loss_pct": 0.65}
 
 # 猎手加仓跟随阈值：只跟对方买入 ≥ 1 SOL 的单
 HUNTER_ADD_THRESHOLD_SOL = 1.0
@@ -162,8 +162,7 @@ TRADING_SCORE_MULTIPLIER = 0.001
 # 首买追高限制：首个猎手买入后若已涨 300%（现价/首买价 ≥ 4），坚决不买、不加仓
 MAX_ENTRY_PUMP_MULTIPLIER = 4.0  # 4x = 300% 涨幅
 
-# 止损：按档位 (60-80: 30% / 80-90: 40% / 90+: 50%)，由 get_tier_config 返回
-STOP_LOSS_PCT = 0.4  # 默认兜底（80-90 档）
+# 止损：按档位由 get_tier_config 返回，无独立常量
 
 # 卖出精度保护：全仓/接近全仓卖出时仅卖 99.9%，避免浮点转 int 时多出 1 wei 导致链上失败
 SELL_BUFFER = 0.999  # 留 0.1% 缓冲，防止 rounding overflow
@@ -171,9 +170,9 @@ SELL_BUFFER = 0.999  # 留 0.1% 缓冲，防止 rounding overflow
 # 止盈策略 (触发倍数, 卖出比例)
 # 1.5 = 收益率 150% (即 2.5倍)
 TAKE_PROFIT_LEVELS = [
-    (1.3, 0.5),  # 赚 130% -> 卖 50%
-    (5.0, 0.5),  # 赚 500% -> 卖 50%
-    (10.0, 0.5)  # 赚 1000% -> 卖 50%
+    # (1.0, 0.25),   # +100% → 卖 25%（回本50%）
+    # (3.0, 0.25),   # +300% → 再卖 25% （回本）
+    (10.0, 0.8)    # +1000% → 再卖 80%
 ]
 
 # 份额管理
