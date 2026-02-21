@@ -184,7 +184,7 @@ SOLANA_PRIVATE_KEY_BASE58 = os.getenv("SOLANA_PRIVATE_KEY")
 # ==================== 猎手挖掘 (sm_searcher) ====================
 MIN_TOKEN_AGE_SEC = 1800  # 最少上市 30 (太新的币数据少，难找好猎手)
 MAX_TOKEN_AGE_SEC = 21600  # 最多上市 6 小时 (放宽年龄)
-MAX_BACKTRACK_PAGES = 30  # 最多回溯 30 页 (3万笔交易)
+MAX_BACKTRACK_PAGES = 50  # 最多回溯 50 页 (5万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
 MIN_SUCCESSFUL_TX_FOR_FREQUENCY = 10  # blockTime 频率检测：成功交易(err=null)少于此次否决（死号/新号/矩阵号）
 MAX_FAILURE_RATE_FOR_FREQUENCY = 0.30  # 失败率超过 30% 即否决（Spam Bot 反向指标）
@@ -244,7 +244,7 @@ MAX_ENTRY_FDV_USD = 1000000.0  # 最大可接受入场 FDV (USD)
 MIN_LIQUIDITY_TO_FDV_RATIO = 0.03  # 流动性/市值比至少 3%
 
 # ==================== 猎手监控 (hunter_monitor) ====================
-DISCOVERY_INTERVAL = 1800  # 挖掘间隔 15 分钟
+DISCOVERY_INTERVAL = 1800  # 挖掘间隔 30 分钟
 POOL_SIZE_LIMIT = 100  # 猎手池上限
 ZOMBIE_THRESHOLD_DAYS = 15  # 多少天未交易视为僵尸
 AUDIT_EXPIRATION_DAYS = 20  # 体检有效期 (天)，超过需重新体检
