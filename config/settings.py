@@ -208,6 +208,8 @@ SM_MIN_TOKEN_PROFIT_PCT = 100.0  # 入库门槛：该代币当下至少赚 100% 
 SM_AUDIT_TX_LIMIT = 300  # 体检时拉取交易笔数
 SM_LP_CHECK_TX_LIMIT = 100  # LP 预检 + 频率检测：先拉 100 笔查 LP 行为（加池/撤池）及频率，有则直接淘汰，通过后再拉满 500
 SM_EARLY_TX_PARSE_LIMIT = 300  # 初筛：最多解析多少笔早期交易（按时间取前 N 笔）
+SM_USE_ATA_FIRST = os.getenv("SM_USE_ATA_FIRST", "true").lower() in ("1", "true", "yes")  # 先用 ATA 算 ROI，达标再拉主钱包，省 Helius
+SM_ATA_SIG_LIMIT = 50  # ATA 模式最多拉签名数（通常 2~20 笔，1 次 POST=100 credits）
 SM_MIN_BUY_SOL = 0.1  # 初筛：单笔买入最少 SOL
 SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
 # 入库硬门槛（取代原 40% 胜率 / 100 SOL）

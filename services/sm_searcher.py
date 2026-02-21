@@ -30,6 +30,8 @@ from config.settings import (
     MAX_TOKEN_AGE_SEC,
     MAX_BACKTRACK_PAGES,
     SM_EARLY_TX_PARSE_LIMIT,
+    SM_USE_ATA_FIRST,
+    SM_ATA_SIG_LIMIT,
     RECENT_TX_COUNT_FOR_FREQUENCY,
     MIN_SUCCESSFUL_TX_FOR_FREQUENCY,
     MAX_FAILURE_RATE_FOR_FREQUENCY,
@@ -55,6 +57,7 @@ from src.alchemy import alchemy_client
 from src.helius import helius_client
 from utils.logger import get_logger
 from utils.hunter_scoring import compute_hunter_score
+from utils.solana_ata import get_associated_token_address
 
 logger = get_logger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -543,23 +546,81 @@ class SmartMoneySearcher:
         """
         计算猎手在该代币上的收益率 (ROI %)，已清仓用卖出收益算，未清仓用现价估算。
         返回 (ROI 百分比, 交易列表)，若无法计算返回 (None, None)。
-        精准制导：用猎手在该代币上的 ATA 地址拉签名，100% 为该代币交易，仅 2~3 笔 Helius 解析。
-        交易列表供后续 analyze_hunter_performance 复用；ATA 模式仅含本代币 txs，复用为 None 时由体检自行拉取。
+        ATA 优先模式 (SM_USE_ATA_FIRST)：先用 ATA 拉 2~50 笔算 ROI（~100 credits），
+        达标后再拉主钱包 300 笔供体检；不达标直接返回，省约 200 credits/人。
         """
-        # 1. 主钱包频率预检（Alchemy 免费），拉 audit_tx_limit 以便后续复用解析
+        usdc_price = await self._get_usdc_price_sol(client)
+        parser = TransactionParser(hunter_address)
+        calc = TokenAttributionCalculator()
+
+        if SM_USE_ATA_FIRST:
+            # ATA 优先：先试 Token2022（Pump），再试 Token
+            ata_addrs = []
+            for prog in ("Token2022", "Token"):
+                try:
+                    ata_addrs.append(get_associated_token_address(hunter_address, token_address, prog))
+                except Exception:
+                    pass
+            ata_sigs, ata_used = [], None
+            for ata_addr in ata_addrs:
+                if not ata_addr:
+                    continue
+                sigs = await self.get_signatures(client, ata_addr, limit=SM_ATA_SIG_LIMIT)
+                if sigs:
+                    ata_sigs, ata_used = sigs, ata_addr
+                    break
+            if ata_sigs:
+                txs_ata = await self.fetch_parsed_transactions(client, ata_sigs)
+                if txs_ata:
+                    if hunter_had_any_lp_on_token(txs_ata, hunter_address, token_address, ata_address=ata_used):
+                        logger.warning("⚠️ LP 行为淘汰(ATA): %s.. 已加入黑名单", hunter_address[:12])
+                        self._add_to_wallet_blacklist(hunter_address)
+                        return None, None
+                    buy_sol, sell_sol, tokens_held = 0.0, 0.0, 0.0
+                    for tx in sorted(txs_ata, key=lambda x: _get_tx_timestamp(x)):
+                        try:
+                            sol_c, token_c, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price)
+                            if token_address not in token_c or abs(token_c[token_address]) < 1e-9:
+                                continue
+                            buy_a, sell_a = calc.calculate_attribution(sol_c, token_c)
+                            buy_sol += buy_a.get(token_address, 0)
+                            sell_sol += sell_a.get(token_address, 0)
+                            tokens_held += token_c[token_address]
+                        except Exception:
+                            continue
+                    if buy_sol < 0.01:
+                        return None, None
+                    total_value = sell_sol
+                    if tokens_held > 1e-9:
+                        price = await self._get_token_price_sol(client, token_address)
+                        if price and price > 0:
+                            total_value += tokens_held * price
+                    roi_ata = (total_value - buy_sol) / buy_sol * 100
+                    if roi_ata < SM_MIN_TOKEN_PROFIT_PCT:
+                        return None, None  # 省约 200 credits
+                    # ROI 达标，拉主钱包供 analyze 复用
+                    sigs_main = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
+                    if not sigs_main or _is_frequent_trader_by_blocktimes(sigs_main):
+                        return None, None
+                    txs_main = await self.fetch_parsed_transactions(client, sigs_main)
+                    if not txs_main:
+                        return None, None
+                    if hunter_had_any_lp_on_token(txs_main, hunter_address, token_address, ata_address=None):
+                        logger.warning("⚠️ LP 行为淘汰: %s.. 主钱包含 LP，已加入黑名单", hunter_address[:12])
+                        self._add_to_wallet_blacklist(hunter_address)
+                        return None, None
+                    return roi_ata, txs_main
+
+        # 主钱包模式（原逻辑 / ATA 空时 fallback）
         sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
         if not sigs:
             return None, None
         if _is_frequent_trader_by_blocktimes(sigs):
             logger.debug("⏭️ 频率淘汰(blockTime预检) %s.. 省 Helius 解析", hunter_address[:12])
             return None, None
-
-        # 2. 一次性解析主钱包交易，供 LP 预检、ROI、analyze 复用（省 1 次 Helius）
         txs = await self.fetch_parsed_transactions(client, sigs)
         if not txs:
             return None, None
-
-        # 3. LP 预检：主钱包交易含该代币 LP 行为则淘汰并拉黑
         if hunter_had_any_lp_on_token(txs, hunter_address, token_address, ata_address=None):
             logger.warning(
                 "⚠️ LP 行为淘汰: %s.. 曾对该代币有 LP 操作（加池/撤池），已加入黑名单，永不跟仓",
@@ -567,26 +628,16 @@ class SmartMoneySearcher:
             )
             self._add_to_wallet_blacklist(hunter_address)
             return None, None
-
-        usdc_price = await self._get_usdc_price_sol(client)
-        parser = TransactionParser(hunter_address)
-        calc = TokenAttributionCalculator()
         buy_sol, sell_sol, tokens_held = 0.0, 0.0, 0.0
-        txs.sort(key=lambda x: _get_tx_timestamp(x))
-        for tx in txs:
+        for tx in sorted(txs, key=lambda x: _get_tx_timestamp(x)):
             try:
-                sol_change, token_changes, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price)
-                if token_address not in token_changes:
+                sol_c, token_c, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price)
+                if token_address not in token_c or abs(token_c[token_address]) < 1e-9:
                     continue
-                delta = token_changes[token_address]
-                if abs(delta) < 1e-9:
-                    continue
-                buy_attrs, sell_attrs = calc.calculate_attribution(sol_change, token_changes)
-                if token_address in buy_attrs:
-                    buy_sol += buy_attrs[token_address]
-                if token_address in sell_attrs:
-                    sell_sol += sell_attrs[token_address]
-                tokens_held += delta
+                buy_a, sell_a = calc.calculate_attribution(sol_c, token_c)
+                buy_sol += buy_a.get(token_address, 0)
+                sell_sol += sell_a.get(token_address, 0)
+                tokens_held += token_c[token_address]
             except Exception:
                 continue
         if buy_sol < 0.01:
@@ -594,10 +645,9 @@ class SmartMoneySearcher:
         total_value = sell_sol
         if tokens_held > 1e-9:
             price = await self._get_token_price_sol(client, token_address)
-            if price is not None and price > 0:
+            if price and price > 0:
                 total_value += tokens_held * price
         roi = (total_value - buy_sol) / buy_sol * 100
-        # 返回 txs 供 analyze_hunter_performance 复用，省 1 次 Helius 解析
         return roi, txs
 
     async def verify_token_age_via_dexscreener(self, client, token_address):

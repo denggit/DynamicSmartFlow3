@@ -71,13 +71,14 @@ resp = await client.post(url, json={"transactions": to_fetch[:100]})  # 1 次 PO
 
 - 300 笔 ÷ 100 = **3 次 POST = 300 credits/代币**
 
-#### 2b. ROI 过滤（每个候选人）
+#### 2b. ROI 过滤（每个候选人，ATA 优先模式）
 
-- `get_hunter_profit_on_token`：300 笔 = **300 credits/人**
-- ROI 达标者：`analyze_hunter_performance` 复用，0 额外
-- 未达标者：每人仍消耗 300 credits
+- **ATA 优先** (`SM_USE_ATA_FIRST=true`)：先用 ATA 拉 2~50 笔算 ROI，~**100 credits/人**
+- ROI **未达标**：直接返回，省约 200 credits（不拉主钱包 300 笔）
+- ROI **达标**：再拉主钱包 300 笔供体检，100 + 300 = **400 credits/人**
 
-**单代币消耗** = 300 + 候选人数量 × 300
+**单代币消耗** ≈ 300 + 未达标人数×100 + 达标人数×400  
+典型 106 人→1 达标：300 + 105×100 + 1×400 = **10,900 credits**（原 31,800，省 ~65%）
 
 #### 2c. 日挖掘量
 
