@@ -28,10 +28,10 @@ async def wait_before_request() -> None:
     """
     Alchemy RPC 请求前调用：等待满足最小间隔，并登记本次调用开始时间。
     """
+    global _last_call_time
     interval = _get_interval()
     async with _lock:
         elapsed = time.monotonic() - _last_call_time
         if elapsed < interval:
             await asyncio.sleep(interval - elapsed)
-        global _last_call_time
         _last_call_time = time.monotonic()
