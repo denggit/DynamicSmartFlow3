@@ -283,26 +283,47 @@ async def check_token_liquidity(token_mint: str) -> Tuple[bool, float, float]:
     """
     查询流动性（早期跟单不强制高流动性，仅作参考）。
     返回: (是否有池子, liquidity_usd, fdv_usd)。
+    先用 DexScreener；若查不到或流动性为 0，用 Birdeye 兜底（新币收录更快）。
     """
     if token_mint == WSOL_MINT:
         return True, 999999999.0, 999999999.0
 
+    has_pool = False
+    liq_usd = 0.0
+    fdv_usd = 0.0
+
     url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
     try:
         resp = await _fetch_with_retry(url, timeout=DEXSCREENER_TIMEOUT)
-        if resp is None or resp.status_code != 200:
-            return False, 0.0, 0.0
-        data = resp.json()
-        pairs = data.get("pairs", [])
-        if not pairs:
-            return False, 0.0, 0.0
-        solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-        if not solana_pairs:
-            return False, 0.0, 0.0
-        best = max(solana_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd") or 0))
-        liq = float(best.get("liquidity", {}).get("usd") or 0)
-        fdv = float(best.get("fdv", 0) or 0)
-        return True, liq, fdv
+        if resp is not None and resp.status_code == 200:
+            data = resp.json()
+            pairs = data.get("pairs", [])
+            if pairs:
+                solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+                if solana_pairs:
+                    best = max(solana_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd") or 0))
+                    liq_usd = float(best.get("liquidity", {}).get("usd") or 0)
+                    fdv_usd = float(best.get("fdv", 0) or 0)
+                    if liq_usd > 0:
+                        has_pool = True
     except Exception as e:
-        logger.warning("流动性查询异常: %s", e)
-        return False, 0.0, 0.0
+        logger.warning("DexScreener 流动性查询异常: %s", e)
+
+    # DexScreener 未查到或流动性为 0 时，用 Birdeye 兜底（Pump.fun 新币等收录更快）
+    if not has_pool or liq_usd == 0:
+        try:
+            from config.settings import birdeye_key_pool
+            if birdeye_key_pool.size > 0:
+                from src.birdeye import birdeye_client
+                logger.debug("DexScreener 未查到流动性，使用 Birdeye 兜底查询...")
+                market_data = await birdeye_client.get_token_market_data(token_mint, timeout=5.0)
+                if market_data:
+                    liq = float(market_data.get("liquidity", 0) or 0)
+                    fdv = float(market_data.get("fdv", 0) or 0)
+                    if liq > 0:
+                        logger.debug("Birdeye 兜底成功: liq=$%.0f fdv=$%.0f", liq, fdv)
+                        return True, liq, fdv
+        except Exception as e:
+            logger.debug("Birdeye 兜底查询异常: %s", e)
+
+    return has_pool, liq_usd, fdv_usd

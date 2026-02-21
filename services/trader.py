@@ -479,6 +479,35 @@ class SolanaTrader:
         if tier:
             stop_loss_pct = tier["stop_loss_pct"]
         if pnl_pct <= -stop_loss_pct:
+            # Birdeye 二次验价：DexScreener 可能因假暴涨/假暴跌插针误触发止损，用 Birdeye 交叉验证
+            proceed_stop_loss = True
+            try:
+                from config.settings import birdeye_key_pool
+                if birdeye_key_pool.size > 0:
+                    from src.birdeye import birdeye_client
+                    logger.warning(
+                        "📉 DexScreener 报亏损触及止损线: %.0f%%，启动 Birdeye 二次验价防插针...",
+                        pnl_pct * 100,
+                    )
+                    full = await birdeye_client.get_price_full(token_address, timeout=3.0)
+                    if full and full.get("priceInNative") is not None:
+                        be_price_sol = float(full["priceInNative"])
+                        if be_price_sol > 0 and pos.average_price > 0:
+                            be_pnl_pct = (be_price_sol - pos.average_price) / pos.average_price
+                            if be_pnl_pct > -stop_loss_pct:
+                                logger.info(
+                                    "🛡️ Birdeye 验价拦截：真实亏损 %.0f%% 未达止损 %.0f%%，疑似 DexScreener 插针，跳过止损",
+                                    be_pnl_pct * 100,
+                                    stop_loss_pct * 100,
+                                )
+                                proceed_stop_loss = False
+                            else:
+                                logger.info("🛡️ Birdeye 验价确认：真实亏损 %.0f%%，执行止损", be_pnl_pct * 100)
+            except Exception as e:
+                logger.debug("Birdeye 二次验价异常，回退 DexScreener 判定: %s", e)
+            if not proceed_stop_loss:
+                return
+
             chain_bal = await self._fetch_own_token_balance(token_address)
             sell_amount = chain_bal if chain_bal is not None else pos.total_tokens * SELL_BUFFER
             if chain_bal is not None and chain_bal < pos.total_tokens * 0.99:
