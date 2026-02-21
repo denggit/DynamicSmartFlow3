@@ -5,17 +5,15 @@
 @File    : trader.py
 @Description: 交易执行核心 (真实交易版)
               1. 资金/份额/止盈逻辑 (保持不变)
-              2. [新增] Jupiter + Helius 真实 Swap 逻辑
+              2. Jupiter + Alchemy RPC 真实 Swap 逻辑
 """
 
 import asyncio
 import base64
 import json
 import math
-import os
 import threading
 import time
-from pathlib import Path
 from typing import Dict, List, Set, Optional, Tuple, Callable, Any
 
 import httpx
@@ -28,16 +26,14 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from config.settings import (
-    get_tier_config, HUNTER_ADD_THRESHOLD_SOL,
-    TRADING_MAX_SOL_PER_TOKEN, TRADING_MIN_BUY_SOL, TRADING_ADD_BUY_SOL,
-    TAKE_PROFIT_LEVELS, STOP_LOSS_PCT,
+    get_tier_config, TAKE_PROFIT_LEVELS, STOP_LOSS_PCT,
     MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
     SOLANA_PRIVATE_KEY_BASE58,
-    JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, PRIORITY_FEE_SETTINGS,
-    BASE_DIR, helius_key_pool, jup_key_pool,
+    JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, BASE_DIR, jup_key_pool,
     TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
     TRADER_RPC_TIMEOUT,
 )
+from services.alchemy import alchemy_client
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -103,10 +99,9 @@ class SolanaTrader:
                 logger.exception("❌ 私钥格式错误")
                 self.keypair = None
 
-        # Helius / Jupiter 各自独立 Key 池，谁不可用谁自己换下一个
-        self._helius_pool = helius_key_pool
+        # Alchemy Client (RPC) / Jupiter 各自独立，谁不可用谁自己换下一个
         self._jup_pool = jup_key_pool
-        self.rpc_client = AsyncClient(helius_key_pool.get_rpc_url(), commitment=Confirmed)
+        self.rpc_client = AsyncClient(alchemy_client.get_rpc_url(), commitment=Confirmed)
         self.http_client = httpx.AsyncClient(timeout=TRADER_RPC_TIMEOUT)
 
     def _jup_headers(self) -> dict:
@@ -120,19 +115,19 @@ class SolanaTrader:
 
     async def _recreate_rpc_client(self) -> None:
         """
-        当前 Helius key 不可用（429 等）时，切换 Helius 池内下一个并重建 RPC 客户端。
-        若仅配置 1 个 Key，切换无效，需在 .env 中配置多个：HELIUS_API_KEY=key1,key2,key3
+        当前 Alchemy key 不可用（429 等）时，切换 Alchemy 池内下一个并重建 RPC 客户端。
+        若仅配置 1 个 Key，切换无效，需在 .env 中配置多个：ALCHEMY_API_KEY=key1,key2,key3
         """
         try:
             await self.rpc_client.close()
         except Exception:
             pass
-        self._helius_pool.mark_current_failed()
-        self.rpc_client = AsyncClient(self._helius_pool.get_rpc_url(), commitment=Confirmed)
-        if self._helius_pool.size <= 1:
-            logger.warning("⚠️ 仅配置 1 个 Helius Key，429 时切换无效，建议配置多个: HELIUS_API_KEY=key1,key2,key3")
+        alchemy_client.mark_current_failed()
+        self.rpc_client = AsyncClient(alchemy_client.get_rpc_url(), commitment=Confirmed)
+        if alchemy_client.size <= 1:
+            logger.warning("⚠️ 仅配置 1 个 Alchemy Key，429 时切换无效，建议配置多个: ALCHEMY_API_KEY=key1,key2,key3")
         else:
-            logger.info("🔄 已切换 Helius Key，重建 RPC 客户端")
+            logger.info("🔄 已切换 Alchemy Key，重建 RPC 客户端")
 
     async def close(self):
         await self.rpc_client.close()
@@ -141,52 +136,26 @@ class SolanaTrader:
     async def _fetch_own_token_balance(self, token_mint: str) -> Optional[float]:
         """
         获取我方钱包在链上的 Token 余额（UI 单位）。
-        用于卖出前校验：内部状态可能因各种原因与链上不一致，需以链上为准 cap 卖出数量。
-        遇 Helius 429 时切换 Key 重试。
+        通过 AlchemyClient.get_token_accounts_by_owner 调用，429 时由 Client 内部切换 Key 重试。
         """
         if not self.keypair:
             return None
         owner_b58 = str(self.keypair.pubkey())
-        payload = {
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                owner_b58,
-                {"mint": token_mint},
-                {"encoding": "jsonParsed"}
-            ]
-        }
-        for attempt in range(2):  # 最多 2 次：首次 + 429 后切换 Key 重试
-            try:
-                resp = await self.http_client.post(
-                    self._helius_pool.get_rpc_url(), json=payload, timeout=TRADER_RPC_TIMEOUT
-                )
-                if resp.status_code == 429:
-                    if self._helius_pool.size > 1 and attempt == 0:
-                        logger.warning("获取 Token 余额遇 Helius 429，切换 Key 重试")
-                        await self._recreate_rpc_client()
-                        continue
-                    return None
-                if resp.status_code != 200:
-                    return None
-                data = resp.json()
-                if "result" in data and data["result"]["value"]:
-                    total_ui = 0.0
-                    for acc in data["result"]["value"]:
-                        info = acc["account"]["data"]["parsed"]["info"]
-                        tamt = info.get("tokenAmount") or {}
-                        ui = tamt.get("uiAmount")
-                        if ui is not None:
-                            total_ui += float(ui)
-                    return total_ui if total_ui > 0 else None
-                return 0.0  # 无持仓
-            except Exception:
-                if attempt == 0 and self._helius_pool.size > 1:
-                    await self._recreate_rpc_client()
-                    continue
-                logger.debug("获取链上 Token 余额失败", exc_info=True)
-                return None
-        return None
+        result = await alchemy_client.get_token_accounts_by_owner(
+            owner_b58, token_mint, http_client=self.http_client, timeout=TRADER_RPC_TIMEOUT
+        )
+        if result is None:
+            return None  # 请求失败
+        if not result.get("value"):
+            return 0.0  # 无持仓
+        total_ui = 0.0
+        for acc in result["value"]:
+            info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+            tamt = info.get("tokenAmount") or {}
+            ui = tamt.get("uiAmount")
+            if ui is not None:
+                total_ui += float(ui)
+        return total_ui if total_ui > 0 else None
 
     async def ensure_fully_closed(self, token_address: str) -> None:
         """
@@ -390,7 +359,8 @@ class SolanaTrader:
 
         # 猎手微调（卖出比例过小）不跟，避免噪音
         if sell_ratio < FOLLOW_SELL_THRESHOLD:
-            logger.debug("跟随卖出跳过: 猎手卖出比例 %.1f%% < 阈值 %.0f%%", sell_ratio * 100, FOLLOW_SELL_THRESHOLD * 100)
+            logger.debug("跟随卖出跳过: 猎手卖出比例 %.1f%% < 阈值 %.0f%%", sell_ratio * 100,
+                         FOLLOW_SELL_THRESHOLD * 100)
             return
 
         actual_ratio = max(sell_ratio, MIN_SELL_RATIO)
@@ -545,7 +515,7 @@ class SolanaTrader:
                     "sol_spent": 0.0,
                     "sol_received": sol_received,
                     "token_amount": sell_amount,
-                    "note": f"止损{stop_loss_pct*100:.0f}%",
+                    "note": f"止损{stop_loss_pct * 100:.0f}%",
                     "pnl_sol": pnl_sol,
                 })
                 if self.on_trade_recorded:
@@ -561,7 +531,7 @@ class SolanaTrader:
                         "price": pos.average_price,
                         "hunter_addr": lead,
                         "pnl_sol": pnl_sol,
-                        "note": f"止损{stop_loss_pct*100:.0f}%",
+                        "note": f"止损{stop_loss_pct * 100:.0f}%",
                     })
                 self._emit_position_closed(token_address, pos)
                 del self.positions[token_address]
@@ -637,10 +607,10 @@ class SolanaTrader:
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
                             is_sell: bool = False, token_decimals: int = 9) -> Tuple[Optional[str], float]:
         """
-        通用 Swap 函数 (Jupiter v1 + Helius 广播)。Helius/Jupiter 各自独立切 key，
+        通用 Swap 函数 (Jupiter v1 + Alchemy RPC 广播)。Alchemy/Jupiter 各自独立切 key，
         遇 429 时先 backoff 等待再切换 key 重试。
         """
-        max_attempts = max(3, self._helius_pool.size)
+        max_attempts = max(3, alchemy_client.size)
         for attempt in range(max_attempts):
             try:
                 if not is_sell:
@@ -665,7 +635,8 @@ class SolanaTrader:
                     self._jup_pool.mark_current_failed()
                     if attempt < max_attempts - 1:
                         backoff_sec = 5 + attempt * 3  # 5s, 8s, 11s...
-                        logger.warning("Jupiter Quote 429，%ds 后重试 (attempt %d/%d)", backoff_sec, attempt + 1, max_attempts)
+                        logger.warning("Jupiter Quote 429，%ds 后重试 (attempt %d/%d)", backoff_sec, attempt + 1,
+                                       max_attempts)
                         await asyncio.sleep(backoff_sec)
                         continue
                 if quote_resp.status_code != 200:
@@ -689,7 +660,8 @@ class SolanaTrader:
                     self._jup_pool.mark_current_failed()
                     if attempt < max_attempts - 1:
                         backoff_sec = 5 + attempt * 3
-                        logger.warning("Jupiter Swap Build 429，%ds 后重试 (attempt %d/%d)", backoff_sec, attempt + 1, max_attempts)
+                        logger.warning("Jupiter Swap Build 429，%ds 后重试 (attempt %d/%d)", backoff_sec, attempt + 1,
+                                       max_attempts)
                         await asyncio.sleep(backoff_sec)
                         continue
                 if swap_resp.status_code != 200:
@@ -720,7 +692,7 @@ class SolanaTrader:
                         TX_VERIFY_RETRY_DELAY_SEC, sig_str,
                     )
                     await asyncio.sleep(TX_VERIFY_RETRY_DELAY_SEC)
-                    if self._helius_pool.size >= 1:
+                    if alchemy_client.size >= 1:
                         await self._recreate_rpc_client()
                     verified = await self._verify_tx_confirmed(
                         sig_str, max_wait_sec=TX_VERIFY_RETRY_MAX_WAIT_SEC
@@ -741,9 +713,10 @@ class SolanaTrader:
                     return sig_str, out_amount_raw
                 return sig_str, out_amount_raw / LAMPORTS_PER_SOL
             except Exception as e:
-                if attempt < max_attempts - 1 and self._helius_pool.size >= 1 and _is_rate_limit_error(e):
+                if attempt < max_attempts - 1 and alchemy_client.size >= 1 and _is_rate_limit_error(e):
                     backoff_sec = 8 + attempt * 4  # send_raw_transaction 429 需较长等待
-                    logger.warning("Helius RPC 限流 (send_raw_transaction)，%ds backoff 后切换 Key 重试: %s", backoff_sec, e)
+                    logger.warning("Alchemy RPC 限流 (send_raw_transaction)，%ds backoff 后切换 Key 重试: %s",
+                                   backoff_sec, e)
                     await asyncio.sleep(backoff_sec)
                     await self._recreate_rpc_client()
                     continue
@@ -752,7 +725,7 @@ class SolanaTrader:
         return None, 0
 
     async def _get_jupiter_implied_pnl(
-        self, token_mint: str, average_price: float, decimals: int
+            self, token_mint: str, average_price: float, decimals: int
     ) -> Optional[float]:
         """
         用 Jupiter Quote 卖少量 token，推算真实可卖价，用于校验 DexScreener 是否虚高。
@@ -789,7 +762,7 @@ class SolanaTrader:
     async def _verify_tx_confirmed(self, sig_str: str, max_wait_sec: int | None = None) -> bool:
         """
         轮询 get_signature_statuses，确认交易成功落地。
-        链上失败（滑点等）时返回 False。遇 Helius 429 时切换 Key 继续轮询，避免限流误判。
+        链上失败（滑点等）时返回 False。遇 Alchemy 429 时切换 Key 继续轮询，避免限流误判。
         """
         if max_wait_sec is None:
             max_wait_sec = TX_VERIFY_MAX_WAIT_SEC
@@ -800,8 +773,8 @@ class SolanaTrader:
                 try:
                     resp = await self.rpc_client.get_signature_statuses([sig])
                 except Exception as e:
-                    if _is_rate_limit_error(e) and self._helius_pool.size > 1:
-                        logger.warning("验证交易时 Helius 429，切换 Key 继续: %s", e)
+                    if _is_rate_limit_error(e) and alchemy_client.size > 1:
+                        logger.warning("验证交易时 Alchemy 429，切换 Key 继续: %s", e)
                         await self._recreate_rpc_client()
                         await asyncio.sleep(1)
                         continue
@@ -821,7 +794,8 @@ class SolanaTrader:
                     logger.warning("交易链上执行失败 err=%s", err)
                     return False
                 conf = getattr(st, "confirmation_status", None) or ""
-                if conf in ("confirmed", "finalized") or getattr(st, "confirmationStatus", "") in ("confirmed", "finalized"):
+                if conf in ("confirmed", "finalized") or getattr(st, "confirmationStatus", "") in (
+                "confirmed", "finalized"):
                     return True
                 await asyncio.sleep(1)
         except Exception:
@@ -831,7 +805,7 @@ class SolanaTrader:
     async def _get_decimals(self, mint_address: str) -> int:
         """
         获取代币精度。Pump.fun 代币多为 6 位，遇 429/限流时不再重试，
-        直接返回默认值；但必须切换 Helius Key，否则后续 send_transaction 会继续打同一 Key。
+        直接返回默认值；但必须切换 Alchemy Key，否则后续 send_transaction 会继续打同一 Key。
         """
         try:
             pubkey = Pubkey.from_string(mint_address)
@@ -840,7 +814,7 @@ class SolanaTrader:
         except Exception as e:
             if _is_rate_limit_error(e):
                 logger.warning("获取 decimals 遇限流，切换 Key 并使用默认 6: %s", e)
-                if self._helius_pool.size >= 1:
+                if alchemy_client.size >= 1:
                     await self._recreate_rpc_client()
             else:
                 logger.exception("获取 decimals 失败，使用默认 6")
@@ -956,6 +930,7 @@ class SolanaTrader:
 
     def _save_state_in_background(self) -> None:
         """后台线程持久化持仓，不阻塞跟单。"""
+
         def _run():
             self._save_state_safe()
 

@@ -45,6 +45,7 @@ from config.settings import (
     SM_ROI_MULT_100_200,
     SM_ROI_MULT_50_100,
 )
+from services import helius_client
 from services.dexscreener.dex_scanner import DexScanner
 from services.sm_searcher import SmartMoneySearcher, TransactionParser
 from utils.logger import get_logger
