@@ -18,17 +18,16 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Callable, Optional
 
-import httpx
 import websockets
 
 from config.settings import (
-    helius_key_pool,
     SYNC_POSITIONS_INTERVAL_SEC,
     SYNC_MIN_DELTA_RATIO,
     SYNC_PROTECTION_AFTER_START_SEC,
     NEW_HUNTER_ADD_WINDOW_SEC,
     USDC_PER_SOL,
 )
+from services.alchemy import alchemy_client
 from services.sm_searcher import IGNORE_MINTS, TransactionParser
 from utils.logger import get_logger
 
@@ -96,7 +95,7 @@ class HunterAgentController:
     async def on_tx_from_monitor(self, tx: dict, active_hunters: set):
         """
         Monitor 消费队列命中钱包池后推送：同一笔 tx + 命中的猎手集合。
-        用 Helius 格式解析 token 变动：
+        用 Helius 解析格式解析 token 变动（Monitor 推送的 tx 为 Helius 格式）：
         1. 已跟仓的 (hunter, token)：发 HUNTER_SELL / HUNTER_BUY
         2. 新增猎手：池内猎手买入我们正在持有的 token 时，加入任务并发 HUNTER_BUY 触发加仓
         """
@@ -285,7 +284,7 @@ class HunterAgentController:
                     await asyncio.sleep(5)
                     continue
 
-                async with websockets.connect(helius_key_pool.get_wss_url()) as ws:
+                async with websockets.connect(alchemy_client.get_wss_url()) as ws:
                     logger.info(f"👀 Agent 已连接，正在监视 {len(monitored_hunters)} 名猎手的持仓变动...")
 
                     # 订阅 logs
@@ -315,8 +314,8 @@ class HunterAgentController:
                 status_code = getattr(e, "status_code", None)
                 is_429 = status_code == 429 or "429" in str(e).lower()
                 if is_429:
-                    helius_key_pool.mark_current_failed()
-                    logger.warning("⚠️ Helius WebSocket 429 限流，已切换 Key，5 秒后重试")
+                    alchemy_client.mark_current_failed()
+                    logger.warning("⚠️ Alchemy WebSocket 429 限流，已切换 Key，5 秒后重试")
                 else:
                     logger.exception("❌ Agent 监控异常，5秒后重试")
                 await asyncio.sleep(5)
@@ -326,51 +325,36 @@ class HunterAgentController:
         signature = log_info['value']['signature']
 
         # 1. 快速过滤: 这笔交易是否涉及我们关心的猎手？
-        # (Helius mentions 已经做了一层，但这里我们需要知道具体是哪个猎手)
-        # 为了准确，我们必须拉取交易详情
-
+        # 通过 Alchemy RPC 拉取交易详情
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    helius_key_pool.get_rpc_url(),
-                    json={"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
-                          "params": [signature, {"maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}]},
-                    timeout=10
-                )
-                if resp.status_code == 429 and helius_key_pool.size > 1:
-                    helius_key_pool.mark_current_failed()
-                if resp.status_code != 200:
-                    return
-                data = resp.json()
-                if "result" not in data or not data["result"]: return
-                tx = data["result"]
+            tx = await alchemy_client.get_transaction(signature, timeout=10)
+            if not tx:
+                return
 
-                # 2. 解析交易：找出参与的猎手，并只处理非 IGNORE 代币的变动（真实交易）
-                # 获取交易涉及的所有账号
-                account_keys = [k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"]]
-                involved_hunters = set(account_keys).intersection(self.hunter_map.keys())
+            # 2. 解析交易：找出参与的猎手，并只处理非 IGNORE 代币的变动（真实交易）
+            account_keys = [k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"]]
+            involved_hunters = set(account_keys).intersection(self.hunter_map.keys())
 
-                if not involved_hunters: return
+            if not involved_hunters:
+                return
 
-                # 3. 对每个涉及的猎手进行分析
-                # 注意：这里需要把 tx 转换成 TransactionParser 能懂的格式 (Helius API vs RPC 格式略有不同)
-                # 为了复用 sm_searcher 的 parser，我们最好做适配
-                # 这里简单处理，提取 timestamp
-                block_time = tx.get("blockTime", time.time())
+            # 3. 对每个涉及的猎手进行分析
+            # 注意：Alchemy getTransaction 返回标准 RPC 格式
+            block_time = tx.get("blockTime", time.time())
 
-                for hunter in involved_hunters:
-                    potential_tokens = self.hunter_map[hunter]
-                    token_changes = self._calculate_balance_changes(tx, hunter)
-                    # 与 SmartFlow3 一致：只把非 SOL/USDC/USDT 的变动当作真实交易，忽略 IGNORE_MINTS
-                    token_changes = {m: v for m, v in token_changes.items() if m not in IGNORE_MINTS}
-                    if not token_changes:
+            for hunter in involved_hunters:
+                potential_tokens = self.hunter_map[hunter]
+                token_changes = self._calculate_balance_changes(tx, hunter)
+                # 与 SmartFlow3 一致：只把非 SOL/USDC/USDT 的变动当作真实交易，忽略 IGNORE_MINTS
+                token_changes = {m: v for m, v in token_changes.items() if m not in IGNORE_MINTS}
+                if not token_changes:
+                    continue
+
+                for token_addr, (delta_raw, decimals) in token_changes.items():
+                    if token_addr not in potential_tokens:
                         continue
-
-                    for token_addr, (delta_raw, decimals) in token_changes.items():
-                        if token_addr not in potential_tokens:
-                            continue
-                        delta_ui = delta_raw / (10 ** decimals)
-                        await self.analyze_action(hunter, token_addr, delta_ui, tx, block_time)
+                    delta_ui = delta_raw / (10 ** decimals)
+                    await self.analyze_action(hunter, token_addr, delta_ui, tx, block_time)
 
         except Exception:
             logger.exception("日志处理失败")
@@ -489,35 +473,19 @@ class HunterAgentController:
             self.signal_callback(signal)
 
     async def _fetch_token_balance(self, hunter, token_mint):
-        """RPC 辅助：获取猎手当前的 Token 余额"""
+        """通过 AlchemyClient 获取猎手当前的 Token 余额（UI 单位）"""
         try:
-            async with httpx.AsyncClient() as client:
-                payload = {
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "getTokenAccountsByOwner",
-                    "params": [
-                        hunter,
-                        {"mint": token_mint},
-                        {"encoding": "jsonParsed"}
-                    ]
-                }
-                resp = await client.post(helius_key_pool.get_rpc_url(), json=payload, timeout=5)
-                if resp.status_code == 429 and helius_key_pool.size > 1:
-                    helius_key_pool.mark_current_failed()
-                data = resp.json()
-
-                if "result" in data and data["result"]["value"]:
-                    # 可能有多个账户，取总和
-                    total = 0.0
-                    for acc in data["result"]["value"]:
-                        info = acc["account"]["data"]["parsed"]["info"]
-                        total += float(info["tokenAmount"]["amount"])  # 使用 raw amount 吗？还是 uiAmount?
-                        # 这里为了和上面的 calculate_balance_changes 一致，最好用 raw amount
-                        # 但 RPC 返回的是 uiAmount...
-                        # 修正：calculate_balance_changes 里我们用的是 uiTokenAmount['amount'] (即 raw)
-                        # 所以这里也取 amount
-                    return total
+            result = await alchemy_client.get_token_accounts_by_owner(hunter, token_mint, timeout=5)
+            if not result or not result.get("value"):
                 return 0.0
+            total_ui = 0.0
+            for acc in result["value"]:
+                info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                tamt = info.get("tokenAmount") or {}
+                ui = tamt.get("uiAmount")
+                if ui is not None:
+                    total_ui += float(ui)
+            return total_ui if total_ui > 0 else 0.0
         except Exception:
             logger.exception("获取余额失败")
             return 0.0

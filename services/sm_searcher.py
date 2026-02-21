@@ -31,13 +31,14 @@ from config.settings import (
     MAX_BACKTRACK_PAGES,
     SM_EARLY_TX_PARSE_LIMIT,
     RECENT_TX_COUNT_FOR_FREQUENCY,
+    MIN_SUCCESSFUL_TX_FOR_FREQUENCY,
+    MAX_FAILURE_RATE_FOR_FREQUENCY,
     MIN_AVG_TX_INTERVAL_SEC,
     MIN_NATIVE_LAMPORTS_FOR_REAL,
     SCANNED_HISTORY_FILE,
     SM_MIN_DELAY_SEC,
     SM_MAX_DELAY_SEC,
     SM_AUDIT_TX_LIMIT,
-    SM_LP_CHECK_TX_LIMIT,
     SM_MIN_BUY_SOL,
     SM_MAX_BUY_SOL,
     SM_MIN_TOKEN_PROFIT_PCT,
@@ -54,9 +55,11 @@ from config.settings import (
     WALLET_BLACKLIST_WIN_RATE,
     USDC_PER_SOL,
 )
+from services.alchemy import alchemy_client
 from services.helius import helius_client
 from utils.logger import get_logger
 from utils.hunter_scoring import compute_hunter_score
+from utils.solana_ata import get_associated_token_address
 
 logger = get_logger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -82,23 +85,6 @@ def tx_has_real_trade(tx: dict) -> bool:
             return True
     for nt in tx.get("nativeTransfers", []):
         if (nt.get("amount") or 0) >= MIN_NATIVE_LAMPORTS_FOR_REAL:
-            return True
-    return False
-
-
-def is_real_trade_for_address(tx: dict, address: str) -> bool:
-    """
-    判断该笔交易对给定地址而言是否为「真实交易」：该地址参与了非 IGNORE 的 token 或 meaningful 的 native。
-    """
-    for tt in tx.get("tokenTransfers", []):
-        if tt.get("mint") in IGNORE_MINTS:
-            continue
-        if tt.get("fromUserAccount") == address or tt.get("toUserAccount") == address:
-            return True
-    for nt in tx.get("nativeTransfers", []):
-        if (nt.get("amount") or 0) < MIN_NATIVE_LAMPORTS_FOR_REAL:
-            continue
-        if nt.get("fromUserAccount") == address or nt.get("toUserAccount") == address:
             return True
     return False
 
@@ -141,11 +127,12 @@ def tx_is_any_lp_behavior(tx: dict) -> bool:
 
 
 def hunter_had_any_lp_on_token(
-    txs: list, hunter_address: str, token_address: str
+    txs: list, hunter_address: str, token_address: str, ata_address: str | None = None
 ) -> bool:
     """
     检查该猎手在该代币上是否有任何 LP 行为（加池/撤池）。
     有则视为项目方或老鼠仓，返回 True，直接淘汰并拉黑。
+    ata_address: 可选，猎手在该代币上的 ATA；Helius 可能用 token 账户地址，需同时匹配。
     """
     for tx in (txs or []):
         if not tx_is_any_lp_behavior(tx):
@@ -153,7 +140,10 @@ def hunter_had_any_lp_on_token(
         for tt in tx.get("tokenTransfers", []):
             if tt.get("mint") != token_address:
                 continue
-            if tt.get("fromUserAccount") == hunter_address or tt.get("toUserAccount") == hunter_address:
+            from_a, to_a = tt.get("fromUserAccount"), tt.get("toUserAccount")
+            if from_a == hunter_address or to_a == hunter_address:
+                return True
+            if ata_address and (from_a == ata_address or to_a == ata_address):
                 return True
     return False
 
@@ -177,26 +167,40 @@ def hunter_had_remove_liquidity_on_token(
     return False
 
 
-def _is_frequent_trader_by_real_txs(txs: list, address: str) -> bool:
+def _is_frequent_trader_by_blocktimes(
+    sigs: list,
+    sample_count: int = RECENT_TX_COUNT_FOR_FREQUENCY,
+    max_interval_sec: float = MIN_AVG_TX_INTERVAL_SEC,
+    min_successful: int = MIN_SUCCESSFUL_TX_FOR_FREQUENCY,
+    max_failure_rate: float = MAX_FAILURE_RATE_FOR_FREQUENCY,
+) -> bool:
     """
-    根据「真实交易」时间戳计算平均间隔；只统计该地址参与的真实买卖。
-    txs: 已解析的交易列表（与 sigs 顺序一致，新在前），来自 fetch_parsed_transactions。
+    免费预检：用 Signature 列表里的 blockTime + err 判断是否应否决该地址。
+    - 高失败率（>= 30%）：Spam Bot 反向指标，直接否决。
+    - 成功交易数 < 10：死号/新号/矩阵号，无稳定盈利历史，直接否决。
+    - 若成功交易平均间隔 < 5 分钟，视为高频机器人。
     """
-    real_ts = []
-    for tx in txs:
-        if len(real_ts) >= RECENT_TX_COUNT_FOR_FREQUENCY:
-            break
-        if not is_real_trade_for_address(tx, address):
-            continue
-        ts = _get_tx_timestamp(tx)
-        if ts > 0:
-            real_ts.append(ts)
-    if len(real_ts) < 2:
+    sample = [s for s in (sigs or [])[:sample_count] if isinstance(s, dict)]
+    if len(sample) < 2:
         return False
-    real_ts.sort()
-    span = real_ts[-1] - real_ts[0]
-    avg_interval = span / (len(real_ts) - 1)
-    return avg_interval < MIN_AVG_TX_INTERVAL_SEC
+    failed = sum(1 for s in sample if s.get("err") is not None)
+    failure_rate = failed / len(sample)
+    if failure_rate >= max_failure_rate:
+        return True  # 高失败率，Spam Bot，一票否决
+
+    # 过滤执行失败的交易，只保留 err 为 None 的成功交易
+    successful = [s for s in sample if s.get("err") is None]
+    if len(successful) < min_successful:
+        return True  # 成功交易不足 10 笔：死号/新号/矩阵号，无稳定盈利历史，直接否决
+    times = [int(s["blockTime"]) for s in successful if s.get("blockTime") and s["blockTime"] > 0]
+    if len(times) < 2:
+        return True  # 有效 blockTime 不足，无法形成有效历史，否决
+    times.sort()
+    span = times[-1] - times[0]
+    if span <= 0:
+        return True  # 同一秒多笔，明显高频
+    avg_interval = span / (len(times) - 1)
+    return avg_interval < max_interval_sec
 
 
 def _normalize_token_amount(raw) -> float:
@@ -294,7 +298,7 @@ class TokenAttributionCalculator:
 
 class SmartMoneySearcher:
     def __init__(self):
-        # Helius API 统一通过 services.helius.helius_client 调用
+        # 签名获取通过 Alchemy，解析交易通过 Helius（增强格式 tokenTransfers/nativeTransfers）
         # 初筛参数 (来自 config/settings.py)
         self.min_delay_sec = SM_MIN_DELAY_SEC
         self.max_delay_sec = SM_MAX_DELAY_SEC
@@ -371,21 +375,21 @@ class SmartMoneySearcher:
         threading.Thread(target=_write, daemon=True).start()
 
     async def get_signatures(self, client, address, limit=100, before=None):
-        """通过 HeliusClient 获取地址签名列表。"""
-        return await helius_client.get_signatures_for_address(
+        """通过 AlchemyClient 获取地址签名列表。"""
+        return await alchemy_client.get_signatures_for_address(
             address, limit=limit, before=before, http_client=client
         )
 
     async def is_frequent_trader(self, client, address: str) -> bool:
         """
-        判断该地址是否为「频繁交易」：最近 100 笔「真实交易」平均间隔 < 5 分钟。
-        只统计该地址参与的真实买卖（非 IGNORE 代币 / meaningful native），与 SmartFlow3 一致。
+        判断该地址是否为「频繁交易」：只统计成功交易（err=null）的 blockTime。
+        用 Alchemy 免费的 getSignaturesForAddress（含 err、blockTime），不花一分钱。
+        若成功交易平均间隔 < 5 分钟，视为高频机器人。
         """
         sigs = await self.get_signatures(client, address, limit=RECENT_TX_COUNT_FOR_FREQUENCY)
         if not sigs:
             return False
-        txs = await self.fetch_parsed_transactions(client, sigs)
-        return _is_frequent_trader_by_real_txs(txs or [], address)
+        return _is_frequent_trader_by_blocktimes(sigs)
 
     async def fetch_parsed_transactions(self, client, signatures):
         """通过 HeliusClient 批量拉取解析后的交易。"""
@@ -435,12 +439,12 @@ class SmartMoneySearcher:
             sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
             if not sigs:
                 return None
+            # 免费预检：blockTime 密集则直接淘汰，不请求 Helius 解析
+            if _is_frequent_trader_by_blocktimes(sigs):
+                logger.info("⏭️ 剔除频繁交易地址 %s.. (blockTime 预检密集)", hunter_address)
+                return None
             txs = await self.fetch_parsed_transactions(client, sigs)
             if not txs:
-                return None
-            # 频繁交易过滤：只统计「真实交易」，最近 100 笔真实买卖平均间隔 < 5 分钟则剔除
-            if _is_frequent_trader_by_real_txs(txs, hunter_address):
-                logger.info("⏭️ 剔除频繁交易地址 %s.. (真实交易平均间隔<5分钟)", hunter_address)
                 return None
         if not txs:
             return None
@@ -544,40 +548,43 @@ class SmartMoneySearcher:
         """
         计算猎手在该代币上的收益率 (ROI %)，已清仓用卖出收益算，未清仓用现价估算。
         返回 (ROI 百分比, 交易列表)，若无法计算返回 (None, None)。
-        交易列表供后续 analyze_hunter_performance 复用，减少 Helius API 消耗。
-        阶段顺序：先 100 笔 LP 预检 -> 120 笔频率检测 -> 拉满 500 笔。
+        精准制导：用猎手在该代币上的 ATA 地址拉签名，100% 为该代币交易，仅 2~3 笔 Helius 解析。
+        交易列表供后续 analyze_hunter_performance 复用；ATA 模式仅含本代币 txs，复用为 None 时由体检自行拉取。
         """
-        sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
+        # 1. 主钱包频率预检（Alchemy 免费）
+        sigs = await self.get_signatures(client, hunter_address, limit=RECENT_TX_COUNT_FOR_FREQUENCY)
         if not sigs:
             return None, None
-
-        # 阶段 0+1：先拉 100 笔做 LP 预检 + 频率检测，复用以节省 API
-        first_batch = sigs[:SM_LP_CHECK_TX_LIMIT]
-        first_txs = await self.fetch_parsed_transactions(client, first_batch)
-        if not first_txs:
+        if _is_frequent_trader_by_blocktimes(sigs):
+            logger.debug("⏭️ 频率淘汰(blockTime预检) %s.. 省 Helius 解析", hunter_address[:12])
             return None, None
-        # LP 预检：有任何 LP 行为（加池/撤池）直接淘汰并拉黑
-        if hunter_had_any_lp_on_token(first_txs, hunter_address, token_address):
+
+        # 2. 精准制导：拉取猎手在该代币上的 ATA 签名（100% 为该代币买卖，通常 2~10 笔）
+        # Pump.fun 等新代币多用 Token-2022，先试 Token 无结果则试 Token2022
+        ata_sigs = None
+        ata = None
+        for program in ("Token", "Token2022"):
+            ata = get_associated_token_address(hunter_address, token_address, program)
+            ata_sigs = await self.get_signatures(client, ata, limit=50)
+            if ata_sigs:
+                break
+        if not ata_sigs:
+            return None, None  # 从未碰过该代币（Token 与 Token2022 均无签名）
+
+        # 3. 仅解析 ATA 的少量签名（2~10 笔），替代过去 100~500 笔
+        txs = await self.fetch_parsed_transactions(client, ata_sigs)
+        if not txs:
+            return None, None
+
+        # LP 预检：ATA 交易含加池/撤池则淘汰并拉黑
+        if hunter_had_any_lp_on_token(txs, hunter_address, token_address, ata_address=ata):
             logger.warning(
                 "⚠️ LP 行为淘汰: %s.. 曾对该代币有 LP 操作（加池/撤池），已加入黑名单，永不跟仓",
                 hunter_address[:12],
             )
             self._add_to_wallet_blacklist(hunter_address)
             return None, None
-        # 频率检测：频繁则直接淘汰
-        if _is_frequent_trader_by_real_txs(first_txs, hunter_address):
-            logger.debug("⏭️ 频率淘汰 %s.. (先拉 %d 笔即判定频繁)", hunter_address[:12], len(first_batch))
-            return None, None
 
-        # 阶段 2：LP 和频率均通过，拉满 500 笔算 ROI 并供评分复用
-        if len(sigs) <= SM_LP_CHECK_TX_LIMIT:
-            txs = first_txs
-        else:
-            rest_sigs = sigs[SM_LP_CHECK_TX_LIMIT:]
-            rest_txs = await self.fetch_parsed_transactions(client, rest_sigs)
-            txs = (first_txs or []) + (rest_txs or [])
-        if not txs:
-            return None, None
         usdc_price = await self._get_usdc_price_sol(client)
         parser = TransactionParser(hunter_address)
         calc = TokenAttributionCalculator()
@@ -607,7 +614,8 @@ class SmartMoneySearcher:
             if price is not None and price > 0:
                 total_value += tokens_held * price
         roi = (total_value - buy_sol) / buy_sol * 100
-        return roi, txs
+        # ATA 的 txs 仅含本代币，无法供 analyze_hunter_performance 统计其他代币，返回 None 由体检自行拉取
+        return roi, None
 
     async def verify_token_age_via_dexscreener(self, client, token_address):
         """
@@ -761,7 +769,7 @@ class SmartMoneySearcher:
                     logger.debug("    跳过黑名单: %s..", addr[:12])
                     continue
                 roi, txs = await self.get_hunter_profit_on_token(client, addr, token_address)
-                # LP 行为（加池/撤池）已在 get_hunter_profit_on_token 前 100 笔预检中淘汰并拉黑
+                # LP 行为（加池/撤池）已在 get_hunter_profit_on_token ATA 预检中淘汰并拉黑
                 if roi is None or roi < SM_MIN_TOKEN_PROFIT_PCT:
                     await asyncio.sleep(0.3)
                     continue

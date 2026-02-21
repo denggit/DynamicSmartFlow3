@@ -191,6 +191,8 @@ MIN_TOKEN_AGE_SEC = 1800  # 最少上市 30 (太新的币数据少，难找好�
 MAX_TOKEN_AGE_SEC = 21600  # 最多上市 6 小时 (放宽年龄)
 MAX_BACKTRACK_PAGES = 30  # 最多回溯 30 页 (3万笔交易)
 RECENT_TX_COUNT_FOR_FREQUENCY = 100  # 频繁交易判断的样本数
+MIN_SUCCESSFUL_TX_FOR_FREQUENCY = 10  # blockTime 频率检测：成功交易(err=null)少于此次否决（死号/新号/矩阵号）
+MAX_FAILURE_RATE_FOR_FREQUENCY = 0.30  # 失败率超过 30% 即否决（Spam Bot 反向指标）
 MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算真实
 SM_MIN_DELAY_SEC = 30  # 初筛：开盘后至少 30 秒买入才计入
