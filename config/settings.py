@@ -204,7 +204,7 @@ MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算真实
 SM_MIN_DELAY_SEC = 30  # 初筛：开盘后至少 30 秒买入才计入
 SM_MAX_DELAY_SEC = 10800  # 3 小时内买入都算
-SM_MIN_TOKEN_PROFIT_PCT = 100.0  # 入库门槛：该代币当下至少赚 100% 才能入池；≥200%×1，100%~200%×0.9；体检时 30 天内若掉到 <50% 则踢出
+SM_MIN_TOKEN_PROFIT_PCT = 50.0  # 入库门槛：该代币当下至少赚 100% 才能入池；≥200%×1，100%~200%×0.9；体检时 30 天内若掉到 <50% 则踢出
 SM_AUDIT_TX_LIMIT = 300  # 体检时拉取交易笔数
 SM_LP_CHECK_TX_LIMIT = 100  # LP 预检 + 频率检测：先拉 100 笔查 LP 行为（加池/撤池）及频率，有则直接淘汰，通过后再拉满 500
 SM_EARLY_TX_PARSE_LIMIT = 300  # 初筛：最多解析多少笔早期交易（按时间取前 N 笔）
@@ -219,10 +219,13 @@ SM_ENTRY_MIN_TRADE_COUNT = 7   # 有效代币项目数 >= 7
 # 盈利分：< 20% 零分，20%~60% 线性，≥60% 满分
 SM_PROFIT_SCORE_ZERO_PCT = 20.0   # < 20% → 盈利分=0
 SM_PROFIT_SCORE_FULL_PCT = 60.0   # ≥60% → 盈利分=1
-# ROI 软门槛乘数：≥200%×1，100%~200%×0.9，50%~100%×0.75
-SM_ROI_MULT_200 = 1.0
-SM_ROI_MULT_100_200 = 0.9
-SM_ROI_MULT_50_100 = 0.75
+# ROI 软门槛乘数：≥100%×1，75%~100%×0.9，50%~75%×0.75
+TIER_ONE_ROI = 100
+TIER_TWO_ROI = 75
+TIER_THREE_ROI = 50
+SM_ROI_MULT_ONE = 1.0
+SM_ROI_MULT_TWO = 0.9
+SM_ROI_MULT_THREE = 0.75
 # 体检踢出：盈亏比<2 或 胜率<20% 或 利润<=0
 SM_AUDIT_MIN_PNL_RATIO = 2.0
 SM_AUDIT_MIN_WIN_RATE = 0.25

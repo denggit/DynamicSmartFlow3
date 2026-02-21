@@ -47,11 +47,14 @@ from config.settings import (
     SM_ENTRY_MIN_PNL_RATIO,
     SM_ENTRY_MIN_WIN_RATE,
     SM_ENTRY_MIN_TRADE_COUNT,
-    SM_ROI_MULT_200,
-    SM_ROI_MULT_100_200,
-    SM_ROI_MULT_50_100,
+    SM_ROI_MULT_ONE,
+    SM_ROI_MULT_TWO,
+    SM_ROI_MULT_THREE,
     DEX_MIN_24H_GAIN_PCT,
     WALLET_BLACKLIST_FILE,
+    TIER_ONE_ROI,
+    TIER_TWO_ROI,
+    TIER_THREE_ROI,
 )
 from src.alchemy import alchemy_client
 from src.helius import helius_client
@@ -816,12 +819,12 @@ class SmartMoneySearcher:
                 if stats:
                     # 入库乘数：用 max_roi_30d（含当前代币），与体检一致，比单代币 ROI 更合理
                     max_roi_30d = max(roi, stats.get("max_roi_30d", 0))
-                    if max_roi_30d >= 200:
-                        roi_mult = SM_ROI_MULT_200
-                    elif max_roi_30d >= 100:
-                        roi_mult = SM_ROI_MULT_100_200
+                    if max_roi_30d >= TIER_ONE_ROI:
+                        roi_mult = SM_ROI_MULT_ONE
+                    elif max_roi_30d >= TIER_TWO_ROI:
+                        roi_mult = SM_ROI_MULT_TWO
                     else:
-                        roi_mult = SM_ROI_MULT_50_100
+                        roi_mult = SM_ROI_MULT_THREE
                     logger.debug(f"    通过收益过滤: {addr[:12]}.. max_roi_30d={max_roi_30d:.0f}%% ×{roi_mult}")
 
                     score_result = compute_hunter_score(stats)
@@ -829,13 +832,14 @@ class SmartMoneySearcher:
                     final_score = round(base_score * roi_mult, 1)
 
                     # 入库与拉黑独立：拉黑仅因 LP 行为（加池/撤池），在 get_hunter_profit_on_token 中执行
-                    # 入库硬门槛：盈亏比≥2、胜率≥20%、代币数≥10、总盈利>0；低分可入库，亏损不可入库
+                    # 入库硬门槛：盈亏比≥2、胜率≥20%、代币数≥10、总盈利>0、单token最大收益率≥TIER_THREE_ROI%
                     trade_count = stats.get("count", 0)
                     pnl_ok = stats.get("pnl_ratio", 0) >= SM_ENTRY_MIN_PNL_RATIO
                     wr_ok = stats["win_rate"] >= SM_ENTRY_MIN_WIN_RATE
                     count_ok = trade_count >= SM_ENTRY_MIN_TRADE_COUNT
                     profit_ok = stats["total_profit"] > 0
-                    is_qualified = pnl_ok and wr_ok and count_ok and profit_ok
+                    roi_ok = max_roi_30d >= TIER_THREE_ROI  # 单 token 最大收益率门槛
+                    is_qualified = pnl_ok and wr_ok and count_ok and profit_ok and roi_ok
 
                     if is_qualified:
                         avg_roi = stats.get("avg_roi_pct", 0.0)
@@ -859,6 +863,8 @@ class SmartMoneySearcher:
                     else:
                         NEAR_THRESHOLD = 0.8
                         reasons = []
+                        if not roi_ok:
+                            reasons.append(f"单token最大收益{max_roi_30d:.0f}%%<{TIER_THREE_ROI}%%")
                         if not pnl_ok and stats.get("pnl_ratio", 0) >= SM_ENTRY_MIN_PNL_RATIO * NEAR_THRESHOLD:
                             reasons.append(f"盈亏比{stats.get('pnl_ratio', 0):.2f}<{SM_ENTRY_MIN_PNL_RATIO}")
                         if not wr_ok and stats["win_rate"] >= SM_ENTRY_MIN_WIN_RATE * NEAR_THRESHOLD:

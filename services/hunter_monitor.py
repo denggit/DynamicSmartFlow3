@@ -40,10 +40,9 @@ from config.settings import (
     HOLDINGS_PRUNE_INTERVAL_SEC,
     SM_AUDIT_MIN_PNL_RATIO,
     SM_AUDIT_MIN_WIN_RATE,
-    SM_AUDIT_KICK_MAX_ROI_30D_PCT,
-    SM_ROI_MULT_200,
-    SM_ROI_MULT_100_200,
-    SM_ROI_MULT_50_100, MAINTENANCE_DAYS,
+    SM_ROI_MULT_ONE,
+    SM_ROI_MULT_TWO,
+    SM_ROI_MULT_THREE, MAINTENANCE_DAYS, TIER_ONE_ROI, TIER_TWO_ROI, TIER_THREE_ROI,
 )
 from src import helius_client
 from src.dexscreener.dex_scanner import DexScanner
@@ -63,12 +62,12 @@ def _roi_multiplier(roi_pct: float) -> float:
     ≥200%×1，100%~200%×0.9，50~100%×0.75
     （<50% 已在体检前直接踢出，不会调用此处）
     """
-    if roi_pct >= 200:
-        return SM_ROI_MULT_200
-    if roi_pct >= 100:
-        return SM_ROI_MULT_100_200
-    if roi_pct >= 50:
-        return SM_ROI_MULT_50_100
+    if roi_pct >= TIER_ONE_ROI:
+        return SM_ROI_MULT_ONE
+    if roi_pct >= TIER_TWO_ROI:
+        return SM_ROI_MULT_TWO
+    if roi_pct >= TIER_THREE_ROI:
+        return SM_ROI_MULT_THREE
     return 0.75
 
 
@@ -666,10 +665,10 @@ class HunterMonitorController:
                         del self.storage.hunters[addr]
                         removed += 1
                         logger.info("🚫 剔除 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
-                    elif max_roi_30d < SM_AUDIT_KICK_MAX_ROI_30D_PCT:
+                    elif max_roi_30d < TIER_THREE_ROI:
                         del self.storage.hunters[addr]
                         removed += 1
-                        logger.info("🚫 剔除 %s.. (30天最大收益 %.0f%% < 50%%)", addr[:12], max_roi_30d)
+                        logger.info("🚫 剔除 %s.. (单token最大收益 %.0f%% < %s%%)", addr[:12], max_roi_30d, TIER_THREE_ROI)
                     else:
                         _apply_audit_update(info, new_stats, time.time(), addr)
                         updated += 1
@@ -736,11 +735,11 @@ class HunterMonitorController:
                                         del self.storage.hunters[addr]
                                         audit_removed.append(addr)
                                         logger.info("🚫 体检踢出 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
-                                elif max_roi_30d < SM_AUDIT_KICK_MAX_ROI_30D_PCT:
+                                elif max_roi_30d < TIER_THREE_ROI:
                                     if addr in self.storage.hunters:
                                         del self.storage.hunters[addr]
                                         audit_removed.append(addr)
-                                        logger.info("🚫 体检踢出 %s.. (30天最大收益 %.0f%% < 50%%)", addr[:12], max_roi_30d)
+                                        logger.info("🚫 体检踢出 %s.. (单token最大收益 %.0f%% < %s%%)", addr[:12], max_roi_30d, TIER_THREE_ROI)
                                 else:
                                     _apply_audit_update(info, new_stats, now, addr)
 
