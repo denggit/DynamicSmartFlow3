@@ -154,13 +154,13 @@ def get_tier_config(score: float) -> dict:
     <60: 0.03×3=0.09 | 60-80: 0.05×4=0.2 | 80-90: 0.1×5=0.5 | 90+: 0.2×5=1.0
     """
     if score >= 90:
-        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.15, "stop_loss_pct": 0.40}
+        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.15, "stop_loss_pct": 0.85}
     if score >= 80:
-        return {"entry_sol": 0.04, "add_sol": 0.04, "max_sol": 0.12, "stop_loss_pct": 0.40}
+        return {"entry_sol": 0.04, "add_sol": 0.04, "max_sol": 0.12, "stop_loss_pct": 0.85}
     if score >= 60:
-        return {"entry_sol": 0.03, "add_sol": 0.03, "max_sol": 0.09, "stop_loss_pct": 0.40}
+        return {"entry_sol": 0.03, "add_sol": 0.03, "max_sol": 0.09, "stop_loss_pct": 0.85}
     # 60 分以下也跟，但额度小
-    return {"entry_sol": 0.03, "add_sol": 0.00, "max_sol": 0.03, "stop_loss_pct": 0.40}
+    return {"entry_sol": 0.03, "add_sol": 0.00, "max_sol": 0.03, "stop_loss_pct": 0.85}
 
 # 猎手加仓跟随阈值：只跟对方买入 ≥ 1 SOL 的单
 HUNTER_ADD_THRESHOLD_SOL = 1.0

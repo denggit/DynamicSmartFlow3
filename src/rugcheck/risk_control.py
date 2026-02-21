@@ -155,20 +155,20 @@ async def check_is_safe_token(token_mint: str) -> bool:
                 )
                 return False
 
-        # 6. 三无盘检查：无 Twitter/X、无 Telegram 的土狗视为春 PVP 割草盘，拒绝
-        links = token_meta.get("links") or []
-        has_twitter = any(
-            "twitter.com" in (str(link.get("url") or "")).lower()
-            or "x.com" in (str(link.get("url") or "")).lower()
-            for link in links if isinstance(link, dict)
-        )
-        has_tg = any(
-            "t.me" in (str(link.get("url") or "")).lower()
-            for link in links if isinstance(link, dict)
-        )
-        if not (has_twitter or has_tg):
-            logger.warning("⚠️ 缺乏社交媒体绑定（三无盘），拒绝入场: %s", token_mint[:16] + "..")
-            return False
+        # # 6. 三无盘检查：无 Twitter/X、无 Telegram 的土狗视为春 PVP 割草盘，拒绝
+        # links = token_meta.get("links") or []
+        # has_twitter = any(
+        #     "twitter.com" in (str(link.get("url") or "")).lower()
+        #     or "x.com" in (str(link.get("url") or "")).lower()
+        #     for link in links if isinstance(link, dict)
+        # )
+        # has_tg = any(
+        #     "t.me" in (str(link.get("url") or "")).lower()
+        #     for link in links if isinstance(link, dict)
+        # )
+        # if not (has_twitter or has_tg):
+        #     logger.warning("⚠️ 缺乏社交媒体绑定（三无盘），拒绝入场: %s", token_mint[:16] + "..")
+        #     return False
 
         # 7. 池子大小（防撤池）+ FDV + 流动性/市值比
         has_pool, liq_usd, fdv_usd = await check_token_liquidity(token_mint)
