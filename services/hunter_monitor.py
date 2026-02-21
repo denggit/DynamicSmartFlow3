@@ -15,7 +15,7 @@ import os
 import shutil
 import time
 from collections import defaultdict
-from typing import Dict, List, Callable, Optional, Set
+from typing import Dict, List, Callable, Optional, Set, Awaitable
 
 import websockets
 
@@ -43,7 +43,7 @@ from config.settings import (
     SM_AUDIT_KICK_MAX_ROI_30D_PCT,
     SM_ROI_MULT_200,
     SM_ROI_MULT_100_200,
-    SM_ROI_MULT_50_100,
+    SM_ROI_MULT_50_100, MAINTENANCE_DAYS,
 )
 from src import helius_client
 from src.dexscreener.dex_scanner import DexScanner
@@ -249,10 +249,17 @@ class HunterMonitorController:
         self._sig_queue: asyncio.Queue = asyncio.Queue()
         # 跟仓阶段：命中钱包池的 tx 推给 Agent，避免 Agent 自建 WS 漏单
         self.agent: Optional[Callable] = None
+        # Helius credit 耗尽时的保命回调：清仓 + 致命错误告警（主程序注入）
+        self.on_helius_credit_exhausted: Optional[Callable[[], Awaitable[None]]] = None
+        self._helius_emergency_triggered = False
 
     def set_agent(self, agent) -> None:
         """主程序注入 Agent，Monitor 消费队列命中后会把 (tx, active_hunters) 推给 Agent。"""
         self.agent = agent
+
+    def set_on_helius_credit_exhausted(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """主程序注入：Helius credit 耗尽（429）时触发保命操作：清仓所有 + 致命错误告警。"""
+        self.on_helius_credit_exhausted = callback
 
     async def start(self):
         logger.info("🚀 启动 Hunter Monitor 系统 (transactionSubscribe 按猎手地址，只收猎手相关交易)")
@@ -467,7 +474,8 @@ class HunterMonitorController:
                 url = helius_client.get_http_endpoint()
                 async with AsyncClient(timeout=15.0) as client:
                     for attempt in range(FETCH_TX_MAX_RETRIES):
-                        resp = await client.post(url, json={"transactions": to_fetch[:20]})
+                        # Helius 按次计费(100 credits/次)，每批最多 100 笔，尽量凑满以节省 credit
+                        resp = await client.post(url, json={"transactions": to_fetch[:100]})
                         if resp.status_code == 429 and helius_client.size >= 1:
                             helius_client.mark_current_failed()
                             url = helius_client.get_http_endpoint()
@@ -501,6 +509,17 @@ class HunterMonitorController:
                         break
                     else:
                         logger.warning("批量拉取失败（已重试 %d 次）", FETCH_TX_MAX_RETRIES)
+                        # 若为 429（credit 耗尽/限流）且未触发过，执行保命：清仓所有 + 致命错误告警
+                        if (
+                            resp.status_code == 429
+                            and not self._helius_emergency_triggered
+                            and self.on_helius_credit_exhausted
+                        ):
+                            self._helius_emergency_triggered = True
+                            try:
+                                await self.on_helius_credit_exhausted()
+                            except Exception:
+                                logger.exception("on_helius_credit_exhausted 回调异常")
             except Exception:
                 logger.exception("消费队列异常")
                 await asyncio.sleep(1)
@@ -666,7 +685,7 @@ class HunterMonitorController:
         """
         每 10 天检查，对超过 20 天未体检的猎手重新审计；并清理频繁交易者。
         """
-        logger.info("🛠️ [线程3] 维护线程启动 (每 %d 天检查体检)", MAINTENANCE_INTERVAL // 86400)
+        logger.info("🛠️ [线程3] 维护线程启动 (每 %d 天检查体检)", MAINTENANCE_DAYS)
 
         # 启动时先睡一会，错开高峰，或者直接运行一次也行
         # 这里选择立即运行第一次，然后按天循环
@@ -739,7 +758,7 @@ class HunterMonitorController:
                 logger.exception("❌ 维护失败")
 
             # 每 10 天检查一次是否要体检
-            logger.info(f"💤 维护线程休眠 {MAINTENANCE_INTERVAL // 86400} 天...")
+            logger.info(f"💤 维护线程休眠 {MAINTENANCE_DAYS} 天...")
             await asyncio.sleep(MAINTENANCE_INTERVAL)
 
 

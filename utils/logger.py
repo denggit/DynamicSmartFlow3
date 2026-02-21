@@ -32,13 +32,14 @@ _buffer_lock = threading.Lock()
 _flush_timer: Optional[threading.Timer] = None
 
 # 触发严重错误邮件的 logger 名称（跟单/交易/风控/主流程等）
+# 必须与各模块 get_logger(__name__) 传入的名称一致
 _CRITICAL_LOGGER_NAMES = frozenset({
     "Main",
-    "src.solana.trader",
-    "src.solana.hunter_agent",
-    "src.solana.hunter_monitor",
-    "src.helius.sm_searcher",
-    "src.risk_control",
+    "services.trader",
+    "services.hunter_agent",
+    "services.hunter_monitor",
+    "services.sm_searcher",
+    "src.rugcheck.risk_control",
     "src.dexscreener.dex_scanner",
 })
 

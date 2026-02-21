@@ -31,6 +31,7 @@ from config.settings import (
     SOLANA_PRIVATE_KEY_BASE58,
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, BASE_DIR, jup_key_pool,
     TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
+    TX_VERIFY_RECONCILIATION_DELAY_SEC, TX_VERIFY_RECONCILIATION_RETRIES,
     TRADER_RPC_TIMEOUT,
 )
 from src.alchemy import alchemy_client
@@ -157,6 +158,30 @@ class SolanaTrader:
                 total_ui += float(ui)
         return total_ui if total_ui > 0 else None
 
+    async def _fetch_own_token_balance_raw(self, token_mint: str) -> Optional[int]:
+        """
+        获取我方钱包在链上的 Token 余额（raw 单位），用于交易验证失败时的兜底 reconciliation。
+        """
+        if not self.keypair:
+            return None
+        owner_b58 = str(self.keypair.pubkey())
+        result = await alchemy_client.get_token_accounts_by_owner(
+            owner_b58, token_mint, http_client=self.http_client, timeout=TRADER_RPC_TIMEOUT
+        )
+        if result is None or not result.get("value"):
+            return None
+        total_raw = 0
+        for acc in result["value"]:
+            info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+            tamt = info.get("tokenAmount") or {}
+            amt_str = tamt.get("amount")
+            if amt_str is not None:
+                try:
+                    total_raw += int(amt_str)
+                except (ValueError, TypeError):
+                    pass
+        return total_raw if total_raw > 0 else None
+
     async def ensure_fully_closed(self, token_address: str) -> None:
         """
         关闭监控前校验：链上仓位是否已归零。若未归零则执行清仓，避免遗漏 dust 或状态不同步。
@@ -182,6 +207,74 @@ class SolanaTrader:
         )
         if not tx_sig:
             logger.warning("❌ 关闭前清仓失败: %s", token_address)
+
+    async def emergency_close_all_positions(self) -> int:
+        """
+        保命操作：紧急清仓所有持仓。用于 Helius credit 耗尽等致命场景，无法继续跟单时立即平仓。
+        使用 Alchemy RPC + Jupiter 执行，不依赖 Helius。
+        :return: 成功清仓的数量
+        """
+        if not self.keypair:
+            return 0
+        tokens = list(self.positions.keys())
+        if not tokens:
+            return 0
+        logger.warning("🚨 [紧急清仓] 开始清仓 %d 个持仓...", len(tokens))
+        closed = 0
+        for token_address in tokens:
+            pos = self.positions.get(token_address)
+            if not pos:
+                continue
+            try:
+                chain_bal = await self._fetch_own_token_balance(token_address)
+                sell_amount = chain_bal if chain_bal is not None else pos.total_tokens * SELL_BUFFER
+                if sell_amount is None or sell_amount <= 0:
+                    del self.positions[token_address]
+                    closed += 1
+                    continue
+                decimals = await self._get_decimals(token_address) or pos.decimals
+                tx_sig, sol_received = await self._jupiter_sell_with_retry(
+                    input_mint=token_address,
+                    output_mint=WSOL_MINT,
+                    amount_in_ui=sell_amount,
+                    token_decimals=decimals,
+                )
+                if tx_sig:
+                    cost = sell_amount * pos.average_price
+                    pnl_sol = sol_received - cost
+                    pos.trade_records.append({
+                        "ts": time.time(),
+                        "type": "sell",
+                        "sol_spent": 0.0,
+                        "sol_received": sol_received,
+                        "token_amount": sell_amount,
+                        "note": "紧急清仓(Helius credit耗尽)",
+                        "pnl_sol": pnl_sol,
+                    })
+                    if self.on_trade_recorded:
+                        lead = list(pos.shares.keys())[0] if pos.shares else ""
+                        self.on_trade_recorded({
+                            "date": time.strftime("%Y-%m-%d", time.localtime()),
+                            "ts": time.time(),
+                            "token": token_address,
+                            "type": "sell",
+                            "sol_spent": 0.0,
+                            "sol_received": sol_received,
+                            "token_amount": sell_amount,
+                            "price": pos.average_price,
+                            "hunter_addr": lead,
+                            "pnl_sol": pnl_sol,
+                            "note": "紧急清仓(Helius credit耗尽)",
+                        })
+                    self._emit_position_closed(token_address, pos)
+                    del self.positions[token_address]
+                    closed += 1
+                else:
+                    logger.warning("❌ 紧急清仓失败: %s (链上余额 %.2f)", token_address, sell_amount)
+            except Exception:
+                logger.exception("紧急清仓异常: %s", token_address)
+        self._save_state_in_background()
+        return closed
 
     # ==========================================
     # 1. 核心交易接口 (逻辑层)
@@ -454,7 +547,7 @@ class SolanaTrader:
     async def check_pnl_and_stop_profit(self, token_address: str, current_price_ui: float):
         """
         止盈与止损逻辑。
-        止损：亏损达到 get_tier_config(lead_hunter_score).stop_loss_pct 时全仓止损（当前档位均为 65%）。
+        止损：亏损达到 get_tier_config(lead_hunter_score).stop_loss_pct 时全仓止损（当前档位均为 40%）。
         止盈：盈利达到 TAKE_PROFIT_LEVELS 各级阈值时按对应比例分批卖出（如 1000% 卖 80%）。
         """
         if not self.keypair: return
@@ -748,7 +841,39 @@ class SolanaTrader:
                     if verified:
                         logger.info("⚠️ 二次验证成功，交易已确认（初检可能受 RPC 限流影响）: %s", sig_str)
                     else:
-                        logger.warning("❌ 交易链上确认失败: %s（可能滑点/余额不足）", sig_str)
+                        # 兜底（仅买入）：RPC 验证超时/失败时（含 Key 超额 429 查不到链上状态），
+                        # 等待限流恢复后多次重试查余额，避免「查不到就说失败」导致漏跟卖
+                        if not is_sell:
+                            min_expected = int(out_amount_raw * 0.99)
+                            logger.info(
+                                "⏳ 验证失败，%ds 后开始链上余额兜底（Key 超额 429 时需等待限流恢复）: %s",
+                                TX_VERIFY_RECONCILIATION_DELAY_SEC, sig_str,
+                            )
+                            await asyncio.sleep(TX_VERIFY_RECONCILIATION_DELAY_SEC)
+                            for recon_attempt in range(TX_VERIFY_RECONCILIATION_RETRIES):
+                                chain_raw = await self._fetch_own_token_balance_raw(output_mint)
+                                if chain_raw is not None and chain_raw >= min_expected:
+                                    logger.warning(
+                                        "⚠️ 买入验证超时但链上余额已到账 (raw %s >= %s)，以链上为准视为成功: %s",
+                                        chain_raw, min_expected, sig_str,
+                                    )
+                                    return sig_str, out_amount_raw
+                                if recon_attempt < TX_VERIFY_RECONCILIATION_RETRIES - 1:
+                                    if alchemy_client.size >= 1:
+                                        alchemy_client.mark_current_failed()
+                                        await self._recreate_rpc_client()
+                                    backoff = 10 + recon_attempt * 5
+                                    logger.info(
+                                        "⏳ 余额兜底第 %d/%d 次未查到，%ds 后切换 Key 重试",
+                                        recon_attempt + 1, TX_VERIFY_RECONCILIATION_RETRIES, backoff,
+                                    )
+                                    await asyncio.sleep(backoff)
+                        # 余额兜底耗尽仍失败：极可能所有 Key 均已 429，必须报致命错误
+                        logger.critical(
+                            "🚨 致命：所有 RPC Key 或已 429 超额，链上余额无法查询，交易 %s 无法确认。"
+                            "可能导致漏跟卖，请立即检查 API 配额并增加 Key！",
+                            sig_str,
+                        )
                         return None, 0
 
                 # 显式记录买入/卖出确认，便于排查与审计
@@ -768,8 +893,19 @@ class SolanaTrader:
                     await asyncio.sleep(backoff_sec)
                     await self._recreate_rpc_client()
                     continue
-                logger.exception("Swap Exception")
+                if _is_rate_limit_error(e):
+                    logger.critical(
+                        "🚨 致命：所有 RPC Key 已 429 超额，交易无法执行。请立即检查 API 配额并增加 Key！",
+                        exc_info=True,
+                    )
+                else:
+                    logger.exception("Swap Exception")
                 return None, 0
+        # 循环耗尽未返回：所有 attempt 均失败
+        logger.critical(
+            "🚨 致命：Swap 重试 %d 次后仍失败，RPC Key 或已全部 429 超额。请检查 API 配额！",
+            max_attempts,
+        )
         return None, 0
 
     async def _get_jupiter_implied_pnl(

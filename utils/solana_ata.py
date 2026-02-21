@@ -37,9 +37,17 @@ def get_associated_token_address(owner: str, mint: str, token_program: str = "To
 
     Returns:
         ATA 地址（Base58 字符串）
+
+    Raises:
+        ValueError: owner 或 mint 格式无效（非合法 Base58）
     """
-    owner_pk = Pubkey.from_string(owner)
-    mint_pk = Pubkey.from_string(mint)
+    if not owner or not mint:
+        raise ValueError("owner 和 mint 不能为空")
+    try:
+        owner_pk = Pubkey.from_string(owner)
+        mint_pk = Pubkey.from_string(mint)
+    except Exception as e:
+        raise ValueError(f"无效的 Base58 地址: {e}") from e
     if token_program == "Token2022":
         return _derive_ata(owner_pk, mint_pk, TOKEN_2022_PROGRAM_ID)
     return _derive_ata(owner_pk, mint_pk, TOKEN_PROGRAM_ID)

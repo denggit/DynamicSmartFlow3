@@ -153,12 +153,6 @@ def get_tier_config(score: float) -> dict:
 # 猎手加仓跟随阈值：只跟对方买入 ≥ 1 SOL 的单
 HUNTER_ADD_THRESHOLD_SOL = 1.0
 
-# 兼容旧逻辑（不再使用）
-TRADING_MAX_SOL_PER_TOKEN = 0.5
-TRADING_MIN_BUY_SOL = 0.05
-TRADING_ADD_BUY_SOL = 0.1
-TRADING_SCORE_MULTIPLIER = 0.001
-
 # 首买追高限制：首个猎手买入后若已涨 300%（现价/首买价 ≥ 4），坚决不买、不加仓
 MAX_ENTRY_PUMP_MULTIPLIER = 4.0  # 4x = 300% 涨幅
 
@@ -199,9 +193,9 @@ MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转
 SM_MIN_DELAY_SEC = 30  # 初筛：开盘后至少 30 秒买入才计入
 SM_MAX_DELAY_SEC = 10800  # 3 小时内买入都算
 SM_MIN_TOKEN_PROFIT_PCT = 100.0  # 入库门槛：该代币当下至少赚 100% 才能入池；≥200%×1，100%~200%×0.9；体检时 30 天内若掉到 <50% 则踢出
-SM_AUDIT_TX_LIMIT = 100  # 体检时拉取交易笔数
+SM_AUDIT_TX_LIMIT = 300  # 体检时拉取交易笔数
 SM_LP_CHECK_TX_LIMIT = 100  # LP 预检 + 频率检测：先拉 100 笔查 LP 行为（加池/撤池）及频率，有则直接淘汰，通过后再拉满 500
-SM_EARLY_TX_PARSE_LIMIT = 360  # 初筛：最多解析多少笔早期交易（按时间取前 N 笔）
+SM_EARLY_TX_PARSE_LIMIT = 300  # 初筛：最多解析多少笔早期交易（按时间取前 N 笔）
 SM_MIN_BUY_SOL = 0.1  # 初筛：单笔买入最少 SOL
 SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
 # 入库硬门槛（取代原 40% 胜率 / 100 SOL）
@@ -217,7 +211,7 @@ SM_ROI_MULT_100_200 = 0.9
 SM_ROI_MULT_50_100 = 0.75
 # 体检踢出：盈亏比<2 或 胜率<20% 或 利润<=0
 SM_AUDIT_MIN_PNL_RATIO = 2.0
-SM_AUDIT_MIN_WIN_RATE = 0.2
+SM_AUDIT_MIN_WIN_RATE = 0.25
 # 体检踢出：最近 30 天最大收益 < 50% 直接踢出（入库需 100%+，可能未结算，结算后若掉到 50% 以下则踢出）
 SM_AUDIT_KICK_MAX_ROI_30D_PCT = 50.0
 SM_MIN_HUNTER_SCORE = 0  # 入库不设最低分（满足四项门槛即可）；池子按分数排序替换
@@ -242,7 +236,7 @@ DEX_MIN_24H_GAIN_PCT = 300.0  # 年龄在范围内时，涨幅 > 300% 才执行�
 # ==================== 风控 (risk_control) ====================
 MAX_ACCEPTABLE_BUY_TAX_PCT = 25.0  # 买入税超过此比例拒绝
 MAX_SAFE_SCORE = 2000  # RugCheck 风险分超过此值拒绝
-MIN_LIQUIDITY_USD = 2000.0  # 池子流动性最低门槛防撤池 ($10k)
+MIN_LIQUIDITY_USD = 10000.0  # 池子流动性最低门槛防撤池 ($10k)
 MIN_LP_LOCKED_PCT = 70.0  # LP 至少锁仓或销毁比例，否则拒绝（防撤池）
 MAX_TOP2_10_COMBINED_PCT = 0.30  # 防老鼠仓：第 2~10 名合计上限
 MAX_SINGLE_HOLDER_PCT = 0.10  # 防老鼠仓：单一地址上限
@@ -250,18 +244,19 @@ MAX_ENTRY_FDV_USD = 1000000.0  # 最大可接受入场 FDV (USD)
 MIN_LIQUIDITY_TO_FDV_RATIO = 0.03  # 流动性/市值比至少 3%
 
 # ==================== 猎手监控 (hunter_monitor) ====================
-DISCOVERY_INTERVAL = 900  # 挖掘间隔 15 分钟
-MAINTENANCE_INTERVAL = 86400 * 10  # 维护间隔 10 天，每 10 天检查一次是否要体检
+DISCOVERY_INTERVAL = 1800  # 挖掘间隔 15 分钟
 POOL_SIZE_LIMIT = 100  # 猎手池上限
 ZOMBIE_THRESHOLD_DAYS = 15  # 多少天未交易视为僵尸
 AUDIT_EXPIRATION_DAYS = 20  # 体检有效期 (天)，超过需重新体检
+MAINTENANCE_DAYS = 10   # 维护间隔 10 天，每 10 天检查一次是否要体检
 ZOMBIE_THRESHOLD = 86400 * ZOMBIE_THRESHOLD_DAYS
 AUDIT_EXPIRATION = 86400 * AUDIT_EXPIRATION_DAYS
+MAINTENANCE_INTERVAL = 86400 * MAINTENANCE_DAYS
 DISCOVERY_INTERVAL_WHEN_FULL_SEC = 86400  # 池满时挖掘间隔 24 小时
 RECENT_SIG_TTL_SEC = 90  # 同一 signature 去重 TTL
 FETCH_TX_MAX_RETRIES = 3  # 拉取交易重试次数
 FETCH_TX_RETRY_DELAY_BASE = 2  # 重试延迟基数 (秒)
-SIG_QUEUE_BATCH_SIZE = 15  # 批量拉取每批 signature 数
+SIG_QUEUE_BATCH_SIZE = 100  # 批量拉取每批 signature 数（Helius 100 credits/次，凑满 100 笔更省）
 SIG_QUEUE_DRAIN_TIMEOUT = 0.3  # 凑批超时 (秒)
 WALLET_WS_RESUBSCRIBE_SEC = 300  # WebSocket 重连间隔
 HOLDINGS_TTL_SEC = 7200  # token 2 小时无新买入则清理
@@ -280,6 +275,9 @@ NEW_HUNTER_ADD_WINDOW_SEC = 600  # 开仓 10 分钟内才处理新猎手 (单猎
 TX_VERIFY_MAX_WAIT_SEC = 15  # 交易确认最大等待秒
 TX_VERIFY_RETRY_DELAY_SEC = 15  # 初次验证失败后，等待链上传播再二次验证
 TX_VERIFY_RETRY_MAX_WAIT_SEC = 30  # 二次验证最大等待秒（切换 RPC 后，避免限流误判）
+# 验证失败时的链上余额兜底：Key 超额 429 时 RPC 查不到状态，需等待限流恢复后重试
+TX_VERIFY_RECONCILIATION_DELAY_SEC = 30  # 验证失败后先等待此秒数再查余额，让 429 冷却
+TX_VERIFY_RECONCILIATION_RETRIES = 5  # 余额查询重试次数，每次切换 Key + 退避
 TRADER_RPC_TIMEOUT = 30.0  # RPC 请求超时
 
 # ==================== 其他 ====================

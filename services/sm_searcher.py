@@ -55,7 +55,6 @@ from src.alchemy import alchemy_client
 from src.helius import helius_client
 from utils.logger import get_logger
 from utils.hunter_scoring import compute_hunter_score
-from utils.solana_ata import get_associated_token_address
 
 logger = get_logger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -547,33 +546,21 @@ class SmartMoneySearcher:
         精准制导：用猎手在该代币上的 ATA 地址拉签名，100% 为该代币交易，仅 2~3 笔 Helius 解析。
         交易列表供后续 analyze_hunter_performance 复用；ATA 模式仅含本代币 txs，复用为 None 时由体检自行拉取。
         """
-        # 1. 主钱包频率预检（Alchemy 免费）
-        sigs = await self.get_signatures(client, hunter_address, limit=RECENT_TX_COUNT_FOR_FREQUENCY)
+        # 1. 主钱包频率预检（Alchemy 免费），拉 audit_tx_limit 以便后续复用解析
+        sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
         if not sigs:
             return None, None
         if _is_frequent_trader_by_blocktimes(sigs):
             logger.debug("⏭️ 频率淘汰(blockTime预检) %s.. 省 Helius 解析", hunter_address[:12])
             return None, None
 
-        # 2. 精准制导：拉取猎手在该代币上的 ATA 签名（100% 为该代币买卖，通常 2~10 笔）
-        # Pump.fun 等新代币多用 Token-2022，先试 Token 无结果则试 Token2022
-        ata_sigs = None
-        ata = None
-        for program in ("Token", "Token2022"):
-            ata = get_associated_token_address(hunter_address, token_address, program)
-            ata_sigs = await self.get_signatures(client, ata, limit=50)
-            if ata_sigs:
-                break
-        if not ata_sigs:
-            return None, None  # 从未碰过该代币（Token 与 Token2022 均无签名）
-
-        # 3. 仅解析 ATA 的少量签名（2~10 笔），替代过去 100~500 笔
-        txs = await self.fetch_parsed_transactions(client, ata_sigs)
+        # 2. 一次性解析主钱包交易，供 LP 预检、ROI、analyze 复用（省 1 次 Helius）
+        txs = await self.fetch_parsed_transactions(client, sigs)
         if not txs:
             return None, None
 
-        # LP 预检：ATA 交易含加池/撤池则淘汰并拉黑
-        if hunter_had_any_lp_on_token(txs, hunter_address, token_address, ata_address=ata):
+        # 3. LP 预检：主钱包交易含该代币 LP 行为则淘汰并拉黑
+        if hunter_had_any_lp_on_token(txs, hunter_address, token_address, ata_address=None):
             logger.warning(
                 "⚠️ LP 行为淘汰: %s.. 曾对该代币有 LP 操作（加池/撤池），已加入黑名单，永不跟仓",
                 hunter_address[:12],
@@ -610,8 +597,8 @@ class SmartMoneySearcher:
             if price is not None and price > 0:
                 total_value += tokens_held * price
         roi = (total_value - buy_sol) / buy_sol * 100
-        # ATA 的 txs 仅含本代币，无法供 analyze_hunter_performance 统计其他代币，返回 None 由体检自行拉取
-        return roi, None
+        # 返回 txs 供 analyze_hunter_performance 复用，省 1 次 Helius 解析
+        return roi, txs
 
     async def verify_token_age_via_dexscreener(self, client, token_address):
         """
@@ -765,7 +752,7 @@ class SmartMoneySearcher:
                     logger.debug("    跳过黑名单: %s..", addr[:12])
                     continue
                 roi, txs = await self.get_hunter_profit_on_token(client, addr, token_address)
-                # LP 行为（加池/撤池）已在 get_hunter_profit_on_token ATA 预检中淘汰并拉黑
+                # LP 行为（加池/撤池）已在 get_hunter_profit_on_token 主钱包预检中淘汰并拉黑
                 if roi is None or roi < SM_MIN_TOKEN_PROFIT_PCT:
                     await asyncio.sleep(0.3)
                     continue

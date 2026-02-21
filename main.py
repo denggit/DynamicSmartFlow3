@@ -407,6 +407,17 @@ async def main(immediate_audit: bool = False):
     monitor.set_agent(agent)  # 跟仓信号由 Monitor 统一推送，避免 Agent 自建 WS 漏单
     agent.signal_callback = on_agent_signal
 
+    async def _on_helius_credit_exhausted():
+        """Helius credit 耗尽（429）时的保命操作：清仓所有持仓 + 致命错误告警。"""
+        closed = await trader.emergency_close_all_positions()
+        logger.critical(
+            "🚨 [致命错误] Helius credit 已耗尽（429），无法解析猎手交易！"
+            "已紧急清仓 %d 个持仓，请立即检查 Helius 用量并充值。",
+            closed,
+        )
+
+    monitor.set_on_helius_credit_exhausted(_on_helius_credit_exhausted)
+
     if immediate_audit:
         await monitor.run_immediate_audit()
 

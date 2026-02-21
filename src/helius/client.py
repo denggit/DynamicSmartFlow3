@@ -123,7 +123,7 @@ class HeliusClient:
         signatures: List,
         *,
         http_client: Optional[httpx.AsyncClient] = None,
-        chunk_size: int = 90,
+        chunk_size: int = 100,
         timeout: float = 30.0,
     ) -> List[Dict]:
         """批量拉取 Helius 解析后的交易。"""

@@ -299,8 +299,11 @@ class HunterAgentController:
                             msg = await asyncio.wait_for(ws.recv(), timeout=60)
                             data = json.loads(msg)
 
-                            if "params" in data:
-                                await self.process_log(data["params"]["result"])
+                            params = data.get("params") if isinstance(data, dict) else None
+                            if params and isinstance(params, dict):
+                                result = params.get("result")
+                                if result is not None:
+                                    await self.process_log(result)
 
                         except asyncio.TimeoutError:
                             await ws.ping()
@@ -321,8 +324,13 @@ class HunterAgentController:
                 await asyncio.sleep(5)
 
     async def process_log(self, log_info):
-        """处理链上日志"""
-        signature = log_info['value']['signature']
+        """处理链上日志。log_info 为 logsSubscribe 的 result，格式可能为 {value: {signature: ...}} 或 {signature: ...}。"""
+        if not log_info or not isinstance(log_info, dict):
+            return
+        value = log_info.get("value") or log_info
+        signature = value.get("signature") if isinstance(value, dict) else None
+        if not signature:
+            return
 
         # 1. 快速过滤: 这笔交易是否涉及我们关心的猎手？
         # 通过 Alchemy RPC 拉取交易详情
@@ -332,7 +340,17 @@ class HunterAgentController:
                 return
 
             # 2. 解析交易：找出参与的猎手，并只处理非 IGNORE 代币的变动（真实交易）
-            account_keys = [k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"]]
+            # accountKeys 可能为 [{pubkey: str}, ...] 或 [str, ...] 取决于 RPC 格式
+            msg = (tx.get("transaction") or {}).get("message") or {}
+            account_keys_raw = msg.get("accountKeys") or []
+            account_keys = []
+            for k in account_keys_raw:
+                if isinstance(k, dict):
+                    pk = k.get("pubkey")
+                    if pk:
+                        account_keys.append(pk)
+                elif isinstance(k, str):
+                    account_keys.append(k)
             involved_hunters = set(account_keys).intersection(self.hunter_map.keys())
 
             if not involved_hunters:

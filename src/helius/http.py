@@ -25,7 +25,7 @@ class HeliusHttp:
 
     BASE_URL = "https://api.helius.xyz/v0"
     DEFAULT_TIMEOUT = 30.0
-    DEFAULT_CHUNK_SIZE = 90
+    DEFAULT_CHUNK_SIZE = 100  # Helius 单次最多 100 笔，100 credits/次，凑满更省
 
     def __init__(self, key_pool):
         """
@@ -59,7 +59,7 @@ class HeliusHttp:
     ) -> List[Dict]:
         """
         批量拉取 Helius 解析后的交易（POST /v0/transactions）。
-        每批最多 90 笔，429 时切换 Key 重试。
+        每批最多 100 笔，429 时切换 Key 重试。
 
         :param signatures: 签名列表，支持 dict 或 str（dict 取 signature 字段）
         :param chunk_size: 每批数量
