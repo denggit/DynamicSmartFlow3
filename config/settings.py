@@ -202,9 +202,9 @@ MIN_SUCCESSFUL_TX_FOR_FREQUENCY = 10  # blockTime 频率检测：成功交易(er
 MAX_FAILURE_RATE_FOR_FREQUENCY = 0.30  # 失败率超过 30% 即否决（Spam Bot 反向指标）
 MIN_AVG_TX_INTERVAL_SEC = 300  # 平均间隔 < 5 分钟视为频繁交易
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算真实
-SM_MIN_DELAY_SEC = 30  # 初筛：开盘后至少 30 秒买入才计入
+SM_MIN_DELAY_SEC = 60  # 初筛：开盘后至少 30 秒买入才计入
 SM_MAX_DELAY_SEC = 10800  # 3 小时内买入都算
-SM_MIN_TOKEN_PROFIT_PCT = 50.0  # 入库门槛：该代币当下至少赚 100% 才能入池；≥200%×1，100%~200%×0.9；体检时 30 天内若掉到 <50% 则踢出
+SM_MIN_TOKEN_PROFIT_PCT = 50.0  # 入库门槛：该代币当下至少赚 50% 才能入池；≥200%×1，100%~200%×0.9；体检时 30 天内若掉到 <50% 则踢出
 SM_AUDIT_TX_LIMIT = 300  # 体检时拉取交易笔数
 SM_LP_CHECK_TX_LIMIT = 100  # LP 预检 + 频率检测：先拉 100 笔查 LP 行为（加池/撤池）及频率，有则直接淘汰，通过后再拉满 500
 SM_EARLY_TX_PARSE_LIMIT = 300  # 初筛：最多解析多少笔早期交易（按时间取前 N 笔）
@@ -214,36 +214,33 @@ SM_MIN_BUY_SOL = 0.1  # 初筛：单笔买入最少 SOL
 SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
 # 入库硬门槛（取代原 40% 胜率 / 100 SOL）
 SM_ENTRY_MIN_PNL_RATIO = 2.0    # 总盈亏比 >= 2
-SM_ENTRY_MIN_WIN_RATE = 0.25     # 胜率 >= 25%
+SM_ENTRY_MIN_WIN_RATE = 0.30     # 胜率 >= 30%
 SM_ENTRY_MIN_TRADE_COUNT = 7   # 有效代币项目数 >= 7
-# 盈利分：< 20% 零分，20%~60% 线性，≥60% 满分
-SM_PROFIT_SCORE_ZERO_PCT = 20.0   # < 20% → 盈利分=0
-SM_PROFIT_SCORE_FULL_PCT = 60.0   # ≥60% → 盈利分=1
-# ROI 软门槛乘数：≥100%×1，75%~100%×0.9，50%~75%×0.75
-TIER_ONE_ROI = 100
-TIER_TWO_ROI = 75
+# ROI 软门槛乘数：≥200%×1，100%~200%×0.9，50%~100%×0.75
+TIER_ONE_ROI = 200
+TIER_TWO_ROI = 100
 TIER_THREE_ROI = 50
 SM_ROI_MULT_ONE = 1.0
 SM_ROI_MULT_TWO = 0.9
 SM_ROI_MULT_THREE = 0.75
 # 体检踢出：盈亏比<2 或 胜率<20% 或 利润<=0
 SM_AUDIT_MIN_PNL_RATIO = 2.0
-SM_AUDIT_MIN_WIN_RATE = 0.25
+SM_AUDIT_MIN_WIN_RATE = 0.20
 # 体检踢出：最近 30 天最大收益 < 50% 直接踢出（入库需 100%+，可能未结算，结算后若掉到 50% 以下则踢出）
 SM_AUDIT_KICK_MAX_ROI_30D_PCT = 50.0
 SM_MIN_HUNTER_SCORE = 0  # 入库不设最低分（满足四项门槛即可）；池子按分数排序替换
+# 盈利分：< 20% 零分，20%~60% 线性，≥60% 满分
+SM_PROFIT_SCORE_ZERO_PCT = 20.0   # < 20% → 盈利分=0
+SM_PROFIT_SCORE_FULL_PCT = 60.0   # ≥60% → 盈利分=1
 # 胜率分：< 15% 零分，15%~35% 线性 0.5~1，≥35% 满分
 SM_WIN_RATE_ZERO_PCT = 15.0   # < 15% → 胜率分=0
-SM_WIN_RATE_FULL_PCT = 35.0   # ≥35% → 胜率分=1
+SM_WIN_RATE_FULL_PCT = 50.0   # ≥ 50% → 胜率分=1
 # 盈亏比分：总盈亏比 = 盈利单利润和/亏损单亏损和；< 1.5 零分，1.5~3 线性，> 3 满分
 SM_PNL_RATIO_ZERO = 1.5   # < 1.5 → 盈亏比分=0
 SM_PNL_RATIO_FULL = 3.0   # > 3.0 → 盈亏比分=1
 SCANNED_HISTORY_FILE = str(BASE_DIR / "data" / "scanned_tokens.json")
 # 钱包黑名单：劣质猎手不再分析，节省 Helius API
 WALLET_BLACKLIST_FILE = str(BASE_DIR / "data" / "wallet_blacklist.json")
-WALLET_BLACKLIST_MIN_SCORE = 50  # 评分低于此加入黑名单
-WALLET_BLACKLIST_LOSS_USDC = 30.0  # 亏损超过此金额 (USDC) 且胜率低则加入
-WALLET_BLACKLIST_WIN_RATE = 0.4  # 亏损+胜率低于此加入黑名单
 
 # ==================== DexScreener 扫描 ====================
 DEX_MIN_LIQUIDITY_USD = 10000  # 最低流动性 (USD)
