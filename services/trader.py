@@ -452,7 +452,11 @@ class SolanaTrader:
         self._save_state_in_background()
 
     async def check_pnl_and_stop_profit(self, token_address: str, current_price_ui: float):
-        """止盈与止损逻辑：亏损超 30% 全仓止损，盈利达标则分批止盈。"""
+        """
+        止盈与止损逻辑。
+        止损：亏损达到 get_tier_config(lead_hunter_score).stop_loss_pct 时全仓止损（当前档位均为 65%）。
+        止盈：盈利达到 TAKE_PROFIT_LEVELS 各级阈值时按对应比例分批卖出（如 1000% 卖 80%）。
+        """
         if not self.keypair: return
         pos = self.positions.get(token_address)
         if not pos or pos.total_tokens <= 0: return

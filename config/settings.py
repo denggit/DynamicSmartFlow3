@@ -142,13 +142,13 @@ def get_tier_config(score: float) -> dict:
     <60: 0.03×3=0.09 | 60-80: 0.05×4=0.2 | 80-90: 0.1×5=0.5 | 90+: 0.2×5=1.0
     """
     if score >= 90:
-        return {"entry_sol": 0.2, "add_sol": 0.2, "max_sol": 1.0, "stop_loss_pct": 0.65}
+        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.15, "stop_loss_pct": 0.40}
     if score >= 80:
-        return {"entry_sol": 0.1, "add_sol": 0.1, "max_sol": 0.5, "stop_loss_pct": 0.65}
+        return {"entry_sol": 0.04, "add_sol": 0.04, "max_sol": 0.12, "stop_loss_pct": 0.40}
     if score >= 60:
-        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.2, "stop_loss_pct": 0.65}
+        return {"entry_sol": 0.03, "add_sol": 0.03, "max_sol": 0.09, "stop_loss_pct": 0.40}
     # 60 分以下也跟，但额度小
-    return {"entry_sol": 0.03, "add_sol": 0.03, "max_sol": 0.09, "stop_loss_pct": 0.65}
+    return {"entry_sol": 0.03, "add_sol": 0.00, "max_sol": 0.03, "stop_loss_pct": 0.40}
 
 # 猎手加仓跟随阈值：只跟对方买入 ≥ 1 SOL 的单
 HUNTER_ADD_THRESHOLD_SOL = 1.0
@@ -170,14 +170,14 @@ SELL_BUFFER = 0.999  # 留 0.1% 缓冲，防止 rounding overflow
 # 止盈策略 (触发倍数, 卖出比例)
 # 1.5 = 收益率 150% (即 2.5倍)
 TAKE_PROFIT_LEVELS = [
-    # (1.0, 0.25),   # +100% → 卖 25%（回本50%）
-    # (3.0, 0.25),   # +300% → 再卖 25% （回本）
-    (10.0, 0.8)    # +1000% → 再卖 80%
+    (1.0, 0.50),   # 涨1倍卖一半，零风险保本
+    (4.0, 0.50),   # 涨4倍再卖一半
+    (10.0, 0.80)   # 涨10倍收网
 ]
 
 # 份额管理
 # 剩余份额价值不足 0.05 SOL 直接清仓
-MIN_SHARE_VALUE_SOL = 0.05  # 份额粉尘阈值 (低于此值该份额清仓)
+MIN_SHARE_VALUE_SOL = 0.01  # 份额粉尘阈值 (低于此值该份额清仓)
 MIN_SELL_RATIO = 0.3  # 跟随卖出时我方最低减仓比例 (如文档: 猎手卖10%我们也至少卖30%)
 FOLLOW_SELL_THRESHOLD = 0.05  # 猎手卖出比例低于此不跟 (微调忽略，文档: 大于5%才跟)
 
@@ -199,15 +199,15 @@ MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转
 SM_MIN_DELAY_SEC = 30  # 初筛：开盘后至少 30 秒买入才计入
 SM_MAX_DELAY_SEC = 10800  # 3 小时内买入都算
 SM_MIN_TOKEN_PROFIT_PCT = 100.0  # 入库门槛：该代币当下至少赚 100% 才能入池；≥200%×1，100%~200%×0.9；体检时 30 天内若掉到 <50% 则踢出
-SM_AUDIT_TX_LIMIT = 500  # 体检时拉取交易笔数
+SM_AUDIT_TX_LIMIT = 100  # 体检时拉取交易笔数
 SM_LP_CHECK_TX_LIMIT = 100  # LP 预检 + 频率检测：先拉 100 笔查 LP 行为（加池/撤池）及频率，有则直接淘汰，通过后再拉满 500
 SM_EARLY_TX_PARSE_LIMIT = 360  # 初筛：最多解析多少笔早期交易（按时间取前 N 笔）
 SM_MIN_BUY_SOL = 0.1  # 初筛：单笔买入最少 SOL
 SM_MAX_BUY_SOL = 50.0  # 初筛：单笔买入最多 SOL
 # 入库硬门槛（取代原 40% 胜率 / 100 SOL）
 SM_ENTRY_MIN_PNL_RATIO = 2.0    # 总盈亏比 >= 2
-SM_ENTRY_MIN_WIN_RATE = 0.2     # 胜率 >= 20%
-SM_ENTRY_MIN_TRADE_COUNT = 10   # 有效代币项目数 >= 10
+SM_ENTRY_MIN_WIN_RATE = 0.25     # 胜率 >= 25%
+SM_ENTRY_MIN_TRADE_COUNT = 7   # 有效代币项目数 >= 7
 # 盈利分：< 20% 零分，20%~60% 线性，≥60% 满分
 SM_PROFIT_SCORE_ZERO_PCT = 20.0   # < 20% → 盈利分=0
 SM_PROFIT_SCORE_FULL_PCT = 60.0   # ≥60% → 盈利分=1
@@ -237,12 +237,12 @@ WALLET_BLACKLIST_WIN_RATE = 0.4  # 亏损+胜率低于此加入黑名单
 # ==================== DexScreener 扫描 ====================
 DEX_MIN_LIQUIDITY_USD = 10000  # 最低流动性 (USD)
 DEX_MIN_VOL_1H_USD = 50000  # 1 小时最低成交额 (USD)
-DEX_MIN_24H_GAIN_PCT = 500.0  # 年龄在范围内时，涨幅 > 500% 才执行猎手挖掘；未达标不写 scanned，下次重试
+DEX_MIN_24H_GAIN_PCT = 300.0  # 年龄在范围内时，涨幅 > 300% 才执行猎手挖掘；未达标不写 scanned，下次重试
 
 # ==================== 风控 (risk_control) ====================
 MAX_ACCEPTABLE_BUY_TAX_PCT = 25.0  # 买入税超过此比例拒绝
 MAX_SAFE_SCORE = 2000  # RugCheck 风险分超过此值拒绝
-MIN_LIQUIDITY_USD = 10000.0  # 池子流动性最低门槛防撤池 ($10k)
+MIN_LIQUIDITY_USD = 2000.0  # 池子流动性最低门槛防撤池 ($10k)
 MIN_LP_LOCKED_PCT = 70.0  # LP 至少锁仓或销毁比例，否则拒绝（防撤池）
 MAX_TOP2_10_COMBINED_PCT = 0.30  # 防老鼠仓：第 2~10 名合计上限
 MAX_SINGLE_HOLDER_PCT = 0.10  # 防老鼠仓：单一地址上限
