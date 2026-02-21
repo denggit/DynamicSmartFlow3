@@ -6,9 +6,9 @@
 @File       : __init__.py
 @Description: Helius API 模块。
               对外暴露 HeliusClient 单例。
-              统一入口请使用 services.blockchain.solana_client。
+              统一入口请使用 src.blockchain.solana_client。
 """
 
-from services.helius.client import HeliusClient, helius_client
+from src.helius.client import HeliusClient, helius_client
 
 __all__ = ["HeliusClient", "helius_client"]

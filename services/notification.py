@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-@File       : services/notification.py
+@File       : src/notification.py
 @Description: 邮件通知服务。支持开仓/清仓/日报；发送均在独立线程执行，不阻塞主流程。
 """
 import os

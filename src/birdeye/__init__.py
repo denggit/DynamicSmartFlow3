@@ -8,6 +8,6 @@
               对外暴露 BirdeyeClient 单例。
 """
 
-from services.birdeye.client import BirdeyeClient, birdeye_client
+from src.birdeye.client import BirdeyeClient, birdeye_client
 
 __all__ = ["BirdeyeClient", "birdeye_client"]

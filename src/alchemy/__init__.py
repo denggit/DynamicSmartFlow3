@@ -8,6 +8,6 @@
               对外暴露 AlchemyClient 单例。
 """
 
-from services.alchemy.client import AlchemyClient, alchemy_client
+from src.alchemy.client import AlchemyClient, alchemy_client
 
 __all__ = ["AlchemyClient", "alchemy_client"]

@@ -14,9 +14,9 @@ import httpx
 
 from config.settings import birdeye_key_pool
 
-from services.birdeye.market import BirdeyeMarket
-from services.birdeye.price import BirdeyePrice
-from services.birdeye.ws import BirdeyeWs
+from src.birdeye.market import BirdeyeMarket
+from src.birdeye.price import BirdeyePrice
+from src.birdeye.ws import BirdeyeWs
 
 
 class BirdeyeClient:

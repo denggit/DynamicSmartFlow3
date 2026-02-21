@@ -130,7 +130,9 @@ JUP_QUOTE_API = "https://api.jup.ag/swap/v1/quote"
 JUP_SWAP_API = "https://api.jup.ag/swap/v1/swap"
 
 # 交易参数
-SLIPPAGE_BPS = 200  # 滑点 2% (200 bps)
+SLIPPAGE_BPS = 200  # 买入滑点 2% (200 bps)，买入失败无所谓，不重试
+# 卖出失败时按此列表依次提高滑点重试，避免滑点过低卖不出（流动性差/剧烈波动时）
+SELL_SLIPPAGE_BPS_RETRIES = [200, 500, 1000]  # 2% -> 5% -> 10%
 PRIORITY_FEE_SETTINGS = "auto"
 
 # 单猎手跟单分档 (<60 / 60-80 / 80-90 / 90+)，只跟一个猎手

@@ -34,12 +34,12 @@ _flush_timer: Optional[threading.Timer] = None
 # 触发严重错误邮件的 logger 名称（跟单/交易/风控/主流程等）
 _CRITICAL_LOGGER_NAMES = frozenset({
     "Main",
-    "services.solana.trader",
-    "services.solana.hunter_agent",
-    "services.solana.hunter_monitor",
-    "services.helius.sm_searcher",
-    "services.risk_control",
-    "services.dexscreener.dex_scanner",
+    "src.solana.trader",
+    "src.solana.hunter_agent",
+    "src.solana.hunter_monitor",
+    "src.helius.sm_searcher",
+    "src.risk_control",
+    "src.dexscreener.dex_scanner",
 })
 
 

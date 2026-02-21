@@ -6,7 +6,7 @@
 @Date    : 2/17/2026
 @File    : sm_searcher.py
 @Description: Smart Money Searcher V7 - 热门币猎手挖掘
-              1. 热门币筛选: DexScreener 过去24小时涨幅 > 1000%
+              1. 热门币筛选: DexScreener 过去24小时涨幅 > DEX_MIN_24H_GAIN_PCT (默认 500%)
               2. 代币年龄: 放宽至 12 小时内
               3. 回溯: 最多 20 页
               4. 初筛买家: 开盘 15 秒后买入，该代币 ROI 入库门槛 ≥100%（×1/×0.9）；体检时 30d<50% 踢出
@@ -55,8 +55,8 @@ from config.settings import (
     WALLET_BLACKLIST_WIN_RATE,
     USDC_PER_SOL,
 )
-from services.alchemy import alchemy_client
-from services.helius import helius_client
+from src.alchemy import alchemy_client
+from src.helius import helius_client
 from utils.logger import get_logger
 from utils.hunter_scoring import compute_hunter_score
 from utils.solana_ata import get_associated_token_address
@@ -864,7 +864,7 @@ class SmartMoneySearcher:
 
 
 if __name__ == "__main__":
-    from services.dexscreener.dex_scanner import DexScanner
+    from src.dexscreener.dex_scanner import DexScanner
 
 
     async def main():

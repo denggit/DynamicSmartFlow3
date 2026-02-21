@@ -17,11 +17,11 @@ from config.settings import (
     BASE_DIR,
     POOL_SIZE_LIMIT,
 )
-from services.dexscreener.dex_scanner import DexScanner
-from services.solana.hunter_agent import HunterAgentController
-from services.solana.hunter_monitor import HunterMonitorController
-from services.solana.trader import SolanaTrader
-from services.rugcheck import risk_control
+from src.dexscreener.dex_scanner import DexScanner
+from services.hunter_agent import HunterAgentController
+from services.hunter_monitor import HunterMonitorController
+from services.trader import SolanaTrader
+from src.rugcheck import risk_control
 from services import notification
 from utils.logger import get_logger
 from utils.trading_history import append_trade, append_trade_in_background, load_history, load_data_for_report

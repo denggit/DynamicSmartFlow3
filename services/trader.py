@@ -29,11 +29,11 @@ from config.settings import (
     get_tier_config, TAKE_PROFIT_LEVELS, STOP_LOSS_PCT,
     MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
     SOLANA_PRIVATE_KEY_BASE58,
-    JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, BASE_DIR, jup_key_pool,
+    JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, BASE_DIR, jup_key_pool,
     TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
     TRADER_RPC_TIMEOUT,
 )
-from services.alchemy import alchemy_client
+from src.alchemy import alchemy_client
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -174,13 +174,11 @@ class SolanaTrader:
         )
         decimals = await self._get_decimals(token_address)
         decimals = decimals or 6
-        tx_sig, _ = await self._jupiter_swap(
+        tx_sig, _ = await self._jupiter_sell_with_retry(
             input_mint=token_address,
             output_mint=WSOL_MINT,
             amount_in_ui=chain_bal,
-            slippage_bps=SLIPPAGE_BPS,
-            is_sell=True,
-            token_decimals=decimals
+            token_decimals=decimals,
         )
         if not tx_sig:
             logger.warning("❌ 关闭前清仓失败: %s", token_address)
@@ -405,14 +403,12 @@ class SolanaTrader:
 
         logger.info(f"📉 [准备卖出] {token_address} | 数量: {sell_amount_ui:.2f}")
 
-        # === 真实卖出 ===
-        tx_sig, sol_got_ui = await self._jupiter_swap(
+        # === 真实卖出（失败时按 2%/5%/10% 滑点递增重试）===
+        tx_sig, sol_got_ui = await self._jupiter_sell_with_retry(
             input_mint=token_address,
             output_mint=WSOL_MINT,
             amount_in_ui=sell_amount_ui,
-            slippage_bps=SLIPPAGE_BPS,
-            is_sell=True,
-            token_decimals=pos.decimals  # 传入正确的精度
+            token_decimals=pos.decimals,
         )
 
         if not tx_sig:
@@ -493,13 +489,11 @@ class SolanaTrader:
             logger.info(f"🛑 [止损触发] {token_address} (亏损 {pnl_pct * 100:.0f}%) | 全仓清仓 {sell_amount:.2f}")
 
             decimals = await self._get_decimals(token_address)
-            tx_sig, sol_received = await self._jupiter_swap(
+            tx_sig, sol_received = await self._jupiter_sell_with_retry(
                 input_mint=token_address,
                 output_mint=WSOL_MINT,
                 amount_in_ui=sell_amount,
-                slippage_bps=SLIPPAGE_BPS,
-                is_sell=True,
-                token_decimals=decimals
+                token_decimals=decimals,
             )
 
             if not tx_sig:
@@ -553,15 +547,13 @@ class SolanaTrader:
                     continue
                 logger.info(f"💰 [止盈触发] {token_address} (+{pnl_pct * 100:.0f}%) | 卖出 {sell_amount:.2f}")
 
-                # === 真实卖出 ===
+                # === 真实卖出（失败时按 2%/5%/10% 滑点递增重试）===
                 decimals = await self._get_decimals(token_address)
-                tx_sig, sol_received = await self._jupiter_swap(
+                tx_sig, sol_received = await self._jupiter_sell_with_retry(
                     input_mint=token_address,
                     output_mint=WSOL_MINT,
                     amount_in_ui=sell_amount,
-                    slippage_bps=SLIPPAGE_BPS,
-                    is_sell=True,
-                    token_decimals=decimals
+                    token_decimals=decimals,
                 )
 
                 if not tx_sig:
@@ -603,6 +595,31 @@ class SolanaTrader:
                         self._emit_position_closed(token_address, pos)
                         del self.positions[token_address]
                 self._save_state_in_background()
+
+    async def _jupiter_sell_with_retry(
+        self, input_mint: str, output_mint: str, amount_in_ui: float, token_decimals: int = 9
+    ) -> Tuple[Optional[str], float]:
+        """
+        卖出专用：按 SELL_SLIPPAGE_BPS_RETRIES 依次尝试，滑点递增直至成功或耗尽。
+        卖出失败（滑点不足等）时优先重试而非直接放弃。
+        """
+        slippage_list = SELL_SLIPPAGE_BPS_RETRIES if SELL_SLIPPAGE_BPS_RETRIES else [SLIPPAGE_BPS]
+        for i, bps in enumerate(slippage_list):
+            tx_sig, sol_out = await self._jupiter_swap(
+                input_mint=input_mint,
+                output_mint=output_mint,
+                amount_in_ui=amount_in_ui,
+                slippage_bps=bps,
+                is_sell=True,
+                token_decimals=token_decimals,
+            )
+            if tx_sig is not None:
+                if i > 0:
+                    logger.info("✅ 卖出成功 (滑点 %.1f%%)", bps / 100)
+                return tx_sig, sol_out
+            if i < len(slippage_list) - 1:
+                logger.warning("❌ 卖出失败，尝试下一档滑点 %.1f%%", slippage_list[i + 1] / 100)
+        return None, 0.0
 
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
                             is_sell: bool = False, token_decimals: int = 9) -> Tuple[Optional[str], float]:
