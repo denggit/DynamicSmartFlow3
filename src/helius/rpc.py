@@ -47,6 +47,13 @@ class HeliusRpc:
     def size(self) -> int:
         return self._pool.size
 
+    def _validate_rpc_url(self, url: str) -> bool:
+        """校验 RPC URL 有效，避免 unknown url type 等错误。"""
+        if not url or not isinstance(url, str):
+            return False
+        u = url.strip()
+        return u.startswith("http://") or u.startswith("https://")
+
     async def rpc_post(
         self,
         method: str,
@@ -74,6 +81,12 @@ class HeliusRpc:
         try:
             for attempt in range(self.MAX_RETRIES):
                 url = self.get_rpc_url()
+                if not self._validate_rpc_url(url):
+                    logger.error(
+                        "❌ Helius RPC URL 无效（空或缺少协议）: %r，请检查 HELIUS_API_KEY 配置",
+                        url[:50] if url else "(空)",
+                    )
+                    return None
                 try:
                     resp = await client.post(url, json=payload, timeout=timeout)
                     if resp.status_code == 200:

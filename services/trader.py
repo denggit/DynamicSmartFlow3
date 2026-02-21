@@ -102,7 +102,13 @@ class SolanaTrader:
 
         # Alchemy Client (RPC) / Jupiter 各自独立，谁不可用谁自己换下一个
         self._jup_pool = jup_key_pool
-        self.rpc_client = AsyncClient(alchemy_client.get_rpc_url(), commitment=Confirmed)
+        rpc_url = alchemy_client.get_rpc_url()
+        if not rpc_url or not (rpc_url.startswith("http://") or rpc_url.startswith("https://")):
+            logger.error(
+                "❌ Alchemy RPC URL 无效: %r（请检查 ALCHEMY_API_KEY；若设了 HTTP_PROXY/HTTPS_PROXY 需为完整 URL）",
+                rpc_url[:80] if rpc_url else "(空)",
+            )
+        self.rpc_client = AsyncClient(rpc_url, commitment=Confirmed)
         self.http_client = httpx.AsyncClient(timeout=TRADER_RPC_TIMEOUT)
 
     def _jup_headers(self) -> dict:
@@ -124,7 +130,10 @@ class SolanaTrader:
         except Exception:
             pass
         alchemy_client.mark_current_failed()
-        self.rpc_client = AsyncClient(alchemy_client.get_rpc_url(), commitment=Confirmed)
+        rpc_url = alchemy_client.get_rpc_url()
+        if not rpc_url or not (rpc_url.startswith("http://") or rpc_url.startswith("https://")):
+            logger.error("❌ 切换 Key 后 Alchemy RPC URL 仍无效: %r", rpc_url[:50] if rpc_url else "(空)")
+        self.rpc_client = AsyncClient(rpc_url, commitment=Confirmed)
         if alchemy_client.size <= 1:
             logger.warning("⚠️ 仅配置 1 个 Alchemy Key，429 时切换无效，建议配置多个: ALCHEMY_API_KEY=key1,key2,key3")
         else:

@@ -123,7 +123,19 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 BOT_NAME = os.getenv("BOT_NAME", "DynamicSmartFlow3")  # 邮件标题前缀
 
 # --- 日报配置 ---
-DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "8"))  # 每日几点发日报 (0-23)
+# DAILY_REPORT_TIME 与 DAILY_REPORT_HOUR 二选一，TIME 优先（支持 "8" 或 "08:00" 格式，取小时）
+_report_time = os.getenv("DAILY_REPORT_TIME", "") or ""
+_report_hour_raw = os.getenv("DAILY_REPORT_HOUR", "8")
+if _report_time:
+    # 解析 "08:00" 或 "8" 格式，取小时部分
+    parts = str(_report_time).strip().split(":")
+    try:
+        DAILY_REPORT_HOUR = int(parts[0])
+    except (ValueError, IndexError):
+        DAILY_REPORT_HOUR = 8
+else:
+    DAILY_REPORT_HOUR = int(_report_hour_raw)
+DAILY_REPORT_HOUR = max(0, min(23, DAILY_REPORT_HOUR))  # 限制在 0-23
 
 # Jupiter API (v1)
 JUP_QUOTE_API = "https://api.jup.ag/swap/v1/quote"
