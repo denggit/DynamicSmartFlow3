@@ -293,7 +293,7 @@ TX_VERIFY_RECONCILIATION_RETRIES = 5  # 余额查询重试次数，每次切换 
 TRADER_RPC_TIMEOUT = 30.0  # RPC 请求超时
 
 # ==================== RPC 限流（防 429）====================
-ALCHEMY_MIN_INTERVAL_SEC = float(os.getenv("ALCHEMY_MIN_INTERVAL_SEC", "0.5"))  # Alchemy RPC 请求最小间隔，免费版约 330 CU/s
+ALCHEMY_MIN_INTERVAL_SEC = float(os.getenv("ALCHEMY_MIN_INTERVAL_SEC", "1.2"))  # Alchemy RPC 请求最小间隔，免费版易 429 可调大
 HELIUS_MIN_INTERVAL_SEC = float(os.getenv("HELIUS_MIN_INTERVAL_SEC", "2"))  # Helius 解析请求最小间隔，还未被真正使用
 
 # ==================== 其他 ====================

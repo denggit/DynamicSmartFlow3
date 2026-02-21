@@ -96,6 +96,11 @@ class AlchemyRpc:
                                     attempt + 1, self.MAX_RETRIES, err_msg,
                                 )
                                 self.mark_current_failed()
+                                backoff_429 = 5 + attempt * 3
+                                logger.info("⏳ 限流退避 %ds 后重试", backoff_429)
+                                await asyncio.sleep(backoff_429)
+                                if attempt < self.MAX_RETRIES - 1:
+                                    continue
                             else:
                                 return None
                     elif resp.status_code == 429:
@@ -104,6 +109,12 @@ class AlchemyRpc:
                             attempt + 1, self.MAX_RETRIES,
                         )
                         self.mark_current_failed()
+                        # 429 时退避更久，给限流桶恢复时间（免费版 CU/s 有限）
+                        backoff_429 = 5 + attempt * 3  # 5s, 8s, 11s
+                        logger.info("⏳ 429 退避 %ds 后重试", backoff_429)
+                        await asyncio.sleep(backoff_429)
+                        if attempt < self.MAX_RETRIES - 1:
+                            continue
                     else:
                         logger.warning("Alchemy RPC 请求失败: HTTP %s", resp.status_code)
 
