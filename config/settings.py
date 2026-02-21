@@ -243,7 +243,7 @@ WALLET_BLACKLIST_WIN_RATE = 0.4  # 亏损+胜率低于此加入黑名单
 # ==================== DexScreener 扫描 ====================
 DEX_MIN_LIQUIDITY_USD = 10000  # 最低流动性 (USD)
 DEX_MIN_VOL_1H_USD = 50000  # 1 小时最低成交额 (USD)
-DEX_MIN_24H_GAIN_PCT = 300.0  # 年龄在范围内时，涨幅 > 300% 才执行猎手挖掘；未达标不写 scanned，下次重试
+DEX_MIN_24H_GAIN_PCT = 500.0  # 年龄在范围内时，涨幅 > 500% 才执行猎手挖掘；未达标不写 scanned，下次重试
 
 # ==================== 风控 (risk_control) ====================
 MAX_ACCEPTABLE_BUY_TAX_PCT = 25.0  # 买入税超过此比例拒绝
