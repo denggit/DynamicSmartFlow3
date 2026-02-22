@@ -39,8 +39,11 @@ from config.settings import (
     TRADER_BIRDEYE_PRICE_TIMEOUT,
     TRADER_RPC_ERROR_SLEEP_SEC,
     TRADER_VERIFY_RETRY_SLEEP_SEC,
+    RECONCILE_TX_LIMIT,
+    IGNORE_MINTS,
 )
 from src.alchemy import alchemy_client
+from src.helius import helius_client
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -253,7 +256,7 @@ class SolanaTrader:
                 chain_bal = await self._fetch_own_token_balance(token_address)
                 sell_amount = chain_bal if chain_bal is not None else pos.total_tokens * SELL_BUFFER
                 if sell_amount is None or sell_amount <= 0:
-                    del self.positions[token_address]
+                    self._sync_zero_and_close_position(token_address, pos)
                     closed += 1
                     continue
                 decimals = await self._get_decimals(token_address) or pos.decimals
@@ -825,7 +828,8 @@ class SolanaTrader:
             if chain_bal is not None and chain_bal < pos.total_tokens * 0.99:
                 logger.warning("⚠️ 止损前状态与链上不一致: 内部 %.2f vs 链上 %.2f", pos.total_tokens, chain_bal)
             if sell_amount <= 0:
-                logger.warning("链上无持仓，跳过止损")
+                logger.info("链上已归零（可能为手动清仓），同步 trader_state 并跳过: %s", token_address[:16] + "..")
+                self._sync_zero_and_close_position(token_address, pos)
                 return
             sell_value_sol = sell_amount * current_price_ui
             if sell_value_sol < MIN_SHARE_VALUE_SOL:
@@ -921,8 +925,9 @@ class SolanaTrader:
                 else:
                     sell_amount = min(sell_amount, pos.total_tokens * SELL_BUFFER)  # 查余额失败，兜底 99.9%
                 if sell_amount <= 0:
-                    logger.warning("链上无持仓，跳过止盈")
-                    continue
+                    logger.info("链上已归零（可能为手动清仓），同步 trader_state 并跳过: %s", token_address[:16] + "..")
+                    self._sync_zero_and_close_position(token_address, pos)
+                    return
                 sell_value_sol = sell_amount * current_price_ui
                 if sell_value_sol < MIN_SHARE_VALUE_SOL:
                     logger.info(
@@ -1340,10 +1345,27 @@ class SolanaTrader:
     def _sync_zero_and_close_position(self, token_address: str, pos: Position) -> None:
         """
         链上持仓为 0 时同步内部状态并触发清仓回调，便于 hunter_agent 停止监控。
-        用于：链上无持仓时跳过卖出、卖出失败但链上已归零（验证超时导致误判）。
+        用于：链上无持仓时跳过卖出、卖出失败但链上已归零（验证超时导致误判）、手动清仓。
+        会更新 trader_state.json，并补录 trading_history（手动清仓时盈亏未知）。
         """
         if token_address not in self.positions:
             return
+        # 手动清仓时补录 trading_history，避免遗漏（实际盈亏链上未知，需人工核验）
+        if self.on_trade_recorded and pos.total_tokens > 0:
+            lead = list(pos.shares.keys())[0] if pos.shares else ""
+            self.on_trade_recorded({
+                "date": time.strftime("%Y-%m-%d", time.localtime()),
+                "ts": time.time(),
+                "token": token_address,
+                "type": "sell",
+                "sol_spent": 0.0,
+                "sol_received": None,
+                "token_amount": pos.total_tokens,
+                "price": pos.average_price,
+                "hunter_addr": lead,
+                "pnl_sol": None,
+                "note": "链上对账补录-手动清仓",
+            })
         self._emit_position_closed(token_address, pos)
         del self.positions[token_address]
         self._save_state_in_background()
@@ -1464,3 +1486,101 @@ class SolanaTrader:
 
     def get_active_tokens(self) -> List[str]:
         return [t for t, p in self.positions.items() if p.total_tokens > 0]
+
+    async def reconcile_from_chain(
+        self,
+        tx_limit: int = RECONCILE_TX_LIMIT,
+        on_trade_callback: Optional[Callable[[dict], None]] = None,
+    ) -> Tuple[List[str], int]:
+        """
+        链上对账：检测手动清仓并同步 trader_state.json，可选从钱包最近交易补录 trading_history。
+        :param tx_limit: 拉取钱包最近交易条数，默认 100
+        :param on_trade_callback: 补录交易时回调（如 append_trade_in_background），与 on_trade_recorded 一致
+        :return: (本次同步移除的 token 列表，补录的 selling 记录数)
+        """
+        if not self.keypair:
+            return [], 0
+        wallet = str(self.keypair.pubkey())
+        synced_tokens: List[str] = []
+        appended_records = 0
+        callback = on_trade_callback or self.on_trade_recorded
+
+        # 1. 遍历持仓，链上归零则同步移除
+        for token_address in list(self.positions.keys()):
+            pos = self.positions.get(token_address)
+            if not pos or pos.total_tokens <= 0:
+                continue
+            try:
+                chain_bal = await self._fetch_own_token_balance(token_address)
+                if chain_bal is not None and chain_bal < 1e-9:
+                    logger.info("📤 [链上对账] 发现 %s 链上已归零，同步 trader_state", token_address[:16] + "..")
+                    self._sync_zero_and_close_position(token_address, pos)
+                    synced_tokens.append(token_address)
+            except Exception:
+                logger.debug("对账拉取余额异常: %s", token_address[:16] + "..")
+
+        # 2. 拉取钱包最近 tx 并补录可能遗漏的卖出记录到 trading_history
+        try:
+            sigs = await alchemy_client.get_signatures_for_address(wallet, limit=tx_limit)
+            if not sigs:
+                return synced_tokens, appended_records
+            sig_list = [s.get("signature") for s in sigs if s.get("signature")]
+            if not sig_list:
+                return synced_tokens, appended_records
+            txs = await helius_client.fetch_parsed_transactions(sig_list, http_client=self.http_client)
+            if not txs:
+                return synced_tokens, appended_records
+
+            from utils.trading_history import load_history
+            history = load_history()
+            history_keys = {(r.get("date") or "", r.get("token") or "", r.get("type") or "") for r in history}
+
+            for tx in txs:
+                ts = tx.get("timestamp") or tx.get("blockTime") or 0
+                date_str = time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else ""
+                sol_received = 0.0
+                for nt in tx.get("nativeTransfers", []):
+                    if nt.get("toUserAccount") == wallet:
+                        sol_received += (nt.get("amount") or 0) / LAMPORTS_PER_SOL
+                for tt in tx.get("tokenTransfers", []):
+                    if tt.get("fromUserAccount") != wallet:
+                        continue
+                    mint = tt.get("mint")
+                    if not mint or mint in IGNORE_MINTS:
+                        continue
+                    token_amt = 0.0
+                    tamt = tt.get("tokenAmount") or {}
+                    if isinstance(tamt, dict):
+                        raw = tamt.get("amount") or "0"
+                        dec = int(tamt.get("decimals") or 9)
+                        token_amt = int(raw) / (10 ** dec) if raw else 0
+                    elif isinstance(tamt, (int, float)):
+                        token_amt = float(tamt)
+                    if token_amt <= 0:
+                        continue
+                    key = (date_str, mint, "sell")
+                    if key in history_keys:
+                        continue
+                    if callback:
+                        try:
+                            callback({
+                                "date": date_str,
+                                "ts": ts,
+                                "token": mint,
+                                "type": "sell",
+                                "sol_spent": 0.0,
+                                "sol_received": sol_received if sol_received > 0 else None,
+                                "token_amount": token_amt,
+                                "price": None,
+                                "hunter_addr": "",
+                                "pnl_sol": None,
+                                "note": "链上对账补录",
+                            })
+                            history_keys.add(key)
+                            appended_records += 1
+                        except Exception:
+                            logger.debug("对账补录回调异常: %s", mint[:16] if mint else "")
+        except Exception:
+            logger.exception("链上对账拉取交易异常")
+
+        return synced_tokens, appended_records

@@ -33,6 +33,10 @@ HELIUS_MIN_INTERVAL_SEC = float(os.getenv("HELIUS_MIN_INTERVAL_SEC", "2"))
 # DexScreener 扫描器
 DEX_SCAN_POLL_INTERVAL_SEC = 300
 
+# 链上对账：每 24 小时拉取钱包最近交易，同步 trader_state 与 trading_history（补录手动清仓等）
+RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "86400"))
+RECONCILE_TX_LIMIT = int(os.getenv("RECONCILE_TX_LIMIT", "100"))
+
 # 其他
 CRITICAL_EMAIL_COOLDOWN_SEC = 3600
 WATCHDOG_RESTART_DELAY = 5

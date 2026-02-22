@@ -28,6 +28,8 @@ from config.settings import (
     LIQUIDITY_COLLAPSE_THRESHOLD_USD,
     LIQUIDITY_DROP_RATIO,
     LIQUIDITY_CHECK_DEXSCREENER_INTERVAL_SEC,
+    RECONCILE_INTERVAL_SEC,
+    RECONCILE_TX_LIMIT,
 )
 from config.paths import DATA_ACTIVE_DIR
 from utils.logger import get_logger, LOGS_ROOT
@@ -413,6 +415,25 @@ def _build_daily_report_from_history(trader_instance):
     return content
 
 
+async def reconcile_loop():
+    """定期链上对账：检测手动清仓、同步 trader_state，补录 trading_history。"""
+    logger.info("📋 链上对账任务已启动，每 %d 小时执行", RECONCILE_INTERVAL_SEC // 3600)
+    while True:
+        await asyncio.sleep(RECONCILE_INTERVAL_SEC)
+        try:
+            synced_tokens, appended = await trader.reconcile_from_chain(
+                tx_limit=RECONCILE_TX_LIMIT,
+                on_trade_callback=append_trade_in_background,
+            )
+            for token in synced_tokens:
+                await trader.ensure_fully_closed(token)
+                await agent.stop_tracking(token)
+            if synced_tokens or appended > 0:
+                logger.info("📤 [链上对账] 完成：移除 %d 个已归零持仓，补录 %d 条交易", len(synced_tokens), appended)
+        except Exception:
+            logger.exception("链上对账异常")
+
+
 async def daily_report_loop():
     """每天 DAILY_REPORT_HOUR 点发送详细日报（从 trading_history.json 读取）。"""
     logger.info("📊 日报任务已启动，每日 %s 点发送", DAILY_REPORT_HOUR)
@@ -529,6 +550,7 @@ async def main(immediate_audit: bool = False):
         agent.start(),
         pnl_monitor_loop(),
         liquidity_structural_check_loop(),
+        reconcile_loop(),
         daily_report_loop(),
     )
 
