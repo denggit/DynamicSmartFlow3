@@ -480,7 +480,7 @@ async def daily_report_loop():
 
 async def restore_agent_from_trader() -> None:
     """启动时根据已恢复的持仓，恢复 Agent 对每个代币的监控。"""
-    for token_address, pos in trader.positions.items():
+    for token_address, pos in list(trader.positions.items()):  # 副本迭代，避免 start_tracking 回调删持仓导致 RuntimeError
         if pos.total_tokens <= 0:
             continue
         hunter_addrs = list(pos.shares.keys())
@@ -525,8 +525,8 @@ async def main(immediate_audit: bool = False):
     trader.on_trade_recorded = append_trade_in_background  # 后台线程写入，不阻塞跟单
 
     async def _on_hunter_zero_skip(token_address: str) -> None:
-        """猎手持仓归零跳过监控时：校验我方链上是否归零，未归零则清仓；链上已归零则同步移除 trader_state。"""
-        await trader.ensure_fully_closed(token_address)
+        """猎手持仓归零跳过监控时：校验我方链上是否归零，未归零则清仓；链上已归零或查询失败则同步移除 trader_state。"""
+        await trader.ensure_fully_closed(token_address, remove_if_chain_unknown=True)
 
     agent.on_hunter_zero_skip = _on_hunter_zero_skip  # 必须在 restore_agent_from_trader 前设置，否则恢复时漏删过时持仓
     await restore_agent_from_trader()

@@ -210,18 +210,22 @@ class SolanaTrader:
                     pass
         return total_raw if total_raw > 0 else None
 
-    async def ensure_fully_closed(self, token_address: str) -> None:
+    async def ensure_fully_closed(self, token_address: str, remove_if_chain_unknown: bool = False) -> None:
         """
         关闭监控前校验：链上仓位是否已归零。若未归零则执行清仓，避免遗漏 dust 或状态不同步。
         若链上已归零但内部仍有持仓记录（如重启后恢复的过时状态），也同步移除并持久化，
         避免下次重启又触发 restore_agent_from_trader 导致重复监控。
+        :param remove_if_chain_unknown: 链上余额查询失败(None)时，若仍有内部持仓，是否强制移除（用于猎手持仓归零跳过场景）
         """
         if not self.keypair:
             return
         chain_bal = await self._fetch_own_token_balance(token_address)
-        if chain_bal is None:
-            return
         pos = self.positions.get(token_address)
+        if chain_bal is None:
+            if remove_if_chain_unknown and pos:
+                logger.warning("链上余额查询失败，按猎手归零跳过策略强制移除过时持仓: %s", token_address[:16] + "..")
+                self._sync_zero_and_close_position(token_address, pos)
+            return
         if chain_bal < 1e-9:  # 链上已归零
             if pos:
                 logger.info("链上已归零，同步移除过时持仓记录: %s", token_address[:16] + "..")
@@ -1392,7 +1396,7 @@ class SolanaTrader:
             })
         self._emit_position_closed(token_address, pos)
         del self.positions[token_address]
-        self._save_state_in_background()
+        self._save_state_safe()  # 同步写入，确保移除过时持仓后立即持久化，避免重启又恢复
         logger.info("📤 已同步清仓状态并移除持仓记录: %s", token_address[:16] + "..")
 
     def _emit_position_closed(self, token_address: str, pos: Position) -> None:
