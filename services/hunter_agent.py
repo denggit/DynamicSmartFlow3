@@ -35,6 +35,7 @@ from config.settings import (
 )
 from src.alchemy import alchemy_client
 from services.hunter_common import TransactionParser
+from services.hunter_common.shared import _get_tx_timestamp
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -104,7 +105,12 @@ class HunterAgentController:
         用 Helius 解析格式解析 token 变动（Monitor 推送的 tx 为 Helius 格式）：
         1. 已跟仓的 (hunter, token)：发 HUNTER_SELL / HUNTER_BUY
         2. 新增猎手：池内猎手买入我们正在持有的 token 时，加入任务并发 HUNTER_BUY 触发加仓
+
+        重要：必须使用 tx 的真实 blockTime，否则队列延迟会导致「基线前交易」被误判为加仓。
+        例如猎手 13:32 买入触发共振，我们 13:33 才完成开仓并 start_tracking；
+        若该 tx 在队列中延迟到 13:33 才被消费，若用 time.time() 会误以为「刚加仓」。
         """
+        tx_time = _get_tx_timestamp(tx) or time.time()
         parser_cache = {}
         usdc_price_sol = 1.0 / USDC_PER_SOL if USDC_PER_SOL > 0 else 0.01
         for hunter in active_hunters:
@@ -119,7 +125,7 @@ class HunterAgentController:
             for mint, delta in token_changes.items():
                 if mint in potential_tokens:
                     try:
-                        await self.analyze_action(hunter, mint, delta, None, time.time())
+                        await self.analyze_action(hunter, mint, delta, tx, tx_time)
                     except Exception:
                         logger.exception("on_tx_from_monitor analyze_action 异常 %s %s", hunter[:6], mint[:6])
                 elif delta > 0:
@@ -249,7 +255,7 @@ class HunterAgentController:
                             delta = real_balance - old_bal
                             if abs(delta) < 1e-9:
                                 continue
-                            # 发现减仓（可能漏了订阅）
+                            # 发现减仓（可能漏了订阅）。注意：old_bal 须正确，若 baseline 被基线前 tx 污染会误判
                             if delta < 0 and abs(delta) >= old_bal * SYNC_MIN_DELTA_RATIO:
                                 mission.hunter_states[hunter] = max(0.0, real_balance)
                                 sell_amount = abs(delta)
@@ -428,9 +434,25 @@ class HunterAgentController:
         return result
 
     async def analyze_action(self, hunter, token, delta, tx, timestamp):
-        """核心：分析行为并生成信号"""
+        """
+        核心：分析行为并生成信号。
+
+        基线前交易过滤：若 tx 发生在 start_tracking 之前，说明是「共振触发的那笔买入」，
+        已包含在 start_tracking 时的链上 snapshot 中，不可再当作「加仓」处理，
+        否则会误发 HUNTER_BUY 导致用户错误加仓；进而 sync_positions 发现「余额对不上」
+        会误判为「减仓」导致用户错误减仓。
+        """
         mission = self.active_missions.get(token)
-        if not mission: return
+        if not mission:
+            return
+
+        # 基线前交易：发生在 start_tracking 之前的 tx，已含在初始 snapshot 中，跳过
+        if timestamp > 0 and timestamp < mission.start_time:
+            trade_logger.debug(
+                "⏭️ [Agent] 忽略基线前交易 %s %s delta=%.2f (tx_time=%.0f < start=%.0f)",
+                hunter[:8], token[:6], delta, timestamp, mission.start_time
+            )
+            return
 
         # 更新本地状态
         old_bal, new_bal = mission.update_balance(hunter, delta)

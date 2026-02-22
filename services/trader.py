@@ -448,7 +448,9 @@ class SolanaTrader:
                 "pnl_sol": None,
                 "note": "首次开仓",
             })
-        logger.info(f"✅ 开仓成功 | 均价: {actual_price:.6f} SOL | 持仓: {token_amount_ui:.2f}")
+        # 极小价格用更多小数位避免精度丢失导致止盈/止损误判
+        price_fmt = f"{actual_price:.8f}" if actual_price < 0.0001 else f"{actual_price:.6f}"
+        logger.info(f"✅ 开仓成功 | 均价: {price_fmt} SOL | 持仓: {token_amount_ui:.2f}")
 
     async def execute_add_position(self, token_address: str, trigger_hunter: Dict, add_reason: str,
                                    current_price: float):
@@ -991,7 +993,8 @@ class SolanaTrader:
                                         "⚠️ 买入验证超时但链上余额已到账 (raw %s >= %s)，以链上为准视为成功: %s",
                                         chain_raw, min_expected, sig_str,
                                     )
-                                    return sig_str, out_amount_raw
+                                    # 关键：返回链上实际到账量（非 Quote 预估），否则均价 = buy_sol/token_ui 会错误
+                                    return sig_str, float(chain_raw)
                                 if recon_attempt < TX_VERIFY_RECONCILIATION_RETRIES - 1:
                                     if alchemy_client.size >= 1:
                                         alchemy_client.mark_current_failed()
