@@ -231,17 +231,19 @@ def _check_top_holders_safe(data: dict, token_mint: str) -> bool:
         candidates.append(pct)
 
     combined = sum(candidates)
-    if combined > MAX_TOP2_10_COMBINED_PCT * remaining_pct:
+    threshold = MAX_TOP2_10_COMBINED_PCT * remaining_pct  # 剩余供应的 30%，如 83.3%×0.3=24.99%
+    if combined > threshold:
         logger.warning(
-            "⚠️ 老鼠仓：第2~10名合计 %.1f%% > 剩余 %.1f%% 的 %.0f%%: %s",
-            combined, remaining_pct, MAX_TOP2_10_COMBINED_PCT * 100, token_mint[:16] + ".."
+            "⚠️ 老鼠仓：第2~10名合计 %.1f%% > 阈值 %.1f%%（剩余%.1f%%的30%%）: %s",
+            combined, threshold, remaining_pct, token_mint[:16] + ".."
         )
         return False
+    single_threshold = MAX_SINGLE_HOLDER_PCT * remaining_pct  # 剩余供应的 10%
     for p in candidates:
-        if p > MAX_SINGLE_HOLDER_PCT * remaining_pct:
+        if p > single_threshold:
             logger.warning(
-                "⚠️ 老鼠仓：单一地址 %.1f%% > 剩余 %.1f%% 的 %.0f%%: %s",
-                p, remaining_pct, MAX_SINGLE_HOLDER_PCT * 100, token_mint[:16] + ".."
+                "⚠️ 老鼠仓：单一地址 %.1f%% > 阈值 %.1f%%（剩余%.1f%%的10%%）: %s",
+                p, single_threshold, remaining_pct, token_mint[:16] + ".."
             )
             return False
     return True

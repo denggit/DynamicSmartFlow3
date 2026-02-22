@@ -26,21 +26,24 @@ from config.settings import (
     PNL_LOOP_RATE_LIMIT_SLEEP_SEC,
 )
 from config.paths import DATA_ACTIVE_DIR
+from utils.logger import get_logger, LOGS_ROOT
 from src.dexscreener.dex_scanner import DexScanner
 from services.hunter_agent import HunterAgentController
 from services.hunter_monitor import HunterMonitorController
 from services.trader import SolanaTrader
 from src.rugcheck import risk_control
 from services import notification
-from utils.logger import get_logger
 from utils.trading_history import append_trade, append_trade_in_background, load_history, load_data_for_report
 
 logger = get_logger("Main")
+# 启动时首行显示当前模式、数据目录、日志目录，避免 MODELA/MODELB 混淆
+logger.info("🦌 当前模式: %s | 数据: %s | 日志: %s", HUNTER_MODE or "MODELA", DATA_ACTIVE_DIR, LOGS_ROOT)
 
-# 启动时确保 data 及 modelA/modelB 目录存在
+# 启动时确保 data、logs 及对应 modelA/modelB 目录存在
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_MODELA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_MODELB_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_ROOT.mkdir(parents=True, exist_ok=True)
 
 trader = SolanaTrader()
 trader.load_state()  # 启动时从本地恢复持仓
@@ -400,7 +403,6 @@ def _migrate_closed_pnl_to_history():
 
 async def main(immediate_audit: bool = False):
     """主入口。HUNTER_MODE 在进程启动时确定，修改 .env 后需重启生效。"""
-    logger.info("🦌 当前模式: %s | 数据目录: %s", HUNTER_MODE or "MODELA", DATA_ACTIVE_DIR)
     _load_closed_pnl_log()
     await asyncio.to_thread(_migrate_closed_pnl_to_history)  # 后台线程迁移，不阻塞启动
     trader.on_position_closed_callback = _on_position_closed

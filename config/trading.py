@@ -17,12 +17,12 @@ PRIORITY_FEE_SETTINGS = "auto"
 def get_tier_config(score: float) -> dict:
     """根据猎手分数返回 entry/add/max/stop_loss。"""
     if score >= 90:
-        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.15, "stop_loss_pct": 0.85}
+        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.15, "stop_loss_pct": 0.65}
     if score >= 80:
-        return {"entry_sol": 0.04, "add_sol": 0.04, "max_sol": 0.12, "stop_loss_pct": 0.85}
+        return {"entry_sol": 0.04, "add_sol": 0.04, "max_sol": 0.12, "stop_loss_pct": 0.65}
     if score >= 60:
-        return {"entry_sol": 0.03, "add_sol": 0.03, "max_sol": 0.09, "stop_loss_pct": 0.85}
-    return {"entry_sol": 0.03, "add_sol": 0.00, "max_sol": 0.03, "stop_loss_pct": 0.85}
+        return {"entry_sol": 0.03, "add_sol": 0.03, "max_sol": 0.09, "stop_loss_pct": 0.65}
+    return {"entry_sol": 0.03, "add_sol": 0.00, "max_sol": 0.03, "stop_loss_pct": 0.65}
 
 
 HUNTER_ADD_THRESHOLD_SOL = 1.0

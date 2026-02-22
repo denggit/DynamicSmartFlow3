@@ -5,13 +5,14 @@
 @Date       : 2/18/2026
 @File       : logger.py
 @Description: 统一日志工具
-              - 日志按日期分目录: logs/YYYY-MM-DD/，主程序 main.log，其他按模块分文件
-              - 猎手交易监控单独写入 monitor.log，便于查看什么时间、交易哪个币
+              - 日志按模式分目录: MODELA -> logs/modelA/YYYY-MM-DD/，MODELB -> logs/modelB/YYYY-MM-DD/
+              - 合并为 5 个重点模块: main、trade、hunter、risk、api
               - 每日零点后自动切到新日期目录，不依赖程序启动时间
               - 关键模块的 ERROR/exception 触发告警邮件，1 小时一封、整合该时段内所有错误
 """
 
 import logging
+import os
 import sys
 import threading
 import time
@@ -21,7 +22,10 @@ from typing import List, Optional
 
 # 项目根目录 (utils 的父级)
 _BASE_DIR = Path(__file__).resolve().parent.parent
-LOGS_ROOT = _BASE_DIR / "logs"
+# 按 HUNTER_MODE 分配日志根目录，启动时确定，与 data/modelA、data/modelB 一致
+_HUNTER_MODE = (os.getenv("HUNTER_MODE", "MODELA") or "MODELA").strip().upper()
+_LOGS_SUBDIR = "modelB" if _HUNTER_MODE == "MODELB" else "modelA"
+LOGS_ROOT = _BASE_DIR / "logs" / _LOGS_SUBDIR
 
 # 已创建的 logger 实例，避免重复添加 handler
 _logger_handlers: dict = {}
@@ -98,33 +102,51 @@ def _schedule_flush_if_first() -> None:
 def _logger_name_to_file_name(name: str) -> str:
     """
     Logger 名称 -> 日志文件名（不含扩展名）。
-    主程序 Main -> main.log；猎手交易专用 trade -> monitor.log；
-    modela/modelb 及其子模块 -> modela.log / modelb.log；其余取最后一段。
+    合并为 5 个重点模块，避免一模块一文件过于分散：
+    - main: 主流程、日报、通知
+    - trade: 跟单、交易、监控、猎手信号
+    - hunter: 猎手挖掘（modela/modelb）
+    - risk: 风控
+    - api: 外部 API（DexScreener、Birdeye、RPC、HTTP）
     """
     if not name or name == "root":
-        return "app"
+        return "main"
     if name == "Main":
         return "main"
+    if name.startswith("services.notification"):
+        return "main"
+    if name.startswith("utils.trading_history"):
+        return "main"
     if name == "trade":
-        return "monitor"
+        return "trade"
+    if name.startswith("services.trader"):
+        return "trade"
+    if name.startswith("services.hunter_monitor"):
+        return "trade"
+    if name.startswith("services.hunter_agent"):
+        return "trade"
     if name.startswith("services.modela"):
-        return "modela"
+        return "hunter"
     if name.startswith("services.modelb"):
-        return "modelb"
-    parts = name.split(".")
-    return parts[-1].lower() if parts else "app"
+        return "hunter"
+    if name.startswith("src.rugcheck"):
+        return "risk"
+    # src.dexscreener、src.birdeye、src.alchemy、src.helius 等
+    if name.startswith("src."):
+        return "api"
+    return "main"
 
 
 class DateDirFileHandler(logging.FileHandler):
     """
-    按日期目录 + 文件名写入: logs/YYYY-MM-DD/<file_name>.log。
+    按日期目录 + 文件名写入: logs/<modelA|modelB>/YYYY-MM-DD/<file_name>.log。
     每次 emit 时检查当前日期，若日期变化则切换到新日期目录下的文件。
     """
 
     def __init__(self, file_name: str, logs_root: Path):
         """
         :param file_name: 文件名（不含 .log），如 main、monitor、trader
-        :param logs_root: 日志根目录，其下按日期建子目录 YYYY-MM-DD
+        :param logs_root: 日志根目录（logs/modelA 或 logs/modelB），其下按日期建子目录 YYYY-MM-DD
         """
         self._file_name = file_name
         self._logs_root = Path(logs_root)
@@ -193,8 +215,9 @@ class CriticalErrorEmailHandler(logging.Handler):
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     """
-    获取按日期目录分文件的 Logger：logs/YYYY-MM-DD/<file_name>.log。
-    主程序用 get_logger("Main") -> main.log；猎手交易用 get_logger("trade") -> monitor.log。
+    获取按日期目录分文件的 Logger：logs/<modelA|modelB>/YYYY-MM-DD/<file_name>.log。
+    MODELA 写入 logs/modelA/，MODELB 写入 logs/modelB/，与 data 目录一致。
+    5 个重点日志文件: main.log、trade.log、hunter.log、risk.log、api.log。
     同一 name 多次调用返回同一实例，且只挂一次 DateDirFileHandler。
 
     :param name: 通常传 __name__，或 "Main"、"trade"
@@ -211,10 +234,9 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
         )
         logger.propagate = False
 
-        # 文件：按日期目录写入；modela/modelb 使用 logs/modela/YYYY-MM-DD、logs/modelb/YYYY-MM-DD
+        # 文件：按日期目录写入 logs/<modelA|modelB>/YYYY-MM-DD/<file_name>.log
         file_name = _logger_name_to_file_name(name)
-        logs_root = LOGS_ROOT / file_name if file_name in ("modela", "modelb") else LOGS_ROOT
-        file_handler = DateDirFileHandler(file_name, logs_root)
+        file_handler = DateDirFileHandler(file_name, LOGS_ROOT)
         file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
