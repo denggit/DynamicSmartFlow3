@@ -113,6 +113,9 @@ def _on_position_closed(snapshot: dict) -> None:
 # 黑名单校验用（main() 中注入 monitor.sm_searcher）
 _sm_searcher_for_blacklist: list = []
 
+# 跟仓买入失败且验证持仓确认失败时放弃的 token 集合。同一共振周期内不再重试，避免买在更高位置。
+_entry_failed_tokens: set = set()
+
 
 async def on_monitor_signal(signal):
     """[Monitor -> Trader] 发现开仓信号：风控 -> 开仓 -> 发首次跟单邮件 -> 启动 Agent。"""
@@ -151,12 +154,24 @@ async def _on_monitor_signal_impl(signal, sm_searcher=None):
     _, entry_liq_usd, _ = await risk_control.check_token_liquidity(token)
 
     # 3. 开仓（halve 时减半仓且禁止加仓）
-    await trader.execute_entry(
+    definitely_failed = await trader.execute_entry(
         token, hunters, total_score, price, halve_position=halve,
         entry_liquidity_usd=entry_liq_usd,
     )
     pos = trader.positions.get(token)
     if not pos:
+        # 仅当确定从未广播（Quote/Swap 失败）时加入放弃集；已广播但验证失败则不加入，
+        # 避免实际已买入却误放弃后续跟仓
+        if definitely_failed is True:
+            _entry_failed_tokens.add(token)
+            logger.info("🚫 跟仓买入确定失败（Quote/Swap 未通过），放弃 %s（本周期不再重试）", token[:16] + "..")
+        elif definitely_failed is False:
+            logger.warning(
+                "⚠️ 买入失败但可能已成交（RPC 验证超时），不加入放弃集：%s。"
+                "若实际已持仓请手动处理或等待链上对账",
+                token[:16] + "..",
+            )
+        # definitely_failed is None：未尝试（keypair/已有仓位等），不记录
         return
 
     # 4. 首次跟单邮件（新线程发送，不阻塞）
@@ -517,7 +532,7 @@ async def main(immediate_audit: bool = False):
     monitor = HunterMonitorController(
         signal_callback=on_monitor_signal,
         tracked_tokens_getter=get_tracked_tokens,
-        position_check=lambda t: t in trader.positions,
+        position_check=lambda t: t in trader.positions or t in _entry_failed_tokens,
     )
     _sm_searcher_for_blacklist.append(monitor.sm_searcher)  # 供开仓前黑名单二次过滤
     monitor.set_agent(agent)  # 跟仓信号由 Monitor 统一推送，避免 Agent 自建 WS 漏单

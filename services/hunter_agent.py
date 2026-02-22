@@ -149,12 +149,15 @@ class HunterAgentController:
         mission = TokenMission(token_address, creation_time or time.time())
         self.active_missions[token_address] = mission
 
-        # 1. 立即获取这些猎手当前的持仓 (Snapshot)
-        # 这是一个关键步骤，因为猎手可能在我们介入前已经买入了多次
+        # 1. 【关键】先建立 hunter_map 索引，再拉链上余额。
+        #    否则：_fetch_token_balance 耗时期间，Monitor 消费队列可能已把「猎手卖出」tx 推给 on_tx_from_monitor，
+        #    此时 hunter_map 尚空，会漏跟卖。先登记后拉余额可避免该竞态。
+        for hunter in hunters:
+            self.hunter_map[hunter].add(token_address)
+        # 2. 获取各猎手当前持仓快照
         for hunter in hunters:
             balance = await self._fetch_token_balance(hunter, token_address)
             mission.add_hunter(hunter, balance)
-            self.hunter_map[hunter].add(token_address)
 
         # 这里会触发 WebSocket 重连以更新订阅列表
         # (在 monitor_loop 里会自动处理)

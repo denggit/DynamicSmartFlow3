@@ -43,6 +43,7 @@ from config.settings import (
     IGNORE_MINTS,
 )
 from src.alchemy import alchemy_client
+from src.alchemy.rate_limit import with_alchemy_rate_limit
 from src.helius import helius_client
 from utils.logger import get_logger
 
@@ -482,15 +483,17 @@ class SolanaTrader:
 
         logger.info(f"🚀 [准备开仓] {token_address} | 计划: {buy_sol:.3f} SOL")
 
-        # 2. 执行买入 (返回 Raw Amount)
-        tx_sig, token_amount_raw = await self._jupiter_swap(
+        # 2. 执行买入 (返回 Raw Amount, definitely_no_buy)
+        tx_sig, token_amount_raw, definitely_no_buy = await self._jupiter_swap(
             input_mint=WSOL_MINT,
             output_mint=token_address,
             amount_in_ui=buy_sol,
             slippage_bps=SLIPPAGE_BPS
         )
 
-        if not tx_sig: return
+        if not tx_sig:
+            # 供 main 判断：仅 definite 时可加入放弃集，避免实际已买入却误放弃后续跟仓
+            return definitely_no_buy
 
         # 3. 转换 UI Amount
         token_amount_ui = token_amount_raw / (10 ** decimals)
@@ -580,7 +583,7 @@ class SolanaTrader:
         logger.info(f"➕ [准备加仓] {token_address} | 金额: {add_sol:.3f} SOL")
 
         # === 真实买入 ===
-        tx_sig, token_got_raw = await self._jupiter_swap(
+        tx_sig, token_got_raw, _ = await self._jupiter_swap(
             input_mint=WSOL_MINT,
             output_mint=token_address,
             amount_in_ui=add_sol,
@@ -1022,7 +1025,7 @@ class SolanaTrader:
             if current_amount <= 0:
                 logger.info("链上持仓已为 0，无需继续卖出重试")
                 return None, 0.0
-            tx_sig, sol_out = await self._jupiter_swap(
+            tx_sig, sol_out, _ = await self._jupiter_swap(
                 input_mint=input_mint,
                 output_mint=output_mint,
                 amount_in_ui=current_amount,
@@ -1050,10 +1053,14 @@ class SolanaTrader:
         return None, 0.0
 
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
-                            is_sell: bool = False, token_decimals: int = 9) -> Tuple[Optional[str], float]:
+                            is_sell: bool = False, token_decimals: int = 9
+                            ) -> Tuple[Optional[str], float, bool]:
         """
         通用 Swap 函数 (Jupiter v1 + Alchemy RPC 广播)。Alchemy/Jupiter 各自独立切 key，
         遇 429 时先 backoff 等待再切换 key 重试。
+        :return: (tx_sig, amount, definitely_no_buy)
+            definitely_no_buy: 仅当从未广播交易时为 True，用于跟仓失败放弃判断。
+            已广播但验证失败时为 False（可能实际已成交，不可加入放弃集）。
         """
         max_attempts = max(3, alchemy_client.size)
         for attempt in range(max_attempts):
@@ -1086,7 +1093,7 @@ class SolanaTrader:
                         continue
                 if quote_resp.status_code != 200:
                     logger.error("Quote Error: %s", quote_resp.text)
-                    return None, 0
+                    return None, 0.0, True  # 确定失败：从未广播
 
                 quote_data = quote_resp.json()
                 out_amount_raw = int(quote_data.get("outAmount", 0))
@@ -1111,19 +1118,21 @@ class SolanaTrader:
                         continue
                 if swap_resp.status_code != 200:
                     logger.error("Swap Build Error: %s", swap_resp.text)
-                    return None, 0
+                    return None, 0.0, True  # 确定失败：从未广播
 
                 swap_data = swap_resp.json()
                 swap_transaction_base64 = swap_data.get("swapTransaction") or swap_data.get("transaction")
                 if not swap_transaction_base64:
                     logger.error("Swap 响应缺少 swapTransaction: %s", swap_data)
-                    return None, 0
+                    return None, 0.0, True  # 确定失败：从未广播
                 raw_tx = base64.b64decode(swap_transaction_base64)
                 tx = VersionedTransaction.from_bytes(raw_tx)
                 signature = self.keypair.sign_message(to_bytes_versioned(tx.message))
                 signed_tx = VersionedTransaction.populate(tx.message, [signature])
                 opts = TxOpts(skip_preflight=True, max_retries=3)
-                result = await self.rpc_client.send_transaction(signed_tx, opts=opts)
+                result = await with_alchemy_rate_limit(
+                    self.rpc_client.send_transaction(signed_tx, opts=opts)
+                )
                 sig_str = str(getattr(result, "value", result))
                 logger.info("⏳ 交易已广播: %s", sig_str)
                 await asyncio.sleep(TRADER_RPC_ERROR_SLEEP_SEC)
@@ -1164,7 +1173,7 @@ class SolanaTrader:
                                     # 关键：返回本笔 Swap 的 outAmount（非钱包总余额 chain_raw），
                                     # 否则若钱包已有该代币（前次买入/重试等），chain_raw 会高估 token_amount_ui，
                                     # 导致均价 = buy_sol/token_ui 被低估，进而错误触发止盈
-                                    return sig_str, float(out_amount_raw)
+                                    return sig_str, float(out_amount_raw), False
                                 if recon_attempt < TX_VERIFY_RECONCILIATION_RETRIES - 1:
                                     if alchemy_client.size >= 1:
                                         alchemy_client.mark_current_failed()
@@ -1176,12 +1185,13 @@ class SolanaTrader:
                                     )
                                     await asyncio.sleep(backoff)
                         # 余额兜底耗尽仍失败：极可能所有 Key 均已 429，必须报致命错误
+                        # 已广播，可能实际已成交 → definitely_no_buy=False，不可加入放弃集
                         logger.critical(
                             "🚨 致命：所有 RPC Key 或已 429 超额，链上余额无法查询，交易 %s 无法确认。"
                             "可能导致漏跟卖，请立即检查 API 配额并增加 Key！",
                             sig_str,
                         )
-                        return None, 0
+                        return None, 0.0, False
 
                 # 显式记录买入/卖出确认，便于排查与审计
                 if is_sell:
@@ -1190,8 +1200,8 @@ class SolanaTrader:
                     logger.info("✅ 买入已确认: %s", sig_str)
 
                 if not is_sell:
-                    return sig_str, out_amount_raw
-                return sig_str, out_amount_raw / LAMPORTS_PER_SOL
+                    return sig_str, out_amount_raw, False
+                return sig_str, out_amount_raw / LAMPORTS_PER_SOL, False
             except Exception as e:
                 if attempt < max_attempts - 1 and alchemy_client.size >= 1 and _is_rate_limit_error(e):
                     backoff_sec = 8 + attempt * 4  # send_raw_transaction 429 需较长等待
@@ -1207,13 +1217,13 @@ class SolanaTrader:
                     )
                 else:
                     logger.exception("Swap Exception")
-                return None, 0
+                return None, 0.0, False  # 异常：可能已广播，不确定
         # 循环耗尽未返回：所有 attempt 均失败
         logger.critical(
             "🚨 致命：Swap 重试 %d 次后仍失败，RPC Key 或已全部 429 超额。请检查 API 配额！",
             max_attempts,
         )
-        return None, 0
+        return None, 0.0, False  # 可能某次 attempt 已广播，不确定
 
     async def _get_jupiter_implied_pnl(
             self, token_mint: str, average_price: float, decimals: int
@@ -1262,7 +1272,9 @@ class SolanaTrader:
             sig = Signature.from_string(sig_str) if isinstance(sig_str, str) else sig_str
             for _ in range(max_wait_sec):
                 try:
-                    resp = await self.rpc_client.get_signature_statuses([sig])
+                    resp = await with_alchemy_rate_limit(
+                        self.rpc_client.get_signature_statuses([sig])
+                    )
                 except Exception as e:
                     if _is_rate_limit_error(e) and alchemy_client.size > 1:
                         logger.warning("验证交易时 Alchemy 429，切换 Key 继续: %s", e)
@@ -1300,7 +1312,7 @@ class SolanaTrader:
         """
         try:
             pubkey = Pubkey.from_string(mint_address)
-            resp = await self.rpc_client.get_token_supply(pubkey)
+            resp = await with_alchemy_rate_limit(self.rpc_client.get_token_supply(pubkey))
             return resp.value.decimals
         except Exception as e:
             if _is_rate_limit_error(e):

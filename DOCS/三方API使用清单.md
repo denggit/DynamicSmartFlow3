@@ -39,10 +39,12 @@
 | `https://solana-mainnet.g.alchemy.com/v2/{key}` | RPC | `alchemy/rpc.py` | `getSignaturesForAddress`、`getTransaction`、`getTokenAccountsByOwner`、`sendRawTransaction` |
 | `wss://solana-mainnet.g.alchemy.com/v2/{key}` | WebSocket | `hunter_agent.py` | 跟单 Agent 的 `transactionSubscribe`（可选） |
 
+**限流**：`src/alchemy/rate_limit.py` 全局串行化，所有 Alchemy 调用（含 Trader 的 solana-py AsyncClient）间隔至少 `ALCHEMY_MIN_INTERVAL_SEC`。
+
 **业务使用**：
 - `sm_searcher.py`：`get_signatures_for_address`（频率预检、ATA 签名）
 - `hunter_agent.py`：WebSocket 订阅、`get_transaction`、`get_token_accounts_by_owner`
-- `trader.py`：RPC 客户端（广播交易、余额查询等）
+- `trader.py`：RPC 客户端（广播、验证、余额、decimals），经 `with_alchemy_rate_limit` 限流
 
 ---
 
