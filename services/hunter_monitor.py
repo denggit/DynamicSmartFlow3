@@ -43,14 +43,6 @@ from config.settings import (
     HOLDINGS_PRUNE_INTERVAL_SEC,
     SM_AUDIT_MIN_PNL_RATIO,
     SM_AUDIT_MIN_WIN_RATE,
-    SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT,
-    SM_MODELB_ENTRY_MIN_PNL_RATIO,
-    SM_MODELB_ENTRY_MIN_WIN_RATE,
-    SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL,
-    SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC,
-    SM_MODELB_ENTRY_MAX_DUST_COUNT,
-    SM_MODELB_ENTRY_MIN_TRADE_COUNT,
-    SM_MODELB_ENTRY_MIN_CLOSED_RATIO,
     SM_ROI_MULT_ONE,
     SM_ROI_MULT_TWO,
     SM_ROI_MULT_THREE,
@@ -77,6 +69,7 @@ from src.dexscreener.dex_scanner import DexScanner
 from services.hunter_common import TransactionParser
 from services.modela import SmartMoneySearcher
 from services.modelb import SmartMoneySearcherB
+from services.modelb.searcher import check_modelb_entry_criteria
 from services.modela.scoring import compute_hunter_score as compute_hunter_score_modela
 from services.modelb.scoring import compute_hunter_score as compute_hunter_score_modelb
 from utils.logger import get_logger
@@ -796,28 +789,8 @@ class HunterMonitorController:
                         continue
                     is_modelb = HUNTER_MODE == "MODELB"
                     if is_modelb:
-                        pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= SM_MODELB_ENTRY_MIN_PNL_RATIO if new_stats.get("pnl_ratio") != float("inf") else True
-                        wr_ok = new_stats["win_rate"] >= SM_MODELB_ENTRY_MIN_WIN_RATE
-                        profit_ok = new_stats["total_profit"] > SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL
-                        avg_hold = new_stats.get("avg_hold_sec")
-                        hold_ok = avg_hold is not None and avg_hold > SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC
-                        dust_ok = (new_stats.get("dust_count", 0) or 0) < SM_MODELB_ENTRY_MAX_DUST_COUNT
-                        count_ok = (new_stats.get("count", 0) or 0) >= SM_MODELB_ENTRY_MIN_TRADE_COUNT
-                        closed_ratio = new_stats.get("closed_ratio", 0) or 0
-                        closed_ok = closed_ratio >= SM_MODELB_ENTRY_MIN_CLOSED_RATIO
-                        roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
-                        roi_ok = roi_val >= SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT
-                        audit_pass = pnl_ok and wr_ok and profit_ok and hold_ok and dust_ok and count_ok and closed_ok and roi_ok
+                        audit_pass, reasons = check_modelb_entry_criteria(new_stats)
                         if not audit_pass:
-                            reasons = []
-                            if not pnl_ok: reasons.append("盈亏比")
-                            if not wr_ok: reasons.append("胜率")
-                            if not profit_ok: reasons.append("总盈利≤1SOL")
-                            if not hold_ok: reasons.append("单币持仓≤5min")
-                            if not dust_ok: reasons.append("灰尘≥10")
-                            if not count_ok: reasons.append("代币数<7")
-                            if not closed_ok: reasons.append("清仓比例<70%")
-                            if not roi_ok: reasons.append("最大收益")
                             del self.storage.hunters[addr]
                             removed += 1
                             await self._trigger_hunter_removed(addr)
@@ -912,28 +885,8 @@ class HunterMonitorController:
                             elif new_stats:
                                 is_modelb = HUNTER_MODE == "MODELB"
                                 if is_modelb:
-                                    pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= SM_MODELB_ENTRY_MIN_PNL_RATIO if new_stats.get("pnl_ratio") != float("inf") else True
-                                    wr_ok = new_stats["win_rate"] >= SM_MODELB_ENTRY_MIN_WIN_RATE
-                                    profit_ok = new_stats["total_profit"] > SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL
-                                    avg_hold = new_stats.get("avg_hold_sec")
-                                    hold_ok = avg_hold is not None and avg_hold > SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC
-                                    dust_ok = (new_stats.get("dust_count", 0) or 0) < SM_MODELB_ENTRY_MAX_DUST_COUNT
-                                    count_ok = (new_stats.get("count", 0) or 0) >= SM_MODELB_ENTRY_MIN_TRADE_COUNT
-                                    closed_ratio = new_stats.get("closed_ratio", 0) or 0
-                                    closed_ok = closed_ratio >= SM_MODELB_ENTRY_MIN_CLOSED_RATIO
-                                    roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
-                                    roi_ok = roi_val >= SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT
-                                    audit_pass = pnl_ok and wr_ok and profit_ok and hold_ok and dust_ok and count_ok and closed_ok and roi_ok
+                                    audit_pass, reasons = check_modelb_entry_criteria(new_stats)
                                     if not audit_pass:
-                                        reasons = []
-                                        if not pnl_ok: reasons.append("盈亏比")
-                                        if not wr_ok: reasons.append("胜率")
-                                        if not profit_ok: reasons.append("总盈利≤1SOL")
-                                        if not hold_ok: reasons.append("单币持仓≤5min")
-                                        if not dust_ok: reasons.append("灰尘≥10")
-                                        if not count_ok: reasons.append("代币数<7")
-                                        if not closed_ok: reasons.append("清仓比例<70%")
-                                        if not roi_ok: reasons.append("最大收益")
                                         if addr in self.storage.hunters:
                                             del self.storage.hunters[addr]
                                             audit_removed.append(addr)

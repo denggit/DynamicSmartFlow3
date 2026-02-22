@@ -29,6 +29,7 @@ from config.settings import (
     SM_MODELB_ENTRY_MAX_DUST_COUNT,
     SM_MODELB_ENTRY_MIN_TRADE_COUNT,
     SM_MODELB_ENTRY_MIN_CLOSED_RATIO,
+    SM_MODELB_ENTRY_MIN_AVG_ROI_PCT,
     SM_MODELB_WALLET_ANALYZE_SLEEP_SEC,
 )
 from src.alchemy import alchemy_client
@@ -52,34 +53,39 @@ def _normalize_address(addr: str) -> str:
     return addr.strip()
 
 
-def _check_modelb_entry_risk(stats: dict) -> Tuple[bool, str]:
+def check_modelb_entry_criteria(stats: dict) -> Tuple[bool, List[str]]:
     """
-    MODELB 入库风控评测：六项硬门槛，全部通过才可进入评分与入库判定。
-    :return: (是否通过, 未通过时的原因，通过时为空)
+    MODELB 入库/体检统一判定：八项硬门槛，全部通过才合格。
+    入库和体检共用此方法，保证条件一致。
+    :param stats: 猎手分析统计（来自 analyze_wallet_modelb）
+    :return: (是否通过, 未通过时的原因列表，通过时为空列表)
     """
+    reasons: List[str] = []
     pnl = stats.get("pnl_ratio", 0) or 0
     if pnl != float("inf") and pnl < SM_MODELB_ENTRY_MIN_PNL_RATIO:
-        return False, f"盈亏比{pnl:.2f}<{SM_MODELB_ENTRY_MIN_PNL_RATIO}"
+        reasons.append("盈亏比")
     wr = stats.get("win_rate", 0) or 0
     if wr < SM_MODELB_ENTRY_MIN_WIN_RATE:
-        return False, f"胜率{wr:.1%}<{SM_MODELB_ENTRY_MIN_WIN_RATE*100:.0f}%"
+        reasons.append("胜率")
     profit = stats.get("total_profit", 0) or 0
     if profit <= SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL:
-        return False, f"总盈利{profit:.2f}SOL≤{SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL}SOL"
+        reasons.append("总盈利≤1SOL")
     avg_hold = stats.get("avg_hold_sec")
     if avg_hold is None or avg_hold <= SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC:
-        h = f"{avg_hold/60:.1f}min" if avg_hold is not None else "无数据"
-        return False, f"单币平均持仓{h}≤5min"
+        reasons.append("单币持仓≤5min")
     dust = stats.get("dust_count", 0) or 0
     if dust >= SM_MODELB_ENTRY_MAX_DUST_COUNT:
-        return False, f"灰尘代币数{dust}≥{SM_MODELB_ENTRY_MAX_DUST_COUNT}"
+        reasons.append("灰尘≥10")
     count = stats.get("count", 0) or 0
     if count < SM_MODELB_ENTRY_MIN_TRADE_COUNT:
-        return False, f"交易代币数{count}<{SM_MODELB_ENTRY_MIN_TRADE_COUNT}"
+        reasons.append("代币数<7")
     closed_ratio = stats.get("closed_ratio", 0) or 0
     if closed_ratio < SM_MODELB_ENTRY_MIN_CLOSED_RATIO:
-        return False, f"清仓比例{closed_ratio:.1%}<{SM_MODELB_ENTRY_MIN_CLOSED_RATIO:.0%}"
-    return True, ""
+        reasons.append("清仓比例<70%")
+    avg_roi = stats.get("avg_roi_pct", 0) or 0
+    if avg_roi <= SM_MODELB_ENTRY_MIN_AVG_ROI_PCT:
+        reasons.append("平均收益≤10%")
+    return (len(reasons) == 0, reasons)
 
 
 class SmartMoneySearcherB:
@@ -219,10 +225,10 @@ class SmartMoneySearcherB:
         if stats is None:
             return None
 
-        # 1. 风控评测：五项硬门槛，未通过则直接淘汰
-        risk_ok, risk_reason = _check_modelb_entry_risk(stats)
+        # 1. 风控评测：八项硬门槛，未通过则直接淘汰
+        risk_ok, risk_reasons = check_modelb_entry_criteria(stats)
         if not risk_ok:
-            logger.info("[MODELB 风控未过] %s.. | %s", address[:12], risk_reason)
+            logger.info("[MODELB 风控未过] %s.. | %s", address[:12], "/".join(risk_reasons))
             return None
 
         # 2. 评分
