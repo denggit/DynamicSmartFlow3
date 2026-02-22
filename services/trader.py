@@ -235,6 +235,10 @@ class SolanaTrader:
         )
         if not tx_sig:
             logger.warning("❌ 关闭前清仓失败: %s", token_address)
+        else:
+            pos = self.positions.get(token_address)
+            if pos:
+                self._sync_zero_and_close_position(token_address, pos)
 
     async def emergency_close_all_positions(self) -> int:
         """

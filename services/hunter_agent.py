@@ -16,7 +16,7 @@ import asyncio
 import json
 import time
 from collections import defaultdict
-from typing import Dict, List, Callable, Optional
+from typing import Awaitable, Dict, List, Callable, Optional
 
 import websockets
 
@@ -84,6 +84,8 @@ class HunterAgentController:
 
     def __init__(self, signal_callback: Optional[Callable] = None):
         self.signal_callback = signal_callback
+        # 猎手持仓归零跳过监控时触发（主程序需校验我方链上是否归零，未归零则清仓）
+        self.on_hunter_zero_skip: Optional[Callable[..., Awaitable[None]]] = None
         # 活跃任务池: {token_address: TokenMission}
         self.active_missions: Dict[str, TokenMission] = {}
 
@@ -158,6 +160,29 @@ class HunterAgentController:
         for hunter in hunters:
             balance = await self._fetch_token_balance(hunter, token_address)
             mission.add_hunter(hunter, balance)
+
+        # 3. 若所有猎手持仓均已归零，无需监控（猎手已卖光，无跟卖信号）
+        if all(mission.hunter_states.get(h, 0) <= 0 for h in hunters):
+            self.active_missions.pop(token_address, None)
+            for hunter in hunters:
+                if token_address in self.hunter_map.get(hunter, set()):
+                    self.hunter_map[hunter].discard(token_address)
+                    if not self.hunter_map[hunter]:
+                        del self.hunter_map[hunter]
+            logger.info(
+                "⏭️ 猎手持仓已归零，跳过监控: %s | 猎手: %s",
+                token_address[:12] + "..",
+                ", ".join(h[:8] + ".." for h in hunters[:3]),
+            )
+            if self.on_hunter_zero_skip:
+                try:
+                    if asyncio.iscoroutinefunction(self.on_hunter_zero_skip):
+                        await self.on_hunter_zero_skip(token_address)
+                    else:
+                        self.on_hunter_zero_skip(token_address)
+                except Exception:
+                    logger.exception("on_hunter_zero_skip 回调异常")
+            return
 
         # 这里会触发 WebSocket 重连以更新订阅列表
         # (在 monitor_loop 里会自动处理)

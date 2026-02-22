@@ -538,6 +538,12 @@ async def main(immediate_audit: bool = False):
     monitor.set_agent(agent)  # 跟仓信号由 Monitor 统一推送，避免 Agent 自建 WS 漏单
     agent.signal_callback = on_agent_signal
 
+    async def _on_hunter_zero_skip(token_address: str) -> None:
+        """猎手持仓归零跳过监控时：校验我方链上是否归零，未归零则清仓。"""
+        await trader.ensure_fully_closed(token_address)
+
+    agent.on_hunter_zero_skip = _on_hunter_zero_skip
+
     async def _on_helius_credit_exhausted():
         """Helius credit 耗尽（429）时的保命操作：清仓所有持仓 + 致命错误告警。"""
         closed = await trader.emergency_close_all_positions()
