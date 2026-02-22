@@ -9,9 +9,14 @@ import os
 JUP_QUOTE_API = "https://api.jup.ag/swap/v1/quote"
 JUP_SWAP_API = "https://api.jup.ag/swap/v1/swap"
 
-SLIPPAGE_BPS = 200
-SELL_SLIPPAGE_BPS_RETRIES = [200, 500, 1000]
+# Jupiter 自动滑点 (dynamicSlippage)：由 Jupiter 根据市场估算最优滑点，提高成交率
+# 买入：最大滑点 3%，防止追高
+BUY_MAX_SLIPPAGE_BPS = 300  # 3%
+# 卖出：按档位重试，Jupiter 在每档上限内自动优化
+SELL_SLIPPAGE_BPS_RETRIES = [500, 1000, 2000]   # 5%, 10%, 20%
 SELL_SLIPPAGE_BPS_STOP_LOSS = 2000  # 止损清仓时用 20% 滑点，确保能成交
+# 兼容旧引用（加仓等复用买入逻辑）
+SLIPPAGE_BPS = BUY_MAX_SLIPPAGE_BPS
 PRIORITY_FEE_SETTINGS = "auto"
 
 

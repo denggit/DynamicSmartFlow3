@@ -58,6 +58,7 @@ from config.trading import (
     JUP_QUOTE_API,
     JUP_SWAP_API,
     get_tier_config,
+    BUY_MAX_SLIPPAGE_BPS,
     SLIPPAGE_BPS,
     SELL_SLIPPAGE_BPS_RETRIES,
     SELL_SLIPPAGE_BPS_STOP_LOSS,

@@ -1102,12 +1102,14 @@ class SolanaTrader:
                 quote_data = quote_resp.json()
                 out_amount_raw = int(quote_data.get("outAmount", 0))
 
-                # 与 SmartFlow3 完全一致：仅使用 computeUnitPriceMicroLamports
+                # Jupiter 自动滑点 + 自动 Compute Unit：由 Jupiter 根据市场估算，提高成交率
                 swap_payload = {
                     "userPublicKey": str(self.keypair.pubkey()),
                     "quoteResponse": quote_data,
                     "wrapAndUnwrapSol": True,
                     "computeUnitPriceMicroLamports": "auto",
+                    "dynamicSlippage": True,
+                    "dynamicComputeUnitLimit": True,
                 }
                 swap_resp = await self.http_client.post(
                     JUP_SWAP_API, json=swap_payload, headers=self._jup_headers()
