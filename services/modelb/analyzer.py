@@ -163,19 +163,25 @@ async def analyze_wallet_modelb(
     txs_per_day = len(txs) / max(1, (now - min(_get_tx_timestamp(t) for t in txs)) / 86400)
 
     closed_projects = [p for p in valid.values() if p["is_closed"]]
-    hold_times = []
+    hold_times = []  # 单币持仓时间（含已清仓+未清仓，用于风控「单币平均持仓时间>5分钟」）
     profitable_hold = []
     loss_hold = []
-    for p in closed_projects:
+    for mint, p in valid.items():
         fb = p.get("first_buy_ts")
-        ls = p.get("last_sell_ts")
-        if fb and ls and ls > fb:
-            sec = ls - fb
+        if not fb:
+            continue
+        if p["is_closed"]:
+            ls = p.get("last_sell_ts")
+            if ls and ls > fb:
+                sec = ls - fb
+                hold_times.append(sec)
+                if p["net_profit"] > 0:
+                    profitable_hold.append(sec)
+                else:
+                    loss_hold.append(sec)
+        else:
+            sec = int(now - fb)
             hold_times.append(sec)
-            if p["net_profit"] > 0:
-                profitable_hold.append(sec)
-            else:
-                loss_hold.append(sec)
     avg_hold_sec = sum(hold_times) / len(hold_times) if hold_times else None
     profitable_avg_hold = sum(profitable_hold) / len(profitable_hold) if profitable_hold else None
     loss_avg_hold = sum(loss_hold) / len(loss_hold) if loss_hold else None

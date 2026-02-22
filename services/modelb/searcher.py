@@ -10,7 +10,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 import httpx
 
@@ -22,6 +22,12 @@ from config.settings import (
     TRASH_WALLETS_TXT_PATH,
     SM_MODELB_TX_LIMIT,
     SM_MODELB_ENTRY_MIN_SCORE,
+    SM_MODELB_ENTRY_MIN_PNL_RATIO,
+    SM_MODELB_ENTRY_MIN_WIN_RATE,
+    SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL,
+    SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC,
+    SM_MODELB_ENTRY_MAX_DUST_COUNT,
+    SM_MODELB_ENTRY_MIN_TRADE_COUNT,
     SM_MODELB_WALLET_ANALYZE_SLEEP_SEC,
 )
 from src.alchemy import alchemy_client
@@ -43,6 +49,33 @@ def _normalize_address(addr: str) -> str:
     if not addr or not isinstance(addr, str):
         return ""
     return addr.strip()
+
+
+def _check_modelb_entry_risk(stats: dict) -> Tuple[bool, str]:
+    """
+    MODELB 入库风控评测：五项硬门槛，全部通过才可进入评分与入库判定。
+    :return: (是否通过, 未通过时的原因，通过时为空)
+    """
+    pnl = stats.get("pnl_ratio", 0) or 0
+    if pnl != float("inf") and pnl < SM_MODELB_ENTRY_MIN_PNL_RATIO:
+        return False, f"盈亏比{pnl:.2f}<{SM_MODELB_ENTRY_MIN_PNL_RATIO}"
+    wr = stats.get("win_rate", 0) or 0
+    if wr < SM_MODELB_ENTRY_MIN_WIN_RATE:
+        return False, f"胜率{wr:.1%}<{SM_MODELB_ENTRY_MIN_WIN_RATE*100:.0f}%"
+    profit = stats.get("total_profit", 0) or 0
+    if profit <= SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL:
+        return False, f"总盈利{profit:.2f}SOL≤{SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL}SOL"
+    avg_hold = stats.get("avg_hold_sec")
+    if avg_hold is None or avg_hold <= SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC:
+        h = f"{avg_hold/60:.1f}min" if avg_hold is not None else "无数据"
+        return False, f"单币平均持仓{h}≤5min"
+    dust = stats.get("dust_count", 0) or 0
+    if dust >= SM_MODELB_ENTRY_MAX_DUST_COUNT:
+        return False, f"灰尘代币数{dust}≥{SM_MODELB_ENTRY_MAX_DUST_COUNT}"
+    count = stats.get("count", 0) or 0
+    if count < SM_MODELB_ENTRY_MIN_TRADE_COUNT:
+        return False, f"交易代币数{count}<{SM_MODELB_ENTRY_MIN_TRADE_COUNT}"
+    return True, ""
 
 
 class SmartMoneySearcherB:
@@ -181,17 +214,24 @@ class SmartMoneySearcherB:
         stats = await analyze_wallet_modelb(txs, address, self.dex_scanner)
         if stats is None:
             return None
+
+        # 1. 风控评测：五项硬门槛，未通过则直接淘汰
+        risk_ok, risk_reason = _check_modelb_entry_risk(stats)
+        if not risk_ok:
+            logger.info("[MODELB 风控未过] %s.. | %s", address[:12], risk_reason)
+            return None
+
+        # 2. 评分
         score_result = compute_hunter_score(stats)
         final_score = score_result["score"]
+
+        # 3. 判定入库：分数达标
         if final_score < SM_MODELB_ENTRY_MIN_SCORE:
             logger.info(
                 "[MODELB 落榜] %s.. | 分: %.1f < %s | %s",
                 address[:12], final_score, SM_MODELB_ENTRY_MIN_SCORE,
                 score_result.get("scores_detail", ""),
             )
-            return None
-        if stats.get("total_profit", 0) <= 0:
-            logger.info("[MODELB 落榜] %s.. | 总盈利≤0", address[:12])
             return None
 
         now = time.time()

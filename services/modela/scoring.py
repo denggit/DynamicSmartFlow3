@@ -4,6 +4,7 @@
 @Description: MODELA 猎手评分
               高收益 token 挖掘模式专用。挖掘阶段与体检阶段共用。
               评分体系：胜率分 30% + 盈利分 40% + 盈亏比分 30%
+              盈亏比分：< 1 零分，1~3 线性，≥ 3 满分
 """
 
 from typing import Dict, Any
