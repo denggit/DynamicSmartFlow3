@@ -11,10 +11,10 @@ import subprocess
 import sys
 import time
 
-from config.settings import WATCHDOG_RESTART_DELAY
+from config.settings import WATCHDOG_RESTART_DELAY, WATCHDOG_CHILD_WAIT_TIMEOUT, BASE_DIR
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-MAIN_SCRIPT = os.path.join(ROOT, "main.py")
+MAIN_SCRIPT = str(BASE_DIR / "main.py")
 
 _child_proc = None
 
@@ -26,7 +26,7 @@ def _kill_child():
         return
     try:
         _child_proc.terminate()
-        _child_proc.wait(timeout=10)
+        _child_proc.wait(timeout=WATCHDOG_CHILD_WAIT_TIMEOUT)
     except Exception:
         try:
             _child_proc.kill()

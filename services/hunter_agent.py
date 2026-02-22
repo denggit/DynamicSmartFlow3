@@ -26,9 +26,15 @@ from config.settings import (
     SYNC_PROTECTION_AFTER_START_SEC,
     NEW_HUNTER_ADD_WINDOW_SEC,
     USDC_PER_SOL,
+    AGENT_WS_RECV_TIMEOUT,
+    AGENT_GET_TX_TIMEOUT,
+    AGENT_TOKEN_ACCOUNTS_TIMEOUT,
+    AGENT_WS_ERROR_SLEEP_SEC,
+    AGENT_POLL_SLEEP_SEC,
+    IGNORE_MINTS,
 )
 from src.alchemy import alchemy_client
-from services.sm_searcher import IGNORE_MINTS, TransactionParser
+from services.sm_searcher import TransactionParser
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -267,7 +273,7 @@ class HunterAgentController:
                                 mission.hunter_states[hunter] = real_balance
                         except Exception:
                             logger.debug("同步单猎手余额异常", exc_info=True)
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(AGENT_POLL_SLEEP_SEC)
             except Exception:
                 logger.exception("sync_positions_loop 异常")
 
@@ -281,7 +287,7 @@ class HunterAgentController:
                 monitored_hunters = list(self.hunter_map.keys())
 
                 if not monitored_hunters:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(AGENT_WS_ERROR_SLEEP_SEC)
                     continue
 
                 async with websockets.connect(alchemy_client.get_wss_url()) as ws:
@@ -296,7 +302,7 @@ class HunterAgentController:
 
                     while True:
                         try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=60)
+                            msg = await asyncio.wait_for(ws.recv(), timeout=AGENT_WS_RECV_TIMEOUT)
                             data = json.loads(msg)
 
                             params = data.get("params") if isinstance(data, dict) else None
@@ -318,10 +324,10 @@ class HunterAgentController:
                 is_429 = status_code == 429 or "429" in str(e).lower()
                 if is_429:
                     alchemy_client.mark_current_failed()
-                    logger.warning("⚠️ Alchemy WebSocket 429 限流，已切换 Key，5 秒后重试")
+                    logger.warning("⚠️ Alchemy WebSocket 429 限流，已切换 Key，%d 秒后重试", AGENT_WS_ERROR_SLEEP_SEC)
                 else:
-                    logger.exception("❌ Agent 监控异常，5秒后重试")
-                await asyncio.sleep(5)
+                    logger.exception("❌ Agent 监控异常，%d秒后重试", AGENT_WS_ERROR_SLEEP_SEC)
+                await asyncio.sleep(AGENT_WS_ERROR_SLEEP_SEC)
 
     async def process_log(self, log_info):
         """处理链上日志。log_info 为 logsSubscribe 的 result，格式可能为 {value: {signature: ...}} 或 {signature: ...}。"""
@@ -335,7 +341,7 @@ class HunterAgentController:
         # 1. 快速过滤: 这笔交易是否涉及我们关心的猎手？
         # 通过 Alchemy RPC 拉取交易详情
         try:
-            tx = await alchemy_client.get_transaction(signature, timeout=10)
+            tx = await alchemy_client.get_transaction(signature, timeout=AGENT_GET_TX_TIMEOUT)
             if not tx:
                 return
 
@@ -493,7 +499,7 @@ class HunterAgentController:
     async def _fetch_token_balance(self, hunter, token_mint):
         """通过 AlchemyClient 获取猎手当前的 Token 余额（UI 单位）"""
         try:
-            result = await alchemy_client.get_token_accounts_by_owner(hunter, token_mint, timeout=5)
+            result = await alchemy_client.get_token_accounts_by_owner(hunter, token_mint, timeout=AGENT_TOKEN_ACCOUNTS_TIMEOUT)
             if not result or not result.get("value"):
                 return 0.0
             total_ui = 0.0

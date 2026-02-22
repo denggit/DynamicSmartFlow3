@@ -22,6 +22,9 @@ import websockets
 # 导入配置和依赖模块
 from config.settings import (
     BASE_DIR,
+    DATA_DIR,
+    DATA_MODELA_DIR,
+    DATA_MODELB_DIR,
     USDC_PER_SOL,
     MAX_ENTRY_PUMP_MULTIPLIER,
     DISCOVERY_INTERVAL,
@@ -40,20 +43,43 @@ from config.settings import (
     HOLDINGS_PRUNE_INTERVAL_SEC,
     SM_AUDIT_MIN_PNL_RATIO,
     SM_AUDIT_MIN_WIN_RATE,
+    SM_MODELB_AUDIT_MIN_PNL_RATIO,
+    SM_MODELB_AUDIT_MIN_WIN_RATE,
+    SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT,
     SM_ROI_MULT_ONE,
     SM_ROI_MULT_TWO,
-    SM_ROI_MULT_THREE, MAINTENANCE_DAYS, TIER_ONE_ROI, TIER_TWO_ROI, TIER_THREE_ROI,
+    SM_ROI_MULT_THREE,
+    MAINTENANCE_DAYS,
+    TIER_ONE_ROI,
+    TIER_TWO_ROI,
+    TIER_THREE_ROI,
+    HUNTER_MODE,
+    HUNTER_JSON_PATH,
+    HUNTER_BACKUP_PATH,
+    SMART_MONEY_JSON_PATH,
+    WS_COMMITMENT,
+    WS_PING_INTERVAL,
+    WS_PING_TIMEOUT,
+    EMPTY_POOL_RETRY_SLEEP_SEC,
+    WS_RECONNECT_SLEEP_SEC,
+    CONSUME_QUEUE_EMPTY_SLEEP_SEC,
+    CONSUME_QUEUE_ERROR_SLEEP_SEC,
+    AUDIT_BETWEEN_HUNTERS_SLEEP_SEC,
+    HTTP_CLIENT_DEFAULT_TIMEOUT,
 )
 from src import helius_client
 from src.dexscreener.dex_scanner import DexScanner
 from services.sm_searcher import SmartMoneySearcher, TransactionParser
+from services.sm_searcher_b import SmartMoneySearcherB
 from utils.logger import get_logger
-from utils.hunter_scoring import compute_hunter_score
+from utils.scoring import compute_hunter_score_modela, compute_hunter_score_modelb
 
 logger = get_logger(__name__)
 
-# 猎手数据文件绝对路径（邮件附件用）
-HUNTER_JSON_PATH = str(BASE_DIR / "data" / "hunters.json")
+
+def _get_scorer():
+    """按 HUNTER_MODE 返回对应评分函数。"""
+    return compute_hunter_score_modelb if HUNTER_MODE == "MODELB" else compute_hunter_score_modela
 
 
 def _roi_multiplier(roi_pct: float) -> float:
@@ -72,12 +98,26 @@ def _roi_multiplier(roi_pct: float) -> float:
 
 
 def _apply_audit_update(info: dict, new_stats: dict, now: float, addr: str) -> None:
-    """体检通过：用最近 30 天最大收益率 max_roi_30d 做评分乘数后更新猎手信息"""
-    score_result = compute_hunter_score(new_stats)
+    """
+    体检通过：更新猎手信息。
+    MODELA：用 max_roi_30d 乘数调整评分。
+    MODELB：直接使用三维度评分，无乘数。
+    """
+    score_result = _get_scorer()(new_stats)
     base_score = score_result["score"]
-    max_roi_30d = new_stats.get("max_roi_30d", 0)
-    mult = _roi_multiplier(max_roi_30d)
-    final_score = round(base_score * mult, 1)
+    if HUNTER_MODE == "MODELB":
+        final_score = round(base_score, 1)
+        info["profit_dim"] = round(score_result.get("profit_dim", 0), 1)
+        info["persist_dim"] = round(score_result.get("persist_dim", 0), 1)
+        info["auth_dim"] = round(score_result.get("auth_dim", 0), 1)
+        info["dust_ratio"] = f"{new_stats.get('dust_ratio', 0):.1%}"
+        info["closed_ratio"] = f"{new_stats.get('closed_ratio', 0):.1%}"
+        info["trade_frequency"] = new_stats.get("trade_frequency", 0)
+    else:
+        max_roi_30d = new_stats.get("max_roi_30d", 0)
+        mult = _roi_multiplier(max_roi_30d)
+        final_score = round(base_score * mult, 1)
+        info["max_roi_30d"] = max_roi_30d
     info["total_profit"] = f"{new_stats['total_profit']:.2f} SOL"
     info["win_rate"] = f"{new_stats['win_rate']:.1%}"
     pnl_r = new_stats.get("pnl_ratio", 0)
@@ -85,20 +125,13 @@ def _apply_audit_update(info: dict, new_stats: dict, now: float, addr: str) -> N
     info["avg_roi_pct"] = f"{new_stats.get('avg_roi_pct', 0):.1f}%"
     info["score"] = final_score
     info["scores_detail"] = score_result["scores_detail"]
-    info["max_roi_30d"] = max_roi_30d
     info["last_audit"] = now
     if score_result["score"] == 0:
         logger.warning("📉 猎手 %s 表现恶化 (负盈利)，分数归零", addr[:12])
     else:
-        logger.info("✅ 猎手 %s 体检完成 | 评分: %.1f (×%.2f) | %s", addr[:12], final_score, mult, score_result["scores_detail"])
+        logger.info("✅ 猎手 %s 体检完成 | 评分: %.1f | %s", addr[:12], final_score, score_result["scores_detail"])
 # 猎手交易单独写入 monitor.log，便于查看时间与交易币种
 trade_logger = get_logger("trade")
-
-# 常量配置（使用 BASE_DIR 保证与 main 路径一致，不受 cwd 影响）
-HUNTER_DATA_FILE = str(BASE_DIR / "data" / "hunters.json")
-HUNTER_DATA_BACKUP = str(BASE_DIR / "data" / "hunters_backup.json")
-WS_COMMITMENT = "processed"
-
 
 class HunterStorage:
     """
@@ -111,27 +144,25 @@ class HunterStorage:
         self.load_hunters()
 
     def ensure_data_dir(self):
-        data_dir = BASE_DIR / "data"
-        if not data_dir.exists():
-            data_dir.mkdir(parents=True, exist_ok=True)
+        DATA_MODELA_DIR.mkdir(parents=True, exist_ok=True)
 
     def load_hunters(self):
-        if os.path.exists(HUNTER_DATA_FILE):
+        if os.path.exists(HUNTER_JSON_PATH):
             try:
-                with open(HUNTER_DATA_FILE, 'r', encoding='utf-8') as f:
+                with open(HUNTER_JSON_PATH, 'r', encoding='utf-8') as f:
                     self.hunters = json.load(f)
                 logger.info(f"📂 已加载 {len(self.hunters)} 名猎手数据")
             except Exception:
                 logger.exception("❌ 加载猎手数据失败")
-                if os.path.exists(HUNTER_DATA_BACKUP):
-                    shutil.copy(HUNTER_DATA_BACKUP, HUNTER_DATA_FILE)
+                if os.path.exists(HUNTER_BACKUP_PATH):
+                    shutil.copy(HUNTER_BACKUP_PATH, HUNTER_JSON_PATH)
                     self.load_hunters()
 
     def save_hunters(self):
         try:
-            if os.path.exists(HUNTER_DATA_FILE):
-                shutil.copy(HUNTER_DATA_FILE, HUNTER_DATA_BACKUP)
-            with open(HUNTER_DATA_FILE, 'w', encoding='utf-8') as f:
+            if os.path.exists(HUNTER_JSON_PATH):
+                shutil.copy(HUNTER_JSON_PATH, HUNTER_BACKUP_PATH)
+            with open(HUNTER_JSON_PATH, 'w', encoding='utf-8') as f:
                 json.dump(self.hunters, f, indent=4, ensure_ascii=False)
         except Exception:
             logger.exception("❌ 保存猎手数据失败")
@@ -218,6 +249,72 @@ class HunterStorage:
         return {"added": added, "removed_zombie": removed_zombie, "replaced": replaced}
 
 
+class SmartMoneyStorage:
+    """
+    MODELB 专用存储：读写 smart_money.json。
+    与 HunterStorage 接口一致，供 Monitor 透明使用。
+    """
+
+    def __init__(self):
+        self.hunters: Dict[str, Dict] = {}
+        self.data_file = SMART_MONEY_JSON_PATH
+        self.ensure_data_dir()
+        self.load_hunters()
+
+    def ensure_data_dir(self):
+        DATA_MODELB_DIR.mkdir(parents=True, exist_ok=True)
+
+    def load_hunters(self):
+        """从 smart_money.json 加载猎手数据。"""
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, "r", encoding="utf-8") as f:
+                    self.hunters = json.load(f)
+                if not isinstance(self.hunters, dict):
+                    self.hunters = {}
+                logger.info(f"📂 [MODELB] 已加载 {len(self.hunters)} 名猎手 (smart_money.json)")
+            except Exception:
+                logger.exception("❌ 加载 smart_money.json 失败")
+
+    def save_hunters(self):
+        try:
+            with open(self.data_file, "w", encoding="utf-8") as f:
+                json.dump(self.hunters, f, indent=4, ensure_ascii=False)
+        except Exception:
+            logger.exception("❌ 保存 smart_money.json 失败")
+
+    def update_last_active(self, address: str, timestamp: float):
+        if address in self.hunters:
+            self.hunters[address]["last_active"] = timestamp
+
+    def get_monitored_addresses(self) -> List[str]:
+        return list(self.hunters.keys())
+
+    def get_hunter_score(self, address: str) -> float:
+        v = self.hunters.get(address, {}).get("score", 0)
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def prune_and_update(self, new_hunters: List[Dict] = None) -> Dict:
+        """
+        MODELB：new_hunters 由 pipeline 直接写入文件，此处仅做僵尸清理。
+        返回统计供兼容。
+        """
+        now = time.time()
+        zombies = [
+            addr
+            for addr, info in self.hunters.items()
+            if info.get("last_active", 0) != 0 and (now - info.get("last_active", 0)) > ZOMBIE_THRESHOLD
+        ]
+        for z in zombies:
+            logger.info(f"💀 [MODELB] 清理僵尸地址 (15天未动): {z}..")
+            del self.hunters[z]
+        self.save_hunters()
+        return {"added": 0, "removed_zombie": len(zombies), "replaced": 0}
+
+
 class HunterMonitorController:
     def __init__(
         self,
@@ -225,9 +322,16 @@ class HunterMonitorController:
         tracked_tokens_getter: Optional[Callable[[], Set[str]]] = None,
         position_check: Optional[Callable[[str], bool]] = None,
     ):
-        self.storage = HunterStorage()
+        self.mode = (HUNTER_MODE or "MODELA").strip().upper()
+        if self.mode == "MODELB":
+            self.storage = SmartMoneyStorage()
+            self.sm_searcher = SmartMoneySearcherB(dex_scanner=None)
+        else:
+            self.storage = HunterStorage()
+            self.sm_searcher = SmartMoneySearcher()
         self.dex_scanner = DexScanner()
-        self.sm_searcher = SmartMoneySearcher()
+        if self.mode == "MODELB":
+            self.sm_searcher.dex_scanner = self.dex_scanner
         self.signal_callback = signal_callback
         self.tracked_tokens_getter = tracked_tokens_getter  # 主程序注入，返回正在跟仓的 token 集合
         self.position_check = position_check  # 主程序注入，(token) -> 是否已有仓位；有则不再触发共振
@@ -261,7 +365,10 @@ class HunterMonitorController:
         self.on_helius_credit_exhausted = callback
 
     async def start(self):
-        logger.info("🚀 启动 Hunter Monitor 系统 (transactionSubscribe 按猎手地址，只收猎手相关交易)")
+        logger.info(
+            "🚀 启动 Hunter Monitor 系统 [%s] (transactionSubscribe 按猎手地址，只收猎手相关交易)",
+            self.mode,
+        )
         tasks = [
             asyncio.create_task(self.discovery_loop()),
             asyncio.create_task(self._program_ws_loop()),       # 只拿 signature 入队
@@ -273,16 +380,21 @@ class HunterMonitorController:
 
     # --- 线程 1: 挖掘 ---
     async def discovery_loop(self):
-        logger.info("🕵️ [线程1] 挖掘启动")
+        logger.info("🕵️ [线程1] 挖掘启动 [%s]", self.mode)
         while True:
             try:
-                new_hunters = await self.sm_searcher.run_pipeline(self.dex_scanner)
-                if new_hunters:
-                    # 存盘为同步 I/O，放线程池执行，不阻塞挖掘/监控
-                    await asyncio.to_thread(self.storage.prune_and_update, new_hunters)
+                if self.mode == "MODELB":
+                    # MODELB: wallets.txt → 三维度分析 → smart_money.json
+                    await self.sm_searcher.run_pipeline()
+                    self.storage.load_hunters()  # 刷新内存
+                    await asyncio.to_thread(self.storage.prune_and_update, [])
+                else:
+                    # MODELA: DexScreener 热门币 → sm_searcher → hunters.json
+                    new_hunters = await self.sm_searcher.run_pipeline(self.dex_scanner)
+                    if new_hunters:
+                        await asyncio.to_thread(self.storage.prune_and_update, new_hunters)
             except Exception:
                 logger.exception("❌ 挖掘异常")
-            # 池满时降低挖掘频率，避免无意义消耗 credit
             if len(self.storage.hunters) >= POOL_SIZE_LIMIT:
                 await asyncio.sleep(DISCOVERY_INTERVAL_WHEN_FULL_SEC)
             else:
@@ -327,14 +439,14 @@ class HunterMonitorController:
             try:
                 addrs = self.storage.get_monitored_addresses()
                 if not addrs:
-                    logger.info("👀 猎手池为空，30 秒后重试订阅")
-                    await asyncio.sleep(30)
+                    logger.info("👀 猎手池为空，%d 秒后重试订阅", EMPTY_POOL_RETRY_SLEEP_SEC)
+                    await asyncio.sleep(EMPTY_POOL_RETRY_SLEEP_SEC)
                     continue
 
                 async with websockets.connect(
                     helius_client.get_wss_url(),
-                    ping_interval=20,
-                    ping_timeout=10,
+                    ping_interval=WS_PING_INTERVAL,
+                    ping_timeout=WS_PING_TIMEOUT,
                     close_timeout=None,
                     max_size=None,
                 ) as ws:
@@ -412,10 +524,10 @@ class HunterMonitorController:
                 status_code = getattr(e, "status_code", None)
                 if status_code == 429 or "429" in str(e).lower():
                     helius_client.mark_current_failed()
-                    logger.warning("⚠️ Helius WebSocket 429 限流，已切换 Key，5 秒后重试")
+                    logger.warning("⚠️ Helius WebSocket 429 限流，已切换 Key，%d 秒后重试", WS_RECONNECT_SLEEP_SEC)
                 else:
                     logger.exception("⚠️ WS 重连异常")
-                await asyncio.sleep(5)
+                await asyncio.sleep(WS_RECONNECT_SLEEP_SEC)
 
     # --- 【钱包池过滤 + 轻量解析】消费队列：批量拉取 → 只保留命中钱包池且真实交易的 tx ---
     @staticmethod
@@ -457,7 +569,7 @@ class HunterMonitorController:
                     except asyncio.TimeoutError:
                         break
                 if not batch:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(CONSUME_QUEUE_EMPTY_SLEEP_SEC)
                     continue
 
                 now = time.time()
@@ -471,7 +583,7 @@ class HunterMonitorController:
                         del self._recent_sigs[sig]
 
                 url = helius_client.get_http_endpoint()
-                async with AsyncClient(timeout=15.0) as client:
+                async with AsyncClient(timeout=HTTP_CLIENT_DEFAULT_TIMEOUT) as client:
                     for attempt in range(FETCH_TX_MAX_RETRIES):
                         # Helius 按次计费(100 credits/次)，每批最多 100 笔，尽量凑满以节省 credit
                         resp = await client.post(url, json={"transactions": to_fetch[:100]})
@@ -521,7 +633,7 @@ class HunterMonitorController:
                                 logger.exception("on_helius_credit_exhausted 回调异常")
             except Exception:
                 logger.exception("消费队列异常")
-                await asyncio.sleep(1)
+                await asyncio.sleep(CONSUME_QUEUE_ERROR_SLEEP_SEC)
 
     def _get_usdc_price_sol(self) -> float:
         """1 USDC = ? SOL，使用配置固定值，不请求 API。"""
@@ -662,25 +774,29 @@ class HunterMonitorController:
                             removed += 1
                         logger.info("🚫 剔除 %s.. (体检发现 LP 行为，已拉黑)", addr[:12])
                         continue
-                    pnl_ok = new_stats.get("pnl_ratio", 0) >= SM_AUDIT_MIN_PNL_RATIO
-                    wr_ok = new_stats["win_rate"] >= SM_AUDIT_MIN_WIN_RATE
+                    is_modelb = HUNTER_MODE == "MODELB"
+                    pnl_min = SM_MODELB_AUDIT_MIN_PNL_RATIO if is_modelb else SM_AUDIT_MIN_PNL_RATIO
+                    wr_min = SM_MODELB_AUDIT_MIN_WIN_RATE if is_modelb else SM_AUDIT_MIN_WIN_RATE
+                    roi_threshold = SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT if is_modelb else TIER_THREE_ROI
+                    pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= pnl_min if new_stats.get("pnl_ratio") != float("inf") else True
+                    wr_ok = new_stats["win_rate"] >= wr_min
                     profit_ok = new_stats["total_profit"] > 0
-                    max_roi_30d = new_stats.get("max_roi_30d", 0)
+                    roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
 
                     if not (pnl_ok and wr_ok and profit_ok):
                         del self.storage.hunters[addr]
                         removed += 1
                         logger.info("🚫 剔除 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
-                    elif max_roi_30d < TIER_THREE_ROI:
+                    elif roi_val < roi_threshold:
                         del self.storage.hunters[addr]
                         removed += 1
-                        logger.info("🚫 剔除 %s.. (单token最大收益 %.0f%% < %s%%)", addr[:12], max_roi_30d, TIER_THREE_ROI)
+                        logger.info("🚫 剔除 %s.. (最大收益 %.0f%% < %s%%)", addr[:12], roi_val, roi_threshold)
                     else:
                         _apply_audit_update(info, new_stats, time.time(), addr)
                         updated += 1
                 except Exception:
                     logger.exception("审计猎手 %s 异常，跳过", addr[:12])
-                await asyncio.sleep(2)
+                await asyncio.sleep(AUDIT_BETWEEN_HUNTERS_SLEEP_SEC)
 
         await asyncio.to_thread(self.storage.save_hunters)
         logger.info("🩺 [立即审计] 完成 | 剔除 %d 名 | 更新 %d 名", removed, updated)
@@ -736,26 +852,30 @@ class HunterMonitorController:
                                     audit_removed.append(addr)
                                 logger.info("🚫 体检踢出 %s.. (发现 LP 行为，已拉黑)", addr[:12])
                             elif new_stats:
-                                pnl_ok = new_stats.get("pnl_ratio", 0) >= SM_AUDIT_MIN_PNL_RATIO
-                                wr_ok = new_stats["win_rate"] >= SM_AUDIT_MIN_WIN_RATE
+                                is_modelb = HUNTER_MODE == "MODELB"
+                                pnl_min = SM_MODELB_AUDIT_MIN_PNL_RATIO if is_modelb else SM_AUDIT_MIN_PNL_RATIO
+                                wr_min = SM_MODELB_AUDIT_MIN_WIN_RATE if is_modelb else SM_AUDIT_MIN_WIN_RATE
+                                roi_threshold = SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT if is_modelb else TIER_THREE_ROI
+                                pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= pnl_min if new_stats.get("pnl_ratio") != float("inf") else True
+                                wr_ok = new_stats["win_rate"] >= wr_min
                                 profit_ok = new_stats["total_profit"] > 0
-                                max_roi_30d = new_stats.get("max_roi_30d", 0)
+                                roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
 
                                 if not (pnl_ok and wr_ok and profit_ok):
                                     if addr in self.storage.hunters:
                                         del self.storage.hunters[addr]
                                         audit_removed.append(addr)
                                         logger.info("🚫 体检踢出 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
-                                elif max_roi_30d < TIER_THREE_ROI:
+                                elif roi_val < roi_threshold:
                                     if addr in self.storage.hunters:
                                         del self.storage.hunters[addr]
                                         audit_removed.append(addr)
-                                        logger.info("🚫 体检踢出 %s.. (单token最大收益 %.0f%% < %s%%)", addr[:12], max_roi_30d, TIER_THREE_ROI)
+                                        logger.info("🚫 体检踢出 %s.. (最大收益 %.0f%% < %s%%)", addr[:12], roi_val, roi_threshold)
                                 else:
                                     _apply_audit_update(info, new_stats, now, addr)
 
                             needs_audit_count += 1
-                            await asyncio.sleep(2)  # 慢慢跑，不着急
+                            await asyncio.sleep(AUDIT_BETWEEN_HUNTERS_SLEEP_SEC)  # 慢慢跑，不着急
 
                 if needs_audit_count == 0:
                     logger.info("✨ 所有猎手均在体检有效期内，无需更新")

@@ -10,7 +10,16 @@ import asyncio
 
 import httpx
 
-from config.settings import DEX_MIN_LIQUIDITY_USD, DEX_MIN_VOL_1H_USD, DEX_MIN_24H_GAIN_PCT
+from config.settings import (
+    DEX_MIN_LIQUIDITY_USD,
+    DEX_MIN_VOL_1H_USD,
+    DEX_MIN_24H_GAIN_PCT,
+    DEXSCREENER_BASE_URL,
+    DEXSCREENER_PROFILES_TIMEOUT,
+    DEXSCREENER_TOKEN_TIMEOUT,
+    WSOL_MINT,
+    DEX_SCAN_POLL_INTERVAL_SEC,
+)
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -18,7 +27,7 @@ logger = get_logger(__name__)
 
 class DexScanner:
     def __init__(self):
-        self.base_url = "https://api.dexscreener.com"
+        self.base_url = DEXSCREENER_BASE_URL
         self.target_chain = "solana"
         self.min_liquidity = DEX_MIN_LIQUIDITY_USD
         self.min_vol_1h = DEX_MIN_VOL_1H_USD
@@ -28,7 +37,7 @@ class DexScanner:
         url = f"{self.base_url}/token-profiles/latest/v1"
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.get(url, timeout=10.0)
+                response = await client.get(url, timeout=DEXSCREENER_PROFILES_TIMEOUT)
                 if response.status_code == 200:
                     return response.json()
             except Exception:
@@ -40,15 +49,12 @@ class DexScanner:
         url = f"{self.base_url}/latest/dex/tokens/{token_address}"
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.get(url, timeout=5.0)
+                response = await client.get(url, timeout=DEXSCREENER_TOKEN_TIMEOUT)
                 if response.status_code == 200:
                     return response.json().get('pairs', [])
             except Exception:
                 logger.exception("get_token_pairs 请求异常")
         return []
-
-    # Solana 上 WSOL 地址，用于校验 pair 是否为 token/SOL
-    _WSOL_ADDRESS = "So11111111111111111111111111111111111111112"
 
     def _parse_sol_per_token(self, pair: dict, token_address: str):
         """
@@ -72,11 +78,54 @@ class DexScanner:
         if p <= 0:
             return None
         # 仅处理 token/SOL 或 SOL/token 的 pair
-        is_sol = lambda a: a == self._WSOL_ADDRESS or "11111111111111111111111111111111" in (a or "")
+        is_sol = lambda a: a == WSOL_MINT or "11111111111111111111" in (a or "")
         if base_addr == token_address and is_sol(quote_addr):
             return p  # 1 token = p SOL
         if quote_addr == token_address and is_sol(base_addr):
             return 1.0 / p if p > 0 else None  # 1 SOL = p token → 1 token = 1/p SOL
+        return None
+
+    async def get_token_price_usd(self, token_address: str) -> float | None:
+        """
+        获取代币当前价格 (1 token = ? USD)，用于 MODELB 灰尘判断。
+        - token 为 base 时：priceUsd 即 1 token 的 USD 价格
+        - token 为 quote、base 为 SOL 时：priceUsd 为 SOL 价，需用 priceNative 折算
+        成功返回 float；失败返回 None。
+        """
+        url = f"{self.base_url}/latest/dex/tokens/{token_address}"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url, timeout=DEXSCREENER_TOKEN_TIMEOUT)
+                if response.status_code != 200:
+                    return None
+                data = response.json()
+                pairs = [p for p in (data.get("pairs") or []) if p.get("chainId") == "solana"]
+                if not pairs:
+                    return None
+                # 优先 token 为 base 的 pair（常见 token/SOL）
+                base_pairs = [p for p in pairs if (p.get("baseToken") or {}).get("address") == token_address]
+                if base_pairs:
+                    best = max(base_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0))
+                    p = best.get("priceUsd")
+                    if p is not None:
+                        v = float(p)
+                        return v if v > 0 else None
+                # token 为 quote（SOL/token）
+                quote_pairs = [p for p in pairs if (p.get("quoteToken") or {}).get("address") == token_address]
+                for p in quote_pairs:
+                    base_addr = (p.get("baseToken") or {}).get("address", "")
+                    if base_addr and ("So11111111111111111111111111111111111111112" in base_addr or "11111111111111111111" in base_addr):
+                        sol_price_usd = float(p.get("priceUsd") or 0)
+                        price_native = float(p.get("priceNative") or 0)  # SOL per 1 base = SOL per 1 SOL = 1?
+                        if sol_price_usd <= 0:
+                            continue
+                        # priceNative: 当 base=SOL 时表示 1 SOL 可换多少 quote(token)，即 token per SOL
+                        # 1 token = 1 SOL / token_per_sol = sol_price_usd / token_per_sol
+                        if price_native > 0:
+                            token_per_sol = price_native
+                            return sol_price_usd / token_per_sol
+            except Exception:
+                logger.debug("get_token_price_usd 失败 %s", token_address[:12])
         return None
 
     async def get_token_price(self, token_address: str):
@@ -88,7 +137,7 @@ class DexScanner:
         url = f"{self.base_url}/latest/dex/tokens/{token_address}"
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.get(url, timeout=5.0)
+                response = await client.get(url, timeout=DEXSCREENER_TOKEN_TIMEOUT)
                 if response.status_code == 200:
                     data = response.json()
                     pairs = data.get('pairs', []) or []
@@ -164,8 +213,8 @@ async def main():
             for r in results:
                 logger.info("代币地址: %s", r['address'])
 
-        logger.info("等待 5 分钟后进行下一轮扫描...")
-        await asyncio.sleep(300)  # 5分钟轮询一次，完全不会触发限流
+        logger.info("等待 %d 秒后进行下一轮扫描...", DEX_SCAN_POLL_INTERVAL_SEC)
+        await asyncio.sleep(DEX_SCAN_POLL_INTERVAL_SEC)
 
 
 if __name__ == "__main__":

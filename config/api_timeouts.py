@@ -1,0 +1,19 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+@Description: 外部 API 超时与重试
+"""
+DEXSCREENER_TIMEOUT = 15.0
+DEXSCREENER_TOKEN_TIMEOUT = 5.0
+DEXSCREENER_PROFILES_TIMEOUT = 10.0
+DEXSCREENER_BASE_URL = "https://api.dexscreener.com"
+
+RUGCHECK_API_BASE_URL = "https://api.rugcheck.xyz/v1/tokens"
+RUGCHECK_TIMEOUT = 20.0
+
+BIRDEYE_TIMEOUT = 10.0
+BIRDEYE_MARKET_DATA_TIMEOUT = 5.0
+
+HTTP_CLIENT_DEFAULT_TIMEOUT = 15.0
+HTTP_MAX_RETRIES = 3
+HTTP_RETRY_DELAY = 1.5

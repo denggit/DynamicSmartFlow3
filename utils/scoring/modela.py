@@ -1,12 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
 """
-@File    : hunter_scoring.py
-@Description: 猎手评分统一模块
-              挖掘阶段（sm_searcher）与体检阶段（hunter_monitor）共用同一套评分逻辑，
-              保证逻辑一致性，单一数据源。
-
+@File    : modela.py
+@Description: MODELA 猎手评分
+              高收益 token 挖掘模式专用。挖掘阶段（sm_searcher）与体检阶段（hunter_monitor）共用。
               评分体系：胜率分 30% + 盈利分 40% + 盈亏比分 30%
               - 胜率分：< 15% 零分，15%~35% 线性 0.5~1，≥35% 满分
               - 盈利分：avg_roi_pct < 20% 零分，20%~60% 线性，≥60% 满分
@@ -27,9 +24,7 @@ from config.settings import (
 
 def compute_hunter_score(stats: Dict[str, Any]) -> Dict[str, Any]:
     """
-    根据猎手表现统计计算综合评分。
-
-    评分体系：胜率分 30% + 盈利分 40% + 盈亏比分 30%
+    MODELA 猎手评分：胜率 30% + 盈利 40% + 盈亏比 30%。
 
     :param stats: 猎手表现统计，需包含：
         - win_rate: float, 0~1，胜率
@@ -61,7 +56,6 @@ def compute_hunter_score(stats: Dict[str, Any]) -> Dict[str, Any]:
     elif wr >= SM_WIN_RATE_FULL_PCT:
         score_hit_rate = 1.0
     else:
-        # 15% ~ 35%: 0.5 + 0.5 × (wr - 15) / 20
         score_hit_rate = 0.5 + 0.5 * (wr - SM_WIN_RATE_ZERO_PCT) / (
             SM_WIN_RATE_FULL_PCT - SM_WIN_RATE_ZERO_PCT
         )
@@ -77,7 +71,7 @@ def compute_hunter_score(stats: Dict[str, Any]) -> Dict[str, Any]:
             SM_PROFIT_SCORE_FULL_PCT - SM_PROFIT_SCORE_ZERO_PCT
         )
 
-    # 盈亏比分：总盈亏比 = 盈利和/亏损和；< 1.5 零分，1.5~3 线性，> 3 满分
+    # 盈亏比分：< 1.5 零分，1.5~3 线性，> 3 满分
     pnl_ratio = stats.get("pnl_ratio", 0.0)
     if pnl_ratio < SM_PNL_RATIO_ZERO:
         score_pnl_ratio = 0.0
@@ -88,7 +82,6 @@ def compute_hunter_score(stats: Dict[str, Any]) -> Dict[str, Any]:
             SM_PNL_RATIO_FULL - SM_PNL_RATIO_ZERO
         )
 
-    # 最终分数
     final_score = (score_hit_rate * 30) + (score_profit * 40) + (score_pnl_ratio * 30)
     final_score = round(final_score, 1)
 

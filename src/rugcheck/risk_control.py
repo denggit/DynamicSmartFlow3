@@ -20,18 +20,18 @@ from config.settings import (
     MAX_SINGLE_HOLDER_PCT,
     MAX_ENTRY_FDV_USD,
     MIN_LIQUIDITY_TO_FDV_RATIO,
+    WSOL_MINT,
+    RUGCHECK_TIMEOUT,
+    RUGCHECK_API_BASE_URL,
+    DEXSCREENER_BASE_URL,
+    DEXSCREENER_TIMEOUT,
+    HTTP_MAX_RETRIES,
+    HTTP_RETRY_DELAY,
+    BIRDEYE_MARKET_DATA_TIMEOUT,
 )
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-WSOL_MINT = "So11111111111111111111111111111111111111112"
-
-# HTTP 请求超时配置（秒）
-RUGCHECK_TIMEOUT = 20.0
-DEXSCREENER_TIMEOUT = 15.0
-HTTP_MAX_RETRIES = 3
-HTTP_RETRY_DELAY = 1.5
 
 
 async def _fetch_with_retry(
@@ -82,7 +82,7 @@ async def check_is_safe_token(token_mint: str) -> bool:
     if token_mint == WSOL_MINT:
         return True
 
-    url = f"https://api.rugcheck.xyz/v1/tokens/{token_mint}/report"
+    url = f"{RUGCHECK_API_BASE_URL}/{token_mint}/report"
     resp = await _fetch_with_retry(url, timeout=RUGCHECK_TIMEOUT)
     if resp is None:
         logger.warning("RugCheck API 请求失败（超时或网络异常），保守拒绝: %s", token_mint[:16] + "..")
@@ -292,7 +292,7 @@ async def check_token_liquidity(token_mint: str) -> Tuple[bool, float, float]:
     liq_usd = 0.0
     fdv_usd = 0.0
 
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
+    url = f"{DEXSCREENER_BASE_URL}/latest/dex/tokens/{token_mint}"
     try:
         resp = await _fetch_with_retry(url, timeout=DEXSCREENER_TIMEOUT)
         if resp is not None and resp.status_code == 200:
@@ -316,7 +316,7 @@ async def check_token_liquidity(token_mint: str) -> Tuple[bool, float, float]:
             if birdeye_key_pool.size > 0:
                 from src.birdeye import birdeye_client
                 logger.debug("DexScreener 未查到流动性，使用 Birdeye 兜底查询...")
-                market_data = await birdeye_client.get_token_market_data(token_mint, timeout=5.0)
+                market_data = await birdeye_client.get_token_market_data(token_mint, timeout=BIRDEYE_MARKET_DATA_TIMEOUT)
                 if market_data:
                     liq = float(market_data.get("liquidity", 0) or 0)
                     fdv = float(market_data.get("fdv", 0) or 0)

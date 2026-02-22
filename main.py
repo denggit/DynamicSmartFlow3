@@ -8,14 +8,22 @@ import asyncio
 import json
 import threading
 from datetime import datetime
+from pathlib import Path
 
 from config.settings import (
     PNL_CHECK_INTERVAL,
     HUNTER_ADD_THRESHOLD_SOL,
     MAX_ENTRY_PUMP_MULTIPLIER,
     DAILY_REPORT_HOUR,
-    BASE_DIR,
     POOL_SIZE_LIMIT,
+    HUNTER_MODE,
+    HUNTER_JSON_PATH,
+    SMART_MONEY_JSON_PATH,
+    DATA_DIR,
+    DATA_MODELA_DIR,
+    DATA_MODELB_DIR,
+    CLOSED_PNL_PATH,
+    PNL_LOOP_RATE_LIMIT_SLEEP_SEC,
 )
 from src.dexscreener.dex_scanner import DexScanner
 from services.hunter_agent import HunterAgentController
@@ -28,9 +36,10 @@ from utils.trading_history import append_trade, append_trade_in_background, load
 
 logger = get_logger("Main")
 
-# 持仓与清仓记录持久化路径（程序挂掉后重启可恢复）
-TRADER_STATE_DIR = BASE_DIR / "data"
-CLOSED_PNL_PATH = TRADER_STATE_DIR / "closed_pnl.json"
+# 启动时确保 data 及 modelA/modelB 目录存在
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_MODELA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_MODELB_DIR.mkdir(parents=True, exist_ok=True)
 
 trader = SolanaTrader()
 trader.load_state()  # 启动时从本地恢复持仓
@@ -40,7 +49,8 @@ price_scanner = DexScanner()
 # 清仓记录（兼容旧逻辑，日报已改用 trading_history.json）
 closed_pnl_log = []
 _CLOSED_PNL_LOCK = threading.Lock()  # 防止多线程同时写 closed_pnl.json 导致竞态丢失
-HUNTER_JSON_PATH = BASE_DIR / "data" / "hunters.json"
+# 猎手池文件：MODELA 用 hunters.json，MODELB 用 smart_money.json
+HUNTER_POOL_PATH = Path(SMART_MONEY_JSON_PATH) if (HUNTER_MODE or "MODELA").strip().upper() == "MODELB" else Path(HUNTER_JSON_PATH)
 
 
 def _load_closed_pnl_log() -> None:
@@ -62,7 +72,8 @@ def _save_closed_pnl_log() -> None:
     with _CLOSED_PNL_LOCK:
         snapshot = list(closed_pnl_log)  # 在锁内复制，避免写时被并发修改
     try:
-        TRADER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        from config.settings import DATA_DIR
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         with open(CLOSED_PNL_PATH, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, ensure_ascii=False, indent=2)
     except Exception:
@@ -210,7 +221,7 @@ async def pnl_monitor_loop():
                         if token not in trader.positions:
                             await trader.ensure_fully_closed(token)  # 关监控前校验链上归零，未归零则清仓
                             await agent.stop_tracking(token)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(PNL_LOOP_RATE_LIMIT_SLEEP_SEC)
         except Exception:
             logger.exception("PnL Loop Error")
         await asyncio.sleep(PNL_CHECK_INTERVAL)
@@ -259,11 +270,11 @@ def _build_daily_report_from_history(trader_instance):
         if costs:
             today_avg_roi_pct = (today_pnl / sum(costs)) * 100 if sum(costs) > 0 else 0
 
-    # 猎手池数量
+    # 猎手池数量（MODELA: hunters.json, MODELB: smart_money.json）
     hunter_pool_count = 0
-    if HUNTER_JSON_PATH.exists():
+    if HUNTER_POOL_PATH.exists():
         try:
-            with open(HUNTER_JSON_PATH, "r", encoding="utf-8") as f:
+            with open(HUNTER_POOL_PATH, "r", encoding="utf-8") as f:
                 hunters_data = json.load(f)
             hunter_pool_count = len(hunters_data) if isinstance(hunters_data, dict) else 0
         except Exception:

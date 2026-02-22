@@ -13,14 +13,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
-from config.settings import BASE_DIR
+from config.settings import TRADING_HISTORY_PATH, DATA_DIR, SUMMARY_FILE_PREFIX
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-TRADING_HISTORY_PATH = BASE_DIR / "data" / "trading_history.json"
-SUMMARY_DIR = BASE_DIR / "data"
-SUMMARY_PREFIX = "summary_report"
+SUMMARY_DIR = DATA_DIR
+SUMMARY_PREFIX = SUMMARY_FILE_PREFIX
 _LOCK = threading.Lock()
 
 

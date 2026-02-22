@@ -29,10 +29,16 @@ from config.settings import (
     get_tier_config, TAKE_PROFIT_LEVELS,
     MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
     SOLANA_PRIVATE_KEY_BASE58,
-    JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, BASE_DIR, jup_key_pool,
+    JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, jup_key_pool,
     TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
     TX_VERIFY_RECONCILIATION_DELAY_SEC, TX_VERIFY_RECONCILIATION_RETRIES,
     TRADER_RPC_TIMEOUT,
+    WSOL_MINT,
+    LAMPORTS_PER_SOL,
+    TRADER_STATE_PATH,
+    TRADER_BIRDEYE_PRICE_TIMEOUT,
+    TRADER_RPC_ERROR_SLEEP_SEC,
+    TRADER_VERIFY_RETRY_SLEEP_SEC,
 )
 from src.alchemy import alchemy_client
 from utils.logger import get_logger
@@ -55,10 +61,7 @@ def _is_rate_limit_error(e: Exception) -> bool:
     )
 
 
-# 常量
-WSOL_MINT = "So11111111111111111111111111111111111111112"
-LAMPORTS_PER_SOL = 1_000_000_000
-TRADER_STATE_PATH = BASE_DIR / "data" / "trader_state.json"
+# 常量：WSOL_MINT、LAMPORTS_PER_SOL、TRADER_STATE_PATH 已移至 config.settings
 
 
 class VirtualShare:
@@ -598,7 +601,7 @@ class SolanaTrader:
                         "📉 DexScreener 报亏损触及止损线: %.0f%%，启动 Birdeye 二次验价防插针...",
                         pnl_pct * 100,
                     )
-                    full = await birdeye_client.get_price_full(token_address, timeout=3.0)
+                    full = await birdeye_client.get_price_full(token_address, timeout=TRADER_BIRDEYE_PRICE_TIMEOUT)
                     if full and full.get("priceInNative") is not None:
                         be_price_sol = float(full["priceInNative"])
                         if be_price_sol > 0 and pos.average_price > 0:
@@ -867,7 +870,7 @@ class SolanaTrader:
                 result = await self.rpc_client.send_transaction(signed_tx, opts=opts)
                 sig_str = str(getattr(result, "value", result))
                 logger.info("⏳ 交易已广播: %s", sig_str)
-                await asyncio.sleep(5)
+                await asyncio.sleep(TRADER_RPC_ERROR_SLEEP_SEC)
 
                 # 验证交易是否真正确认，避免广播成功但链上执行失败时误更新状态
                 verified = await self._verify_tx_confirmed(sig_str, max_wait_sec=TX_VERIFY_MAX_WAIT_SEC)
@@ -1005,18 +1008,18 @@ class SolanaTrader:
                     if _is_rate_limit_error(e) and alchemy_client.size > 1:
                         logger.warning("验证交易时 Alchemy 429，切换 Key 继续: %s", e)
                         await self._recreate_rpc_client()
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(TRADER_VERIFY_RETRY_SLEEP_SEC)
                         continue
                     logger.debug("验证交易确认异常", exc_info=True)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(TRADER_VERIFY_RETRY_SLEEP_SEC)
                     continue
                 vals = getattr(resp, "value", None) or []
                 if not vals:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(TRADER_VERIFY_RETRY_SLEEP_SEC)
                     continue
                 st = vals[0]
                 if st is None:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(TRADER_VERIFY_RETRY_SLEEP_SEC)
                     continue
                 err = getattr(st, "err", None)
                 if err is not None:

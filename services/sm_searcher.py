@@ -26,6 +26,9 @@ import httpx
 
 from config.settings import (
     BASE_DIR,
+    IGNORE_MINTS,
+    USDC_MINT,
+    WSOL_MINT,
     MIN_TOKEN_AGE_SEC,
     MAX_TOKEN_AGE_SEC,
     MAX_BACKTRACK_PAGES,
@@ -56,24 +59,24 @@ from config.settings import (
     TIER_ONE_ROI,
     TIER_TWO_ROI,
     TIER_THREE_ROI,
+    DEXSCREENER_TOKEN_TIMEOUT,
+    SM_BACKTRACK_SIGS_PER_PAGE,
+    SM_NEAR_ENTRY_THRESHOLD,
+    SM_SEARCHER_WALLET_SLEEP_SEC,
+    SM_SEARCHER_CANDIDATE_SKIP_SLEEP_SEC,
+    SM_SEARCHER_TOKEN_SLEEP_SEC,
 )
 from src.alchemy import alchemy_client
 from src.helius import helius_client
 from utils.logger import get_logger
-from utils.hunter_scoring import compute_hunter_score
+from utils.scoring.modela import compute_hunter_score
 from utils.solana_ata import get_associated_token_address
 
 logger = get_logger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-# 与 SmartFlow3 一致：只把「真实买卖」算作交易，忽略 SOL/USDC/USDT 等
-IGNORE_MINTS = {
-    "So11111111111111111111111111111111111111112",  # WSOL
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",   # USDT
-}
-USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+# 链常量：IGNORE_MINTS、USDC_MINT、WSOL_MINT 已移至 config.settings
 MIN_NATIVE_LAMPORTS_FOR_REAL = int(0.01 * 1e9)  # 至少 0.01 SOL 的 native 转账才算「真实」
 
 
@@ -266,7 +269,7 @@ def _normalize_token_amount(raw) -> float:
 class TransactionParser:
     def __init__(self, target_wallet: str):
         self.target_wallet = target_wallet
-        self.wsol_mint = "So11111111111111111111111111111111111111112"
+        self.wsol_mint = WSOL_MINT
 
     def parse_transaction(
         self, tx: dict, usdc_price_sol: float | None = None
@@ -583,12 +586,12 @@ class SmartMoneySearcher:
         """
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
         try:
-            resp = await client.get(url, timeout=5.0)
+            resp = await client.get(url, timeout=DEXSCREENER_TOKEN_TIMEOUT)
             if resp.status_code != 200:
                 return None
             data = resp.json()
             pairs = data.get("pairs", [])
-            wsol = "So11111111111111111111111111111111111111112"
+            wsol = WSOL_MINT
             for p in pairs:
                 if p.get("chainId") != "solana":
                     continue
@@ -752,7 +755,7 @@ class SmartMoneySearcher:
         """
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
         try:
-            resp = await client.get(url, timeout=5.0)
+            resp = await client.get(url, timeout=DEXSCREENER_TOKEN_TIMEOUT)
             if resp.status_code == 200:
                 data = resp.json()
                 pairs = data.get('pairs', [])
@@ -817,7 +820,7 @@ class SmartMoneySearcher:
             found_early_txs = []
 
             for page in range(MAX_BACKTRACK_PAGES):
-                sigs = await self.get_signatures(client, token_address, limit=1000, before=current_before)
+                sigs = await self.get_signatures(client, token_address, limit=SM_BACKTRACK_SIGS_PER_PAGE, before=current_before)
                 if not sigs: break
 
                 batch_oldest = sigs[-1].get('blockTime', 0)
@@ -853,7 +856,6 @@ class SmartMoneySearcher:
             seen_buyers = set()
             usdc_price = await self._get_usdc_price_sol(client)
 
-            wsol_mint = "So11111111111111111111111111111111111111112"
             for tx in txs:
                 block_time = _get_tx_timestamp(tx)
                 delay = block_time - start_time
@@ -871,7 +873,7 @@ class SmartMoneySearcher:
                     if not addr:
                         continue
                     amt = _normalize_token_amount(tt.get('tokenAmount'))
-                    if mint == wsol_mint:
+                    if mint == WSOL_MINT:
                         spend_by_addr[addr] += amt
                     elif mint == USDC_MINT and usdc_price and usdc_price > 0:
                         spend_by_addr[addr] += amt * usdc_price
@@ -906,7 +908,7 @@ class SmartMoneySearcher:
                 roi, txs = await self.get_hunter_profit_on_token(client, addr, token_address)
                 # LP 行为（加池/撤池）已在 get_hunter_profit_on_token 主钱包预检中淘汰并拉黑
                 if roi is None or roi < SM_MIN_TOKEN_PROFIT_PCT:
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(SM_SEARCHER_CANDIDATE_SKIP_SLEEP_SEC)
                     continue
                 pnl_passed_count += 1
 
@@ -960,7 +962,7 @@ class SmartMoneySearcher:
                         logger.info(
                             f"    ✅ 锁定猎手 {addr}.. | 利润: {candidate['total_profit']} | 评分: {final_score} (×{roi_mult})")
                     else:
-                        NEAR_THRESHOLD = 0.8
+                        NEAR_THRESHOLD = SM_NEAR_ENTRY_THRESHOLD
                         reasons = []
                         if not roi_ok:
                             reasons.append(f"单token最大收益{max_roi_30d:.0f}%%<{TIER_THREE_ROI}%%")
@@ -974,7 +976,7 @@ class SmartMoneySearcher:
                             reasons.append("总盈利非正")
                         if reasons:
                             logger.info("[落榜钱包地址] %s | 原因: %s", addr, " | ".join(reasons))
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(SM_SEARCHER_WALLET_SLEEP_SEC)
 
             logger.info(f"  [收益+评分] 初筛 {total} → ROI≥{SM_MIN_TOKEN_PROFIT_PCT:.0f}%: {pnl_passed_count} 个 → 入库 {len(verified_hunters)} 个")
             self._save_scanned_token(token_address)
@@ -999,7 +1001,7 @@ class SmartMoneySearcher:
                     if hunters: all_hunters.extend(hunters)
                 except Exception:
                     logger.exception("❌ 挖掘代币 %s 出错", sym)
-                await asyncio.sleep(1)
+                await asyncio.sleep(SM_SEARCHER_TOKEN_SLEEP_SEC)
         all_hunters.sort(key=lambda x: float(x.get('score', 0) or 0), reverse=True)
         return all_hunters
 
