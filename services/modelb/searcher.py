@@ -28,6 +28,7 @@ from config.settings import (
     SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC,
     SM_MODELB_ENTRY_MAX_DUST_COUNT,
     SM_MODELB_ENTRY_MIN_TRADE_COUNT,
+    SM_MODELB_ENTRY_MIN_CLOSED_RATIO,
     SM_MODELB_WALLET_ANALYZE_SLEEP_SEC,
 )
 from src.alchemy import alchemy_client
@@ -53,7 +54,7 @@ def _normalize_address(addr: str) -> str:
 
 def _check_modelb_entry_risk(stats: dict) -> Tuple[bool, str]:
     """
-    MODELB 入库风控评测：五项硬门槛，全部通过才可进入评分与入库判定。
+    MODELB 入库风控评测：六项硬门槛，全部通过才可进入评分与入库判定。
     :return: (是否通过, 未通过时的原因，通过时为空)
     """
     pnl = stats.get("pnl_ratio", 0) or 0
@@ -75,6 +76,9 @@ def _check_modelb_entry_risk(stats: dict) -> Tuple[bool, str]:
     count = stats.get("count", 0) or 0
     if count < SM_MODELB_ENTRY_MIN_TRADE_COUNT:
         return False, f"交易代币数{count}<{SM_MODELB_ENTRY_MIN_TRADE_COUNT}"
+    closed_ratio = stats.get("closed_ratio", 0) or 0
+    if closed_ratio < SM_MODELB_ENTRY_MIN_CLOSED_RATIO:
+        return False, f"清仓比例{closed_ratio:.1%}<{SM_MODELB_ENTRY_MIN_CLOSED_RATIO:.0%}"
     return True, ""
 
 

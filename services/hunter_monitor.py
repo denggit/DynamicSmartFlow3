@@ -50,6 +50,7 @@ from config.settings import (
     SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC,
     SM_MODELB_ENTRY_MAX_DUST_COUNT,
     SM_MODELB_ENTRY_MIN_TRADE_COUNT,
+    SM_MODELB_ENTRY_MIN_CLOSED_RATIO,
     SM_ROI_MULT_ONE,
     SM_ROI_MULT_TWO,
     SM_ROI_MULT_THREE,
@@ -802,9 +803,11 @@ class HunterMonitorController:
                         hold_ok = avg_hold is not None and avg_hold > SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC
                         dust_ok = (new_stats.get("dust_count", 0) or 0) < SM_MODELB_ENTRY_MAX_DUST_COUNT
                         count_ok = (new_stats.get("count", 0) or 0) >= SM_MODELB_ENTRY_MIN_TRADE_COUNT
+                        closed_ratio = new_stats.get("closed_ratio", 0) or 0
+                        closed_ok = closed_ratio >= SM_MODELB_ENTRY_MIN_CLOSED_RATIO
                         roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
                         roi_ok = roi_val >= SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT
-                        audit_pass = pnl_ok and wr_ok and profit_ok and hold_ok and dust_ok and count_ok and roi_ok
+                        audit_pass = pnl_ok and wr_ok and profit_ok and hold_ok and dust_ok and count_ok and closed_ok and roi_ok
                         if not audit_pass:
                             reasons = []
                             if not pnl_ok: reasons.append("盈亏比")
@@ -813,6 +816,7 @@ class HunterMonitorController:
                             if not hold_ok: reasons.append("单币持仓≤5min")
                             if not dust_ok: reasons.append("灰尘≥10")
                             if not count_ok: reasons.append("代币数<7")
+                            if not closed_ok: reasons.append("清仓比例<70%")
                             if not roi_ok: reasons.append("最大收益")
                             del self.storage.hunters[addr]
                             removed += 1
@@ -915,9 +919,11 @@ class HunterMonitorController:
                                     hold_ok = avg_hold is not None and avg_hold > SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC
                                     dust_ok = (new_stats.get("dust_count", 0) or 0) < SM_MODELB_ENTRY_MAX_DUST_COUNT
                                     count_ok = (new_stats.get("count", 0) or 0) >= SM_MODELB_ENTRY_MIN_TRADE_COUNT
+                                    closed_ratio = new_stats.get("closed_ratio", 0) or 0
+                                    closed_ok = closed_ratio >= SM_MODELB_ENTRY_MIN_CLOSED_RATIO
                                     roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
                                     roi_ok = roi_val >= SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT
-                                    audit_pass = pnl_ok and wr_ok and profit_ok and hold_ok and dust_ok and count_ok and roi_ok
+                                    audit_pass = pnl_ok and wr_ok and profit_ok and hold_ok and dust_ok and count_ok and closed_ok and roi_ok
                                     if not audit_pass:
                                         reasons = []
                                         if not pnl_ok: reasons.append("盈亏比")
@@ -926,6 +932,7 @@ class HunterMonitorController:
                                         if not hold_ok: reasons.append("单币持仓≤5min")
                                         if not dust_ok: reasons.append("灰尘≥10")
                                         if not count_ok: reasons.append("代币数<7")
+                                        if not closed_ok: reasons.append("清仓比例<70%")
                                         if not roi_ok: reasons.append("最大收益")
                                         if addr in self.storage.hunters:
                                             del self.storage.hunters[addr]
