@@ -682,6 +682,13 @@ class SolanaTrader:
             logger.warning("链上无持仓或余额为 0，同步状态并停止监控")
             self._sync_zero_and_close_position(token_address, pos)
             return
+        sell_value_sol = sell_amount_ui * current_price
+        if sell_value_sol < MIN_SHARE_VALUE_SOL:
+            logger.info(
+                "⏭️ 跟随卖出跳过: 卖出价值 %.4f SOL < %.2f SOL，无意义: %s",
+                sell_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
+            )
+            return
 
         logger.info(f"📉 [准备卖出] {token_address} | 数量: {sell_amount_ui:.2f}")
 
@@ -698,6 +705,12 @@ class SolanaTrader:
             if chain_after is not None and chain_after < 1e-9:
                 logger.info(
                     "✅ 链上持仓已归零（交易或已成交，RPC 验证可能超时误判），同步状态并停止监控: %s",
+                    token_address[:16] + "..",
+                )
+                self._sync_zero_and_close_position(token_address, pos)
+            elif chain_after is None:
+                logger.warning(
+                    "⚠️ 无法查询链上余额(429等)，假定已成交并同步状态，避免重复卖出: %s",
                     token_address[:16] + "..",
                 )
                 self._sync_zero_and_close_position(token_address, pos)
@@ -801,11 +814,26 @@ class SolanaTrader:
                 return
 
             chain_bal = await self._fetch_own_token_balance(token_address)
+            if chain_bal is not None and chain_bal < 1e-9:
+                logger.info(
+                    "✅ 止损前链上已归零（前次卖出或已成交），同步状态并跳过: %s",
+                    token_address[:16] + "..",
+                )
+                self._sync_zero_and_close_position(token_address, pos)
+                return
             sell_amount = chain_bal if chain_bal is not None else pos.total_tokens * SELL_BUFFER
             if chain_bal is not None and chain_bal < pos.total_tokens * 0.99:
                 logger.warning("⚠️ 止损前状态与链上不一致: 内部 %.2f vs 链上 %.2f", pos.total_tokens, chain_bal)
             if sell_amount <= 0:
                 logger.warning("链上无持仓，跳过止损")
+                return
+            sell_value_sol = sell_amount * current_price_ui
+            if sell_value_sol < MIN_SHARE_VALUE_SOL:
+                logger.info(
+                    "⏭️ 止损跳过: 持仓价值 %.4f SOL < %.2f SOL，无意义卖出: %s",
+                    sell_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
+                )
+                self._sync_zero_and_close_position(token_address, pos)
                 return
             logger.info(f"🛑 [止损触发] {token_address} (亏损 {pnl_pct * 100:.0f}%) | 全仓清仓 {sell_amount:.2f}")
 
@@ -823,6 +851,12 @@ class SolanaTrader:
                 if chain_after is not None and chain_after < 1e-9:
                     logger.info(
                         "✅ 链上持仓已归零（交易或已成交，RPC 验证可能超时误判），同步状态并停止监控: %s",
+                        token_address[:16] + "..",
+                    )
+                    self._sync_zero_and_close_position(token_address, pos)
+                elif chain_after is None:
+                    logger.warning(
+                        "⚠️ 无法查询链上余额(429等)，假定已成交并同步状态，避免重复卖出: %s",
                         token_address[:16] + "..",
                     )
                     self._sync_zero_and_close_position(token_address, pos)
@@ -866,6 +900,14 @@ class SolanaTrader:
 
         for level, sell_pct in TAKE_PROFIT_LEVELS:
             if pnl_pct >= level and level not in pos.tp_hit_levels:
+                chain_bal_pre = await self._fetch_own_token_balance(token_address)
+                if chain_bal_pre is not None and chain_bal_pre < 1e-9:
+                    logger.info(
+                        "✅ 止盈前链上已归零（前次卖出或已成交），同步状态并跳过: %s",
+                        token_address[:16] + "..",
+                    )
+                    self._sync_zero_and_close_position(token_address, pos)
+                    return
                 sell_amount = pos.total_tokens * sell_pct
                 remaining_after = pos.total_tokens * (1.0 - sell_pct)
                 if (remaining_after * current_price_ui) < MIN_SHARE_VALUE_SOL:
@@ -880,6 +922,13 @@ class SolanaTrader:
                     sell_amount = min(sell_amount, pos.total_tokens * SELL_BUFFER)  # 查余额失败，兜底 99.9%
                 if sell_amount <= 0:
                     logger.warning("链上无持仓，跳过止盈")
+                    continue
+                sell_value_sol = sell_amount * current_price_ui
+                if sell_value_sol < MIN_SHARE_VALUE_SOL:
+                    logger.info(
+                        "⏭️ 止盈跳过: 卖出价值 %.4f SOL < %.2f SOL，无意义: %s",
+                        sell_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
+                    )
                     continue
                 logger.info(f"💰 [止盈触发] {token_address} (+{pnl_pct * 100:.0f}%) | 卖出 {sell_amount:.2f}")
 
@@ -897,6 +946,12 @@ class SolanaTrader:
                     if chain_after is not None and chain_after < 1e-9:
                         logger.info(
                             "✅ 链上持仓已归零（交易或已成交，RPC 验证可能超时误判），同步状态并停止监控: %s",
+                            token_address[:16] + "..",
+                        )
+                        self._sync_zero_and_close_position(token_address, pos)
+                    elif chain_after is None:
+                        logger.warning(
+                            "⚠️ 无法查询链上余额(429等)，假定已成交并同步状态，避免重复卖出: %s",
                             token_address[:16] + "..",
                         )
                         self._sync_zero_and_close_position(token_address, pos)
