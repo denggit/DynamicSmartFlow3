@@ -247,6 +247,11 @@ class SmartMoneySearcherB:
         now = time.time()
         pnl = stats.get("pnl_ratio", 0)
         pnl_str = "∞" if pnl == float("inf") else f"{pnl:.2f}"
+        logger.info(
+            "✅️ [MODELB 入库成功] %s.. | 分: %.1f | 盈亏比: %s | 胜率: %s | 盈利: %.2f SOL | %s",
+            address[:12], final_score, pnl_str, f"{stats['win_rate']:.1%}",
+            stats["total_profit"], score_result.get("scores_detail", ""),
+        )
         return {
             "address": address,
             "score": round(final_score, 1),
@@ -312,6 +317,8 @@ class SmartMoneySearcherB:
 
         self._save_smart_money(smart_money)
         self._remove_from_wallets_file(processed_addrs)
+        if new_hunters:
+            logger.info("🆕 [MODELB] 本轮入库 %d 名新猎手，池内共 %d 名", len(new_hunters), len(smart_money))
         return new_hunters
 
     def is_blacklisted(self, address: str) -> bool:
