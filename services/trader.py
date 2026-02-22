@@ -213,13 +213,19 @@ class SolanaTrader:
     async def ensure_fully_closed(self, token_address: str) -> None:
         """
         关闭监控前校验：链上仓位是否已归零。若未归零则执行清仓，避免遗漏 dust 或状态不同步。
+        若链上已归零但内部仍有持仓记录（如重启后恢复的过时状态），也同步移除并持久化，
+        避免下次重启又触发 restore_agent_from_trader 导致重复监控。
         """
         if not self.keypair:
             return
         chain_bal = await self._fetch_own_token_balance(token_address)
         if chain_bal is None:
             return
-        if chain_bal < 1e-9:  # 视为 0
+        pos = self.positions.get(token_address)
+        if chain_bal < 1e-9:  # 链上已归零
+            if pos:
+                logger.info("链上已归零，同步移除过时持仓记录: %s", token_address[:16] + "..")
+                self._sync_zero_and_close_position(token_address, pos)
             return
         logger.warning(
             "⚠️ 关闭监控前发现链上仍有持仓 %.6f，执行清仓",
@@ -235,10 +241,8 @@ class SolanaTrader:
         )
         if not tx_sig:
             logger.warning("❌ 关闭前清仓失败: %s", token_address)
-        else:
-            pos = self.positions.get(token_address)
-            if pos:
-                self._sync_zero_and_close_position(token_address, pos)
+        elif pos:
+            self._sync_zero_and_close_position(token_address, pos)
 
     async def emergency_close_all_positions(self) -> int:
         """
