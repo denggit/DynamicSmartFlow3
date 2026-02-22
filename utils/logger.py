@@ -38,7 +38,8 @@ _CRITICAL_LOGGER_NAMES = frozenset({
     "services.trader",
     "services.hunter_agent",
     "services.hunter_monitor",
-    "services.sm_searcher",
+    "services.modela",
+    "services.modelb",
     "src.rugcheck.risk_control",
     "src.dexscreener.dex_scanner",
 })
@@ -97,7 +98,8 @@ def _schedule_flush_if_first() -> None:
 def _logger_name_to_file_name(name: str) -> str:
     """
     Logger 名称 -> 日志文件名（不含扩展名）。
-    主程序 Main -> main.log；猎手交易专用 trade -> monitor.log；其余取最后一段。
+    主程序 Main -> main.log；猎手交易专用 trade -> monitor.log；
+    modela/modelb 及其子模块 -> modela.log / modelb.log；其余取最后一段。
     """
     if not name or name == "root":
         return "app"
@@ -105,6 +107,10 @@ def _logger_name_to_file_name(name: str) -> str:
         return "main"
     if name == "trade":
         return "monitor"
+    if name.startswith("services.modela"):
+        return "modela"
+    if name.startswith("services.modelb"):
+        return "modelb"
     parts = name.split(".")
     return parts[-1].lower() if parts else "app"
 
@@ -205,9 +211,10 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
         )
         logger.propagate = False
 
-        # 文件：按日期目录写入
+        # 文件：按日期目录写入；modela/modelb 使用 logs/modela/YYYY-MM-DD、logs/modelb/YYYY-MM-DD
         file_name = _logger_name_to_file_name(name)
-        file_handler = DateDirFileHandler(file_name, LOGS_ROOT)
+        logs_root = LOGS_ROOT / file_name if file_name in ("modela", "modelb") else LOGS_ROOT
+        file_handler = DateDirFileHandler(file_name, logs_root)
         file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)

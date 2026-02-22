@@ -34,7 +34,7 @@ from config.settings import (
     IGNORE_MINTS,
 )
 from src.alchemy import alchemy_client
-from services.sm_searcher import TransactionParser
+from services.hunter_common import TransactionParser
 from utils.logger import get_logger
 
 logger = get_logger(__name__)

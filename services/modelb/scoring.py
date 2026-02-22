@@ -1,43 +1,40 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-@File    : modelb.py
 @Description: MODELB 三维度评分（与 MODELA 完全分离）
-              1. 盈利力 45%：盈亏比 25 分 + 单币 ROI 平均 10 分 + 单币 ROI 最大 10 分，单币最大亏损>99% 扣 10 分
-              2. 持久力 35%：胜率 30 分（40%~80% 线性）+ 活跃度 5 分（日均≥1 满分）+ 灰尘占比扣分
-              3. 真实性 20%：平均持仓≤24h 5 分 + 盈利/亏损持仓时间比 10 分 + 已清仓占比 5 分
+              盈利力 45% + 持久力 35% + 真实性 20%
 """
+
 from typing import Dict, Any
 
 
 def compute_hunter_score(stats: Dict[str, Any]) -> Dict[str, Any]:
     """
-    MODELB 三维度评分，与 MODELA 独立。
+    MODELB 三维度评分。
     :param stats: analyze_wallet_modelb 返回的完整统计
-    :return: score, scores_detail, 及各维度分值
+    :return: score, scores_detail, profit_dim, persist_dim, auth_dim 等
     """
-    # 盈利力 45 分
     pnl_ratio = stats.get("pnl_ratio", 0) or 0
     if pnl_ratio == float("inf"):
         pnl_ratio = 10.0
-    score_pnl = min(25.0, pnl_ratio * 12.5) if pnl_ratio >= 0 else 0  # 0→0, 2→25
+    score_pnl = min(25.0, pnl_ratio * 12.5) if pnl_ratio >= 0 else 0
     avg_roi = stats.get("avg_roi_pct", 0) or 0
-    score_avg_roi = min(10.0, max(0, avg_roi / 5))  # 0-50% 线性
+    score_avg_roi = min(10.0, max(0, avg_roi / 5))
     max_roi = stats.get("max_roi_pct", 0) or 0
-    score_max_roi = min(10.0, max(0, max_roi / 10))  # 0-100% 线性
+    score_max_roi = min(10.0, max(0, max_roi / 10))
     profit_dim = score_pnl + score_avg_roi + score_max_roi
     max_loss = stats.get("max_single_loss_pct", 0) or 0
     if max_loss > 99.0:
         profit_dim = max(0, profit_dim - 10)
     profit_dim = round(profit_dim, 1)
-    # 持久力 35 分
+
     wr = (stats.get("win_rate", 0) or 0) * 100
     if wr < 40:
-        score_wr = 10.0 * (wr / 40) if wr >= 0 else 0  # 0-40% → 0-10
+        score_wr = 10.0 * (wr / 40) if wr >= 0 else 0
     elif wr >= 80:
         score_wr = 30.0
     else:
-        score_wr = 10.0 + 20.0 * (wr - 40) / 40  # 40-80% → 10-30
+        score_wr = 10.0 + 20.0 * (wr - 40) / 40
     txs_per_day = stats.get("txs_per_day", 0) or 0
     score_activity = 5.0 if txs_per_day >= 1 else 0.0
     persist_dim = score_wr + score_activity
@@ -45,14 +42,14 @@ def compute_hunter_score(stats: Dict[str, Any]) -> Dict[str, Any]:
     if dust_ratio >= 0.5:
         dust_deduction = 20.0
     elif dust_ratio >= 0.1:
-        dust_deduction = 5.0 + 15.0 * (dust_ratio - 0.1) / 0.4  # 10-50% 线性 5-20
+        dust_deduction = 5.0 + 15.0 * (dust_ratio - 0.1) / 0.4
     else:
         dust_deduction = 0.0
     persist_dim = max(0, persist_dim - dust_deduction)
     persist_dim = round(persist_dim, 1)
-    # 真实性 20 分
+
     avg_hold = stats.get("avg_hold_sec")
-    score_hold = 5.0 if (avg_hold is not None and avg_hold <= 86400) else 0.0  # ≤24h
+    score_hold = 5.0 if (avg_hold is not None and avg_hold <= 86400) else 0.0
     prof_hold = stats.get("profitable_avg_hold_sec")
     loss_hold = stats.get("loss_avg_hold_sec")
     if prof_hold is not None and loss_hold is not None and loss_hold > 0:

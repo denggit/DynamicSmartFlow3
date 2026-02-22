@@ -69,10 +69,12 @@ from config.settings import (
 )
 from src import helius_client
 from src.dexscreener.dex_scanner import DexScanner
-from services.sm_searcher import SmartMoneySearcher, TransactionParser
-from services.sm_searcher_b import SmartMoneySearcherB
+from services.hunter_common import TransactionParser
+from services.modela import SmartMoneySearcher
+from services.modelb import SmartMoneySearcherB
+from services.modela.scoring import compute_hunter_score as compute_hunter_score_modela
+from services.modelb.scoring import compute_hunter_score as compute_hunter_score_modelb
 from utils.logger import get_logger
-from utils.scoring import compute_hunter_score_modela, compute_hunter_score_modelb
 
 logger = get_logger(__name__)
 
