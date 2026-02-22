@@ -29,7 +29,7 @@ from config.settings import (
     get_tier_config, TAKE_PROFIT_LEVELS,
     MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
     SOLANA_PRIVATE_KEY_BASE58,
-    JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, jup_key_pool,
+    JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, SELL_SLIPPAGE_BPS_STOP_LOSS, jup_key_pool,
     TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
     TX_VERIFY_RECONCILIATION_DELAY_SEC, TX_VERIFY_RECONCILIATION_RETRIES,
     TRADER_RPC_TIMEOUT,
@@ -75,7 +75,14 @@ class VirtualShare:
 
 
 class Position:
-    def __init__(self, token_address: str, entry_price: float, decimals: int = 9, lead_hunter_score: float = 0):
+    def __init__(
+        self,
+        token_address: str,
+        entry_price: float,
+        decimals: int = 9,
+        lead_hunter_score: float = 0,
+        entry_liquidity_usd: float = 0.0,
+    ):
         self.token_address = token_address
         self.average_price = entry_price
         self.decimals = decimals
@@ -87,6 +94,7 @@ class Position:
         self.trade_records: List[Dict] = []  # 每笔交易，用于清仓邮件
         self.lead_hunter_score: float = lead_hunter_score  # 跟单猎手分数，用于分档止损/加仓
         self.no_addon: bool = False  # 禁止加仓：流动性/FDV/分数触达减半仓门槛时设为 True
+        self.entry_liquidity_usd: float = entry_liquidity_usd  # 入场时 DexScreener 流动性，用于结构风险兜底
 
 
 class SolanaTrader:
@@ -292,6 +300,70 @@ class SolanaTrader:
         self._save_state_in_background()
         return closed
 
+    async def force_close_position_for_structural_risk(
+        self, token_address: str, reason: str
+    ) -> bool:
+        """
+        结构性风险强制清仓：流动性撤池/净减 30% 等场景。
+        :param token_address: 代币地址
+        :param reason: 清仓原因（用于 trade_records note）
+        :return: 是否成功清仓（含链上已归零的同步）
+        """
+        if not self.keypair:
+            return False
+        pos = self.positions.get(token_address)
+        if not pos or pos.total_tokens <= 0:
+            return True
+        try:
+            chain_bal = await self._fetch_own_token_balance(token_address)
+            sell_amount = chain_bal if chain_bal is not None else pos.total_tokens * SELL_BUFFER
+            if sell_amount is None or sell_amount <= 0:
+                self._sync_zero_and_close_position(token_address, pos)
+                return True
+            decimals = await self._get_decimals(token_address) or pos.decimals
+            tx_sig, sol_received = await self._jupiter_sell_with_retry(
+                input_mint=token_address,
+                output_mint=WSOL_MINT,
+                amount_in_ui=sell_amount,
+                token_decimals=decimals,
+            )
+            if tx_sig:
+                cost = sell_amount * pos.average_price
+                pnl_sol = sol_received - cost
+                pos.trade_records.append({
+                    "ts": time.time(),
+                    "type": "sell",
+                    "sol_spent": 0.0,
+                    "sol_received": sol_received,
+                    "token_amount": sell_amount,
+                    "note": reason,
+                    "pnl_sol": pnl_sol,
+                })
+                if self.on_trade_recorded:
+                    lead = list(pos.shares.keys())[0] if pos.shares else ""
+                    self.on_trade_recorded({
+                        "date": time.strftime("%Y-%m-%d", time.localtime()),
+                        "ts": time.time(),
+                        "token": token_address,
+                        "type": "sell",
+                        "sol_spent": 0.0,
+                        "sol_received": sol_received,
+                        "token_amount": sell_amount,
+                        "price": pos.average_price,
+                        "hunter_addr": lead,
+                        "pnl_sol": pnl_sol,
+                        "note": reason,
+                    })
+                self._emit_position_closed(token_address, pos)
+                del self.positions[token_address]
+                self._save_state_in_background()
+                return True
+            logger.warning("❌ 结构性风险清仓失败: %s (链上余额 %.2f)", token_address[:16] + "..", sell_amount)
+            return False
+        except Exception:
+            logger.exception("结构性风险清仓异常: %s", token_address[:16] + "..")
+            return False
+
     async def emergency_close_positions_by_hunter(self, hunter_addr: str) -> int:
         """
         兜底清仓：体检踢出猎手时，若该猎手正在被跟仓，立即清仓对应持仓。
@@ -372,8 +444,20 @@ class SolanaTrader:
     # 1. 核心交易接口 (逻辑层)
     # ==========================================
 
-    async def execute_entry(self, token_address: str, hunters: List[Dict], total_score: float, current_price_ui: float, halve_position: bool = False):
-        """开仓：只跟单一个猎手，按分数档位决定买入金额。halve_position=True 时买入减半且禁止加仓。"""
+    async def execute_entry(
+        self,
+        token_address: str,
+        hunters: List[Dict],
+        total_score: float,
+        current_price_ui: float,
+        halve_position: bool = False,
+        entry_liquidity_usd: float = 0.0,
+    ):
+        """
+        开仓：只跟单一个猎手，按分数档位决定买入金额。
+        halve_position=True 时买入减半且禁止加仓。
+        entry_liquidity_usd: 入场时 DexScreener 流动性，用于跟仓期结构风险检查（LP 撤池/净减 30% 即清仓）。
+        """
         if not self.keypair: return
         if token_address in self.positions: return
         if not hunters:
@@ -414,8 +498,14 @@ class SolanaTrader:
         else:
             actual_price = current_price_ui
 
-        # 4. 建仓 (传入 decimals, lead_hunter_score)，减半仓时禁止加仓
-        pos = Position(token_address, actual_price, decimals, lead_hunter_score=score)
+        # 4. 建仓 (传入 decimals, lead_hunter_score, entry_liquidity_usd)，减半仓时禁止加仓
+        pos = Position(
+            token_address,
+            actual_price,
+            decimals,
+            lead_hunter_score=score,
+            entry_liquidity_usd=entry_liquidity_usd,
+        )
         pos.no_addon = halve_position
         pos.total_cost_sol = buy_sol
         pos.total_tokens = token_amount_ui
@@ -604,11 +694,15 @@ class SolanaTrader:
         )
 
         if not tx_sig:
-            logger.warning("❌ 跟随卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount_ui)
             chain_after = await self._fetch_own_token_balance(token_address)
             if chain_after is not None and chain_after < 1e-9:
-                logger.info("链上持仓已归零（交易或已成功），同步状态并停止监控")
+                logger.info(
+                    "✅ 链上持仓已归零（交易或已成交，RPC 验证可能超时误判），同步状态并停止监控: %s",
+                    token_address[:16] + "..",
+                )
                 self._sync_zero_and_close_position(token_address, pos)
+            else:
+                logger.warning("❌ 跟随卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount_ui)
             return
 
         cost_this_sell = sell_amount_ui * pos.average_price
@@ -721,14 +815,19 @@ class SolanaTrader:
                 output_mint=WSOL_MINT,
                 amount_in_ui=sell_amount,
                 token_decimals=decimals,
+                slippage_bps_list=[SELL_SLIPPAGE_BPS_STOP_LOSS],
             )
 
             if not tx_sig:
-                logger.warning("❌ 止损卖出失败 (无 tx_sig): %s", token_address)
                 chain_after = await self._fetch_own_token_balance(token_address)
                 if chain_after is not None and chain_after < 1e-9:
-                    logger.info("链上持仓已归零，同步状态并停止监控")
+                    logger.info(
+                        "✅ 链上持仓已归零（交易或已成交，RPC 验证可能超时误判），同步状态并停止监控: %s",
+                        token_address[:16] + "..",
+                    )
                     self._sync_zero_and_close_position(token_address, pos)
+                else:
+                    logger.warning("❌ 止损卖出失败 (无 tx_sig): %s", token_address)
                 self._save_state_in_background()
                 return
 
@@ -794,11 +893,15 @@ class SolanaTrader:
                 )
 
                 if not tx_sig:
-                    logger.warning("❌ 止盈卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount)
                     chain_after = await self._fetch_own_token_balance(token_address)
                     if chain_after is not None and chain_after < 1e-9:
-                        logger.info("链上持仓已归零，同步状态并停止监控")
+                        logger.info(
+                            "✅ 链上持仓已归零（交易或已成交，RPC 验证可能超时误判），同步状态并停止监控: %s",
+                            token_address[:16] + "..",
+                        )
                         self._sync_zero_and_close_position(token_address, pos)
+                    else:
+                        logger.warning("❌ 止盈卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount)
                     self._save_state_in_background()
                     return
 
@@ -841,14 +944,19 @@ class SolanaTrader:
                 self._save_state_in_background()
 
     async def _jupiter_sell_with_retry(
-        self, input_mint: str, output_mint: str, amount_in_ui: float, token_decimals: int = 9
+        self,
+        input_mint: str,
+        output_mint: str,
+        amount_in_ui: float,
+        token_decimals: int = 9,
+        slippage_bps_list: Optional[List[int]] = None,
     ) -> Tuple[Optional[str], float]:
         """
-        卖出专用：按 SELL_SLIPPAGE_BPS_RETRIES 依次尝试，滑点递增直至成功或耗尽。
-        卖出失败（滑点不足等）时优先重试而非直接放弃。
+        卖出专用：按 slippage_bps_list 依次尝试，滑点递增直至成功或耗尽。
+        默认用 SELL_SLIPPAGE_BPS_RETRIES；止损时可传入 [SELL_SLIPPAGE_BPS_STOP_LOSS] 用 20% 滑点。
         重试前检查链上余额，避免前次交易已成功但验证超时导致重复卖出（6024 超卖错误）。
         """
-        slippage_list = SELL_SLIPPAGE_BPS_RETRIES if SELL_SLIPPAGE_BPS_RETRIES else [SLIPPAGE_BPS]
+        slippage_list = slippage_bps_list or SELL_SLIPPAGE_BPS_RETRIES or [SLIPPAGE_BPS]
         current_amount = amount_in_ui
         for i, bps in enumerate(slippage_list):
             if current_amount <= 0:
@@ -1217,6 +1325,7 @@ class SolanaTrader:
             "total_cost_sol": pos.total_cost_sol,
             "lead_hunter_score": pos.lead_hunter_score,
             "no_addon": getattr(pos, "no_addon", False),
+            "entry_liquidity_usd": getattr(pos, "entry_liquidity_usd", 0.0),
             "tp_hit_levels": list(pos.tp_hit_levels),
             "shares": {
                 addr: {"hunter": s.hunter, "score": s.score, "token_amount": s.token_amount}
@@ -1232,6 +1341,8 @@ class SolanaTrader:
             d["token_address"],
             float(d.get("average_price", 0)),
             decimals,
+            lead_hunter_score=float(d.get("lead_hunter_score", 0)),
+            entry_liquidity_usd=float(d.get("entry_liquidity_usd", 0)),
         )
         pos.entry_time = float(d.get("entry_time", 0))
         pos.total_tokens = float(d.get("total_tokens", 0))

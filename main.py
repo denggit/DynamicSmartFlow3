@@ -24,6 +24,10 @@ from config.settings import (
     DATA_MODELB_DIR,
     CLOSED_PNL_PATH,
     PNL_LOOP_RATE_LIMIT_SLEEP_SEC,
+    LIQUIDITY_STRUCTURAL_CHECK_INTERVAL_SEC,
+    LIQUIDITY_COLLAPSE_THRESHOLD_USD,
+    LIQUIDITY_DROP_RATIO,
+    LIQUIDITY_CHECK_DEXSCREENER_INTERVAL_SEC,
 )
 from config.paths import DATA_ACTIVE_DIR
 from utils.logger import get_logger, LOGS_ROOT
@@ -141,8 +145,14 @@ async def _on_monitor_signal_impl(signal, sm_searcher=None):
         logger.error("无法获取 %s 价格或价格为 0，取消开仓", token)
         return
 
+    # 2.5 入场流动性（用于跟仓期结构风险：LP 撤池/净减 30% 即清仓）
+    _, entry_liq_usd, _ = await risk_control.check_token_liquidity(token)
+
     # 3. 开仓（halve 时减半仓且禁止加仓）
-    await trader.execute_entry(token, hunters, total_score, price, halve_position=halve)
+    await trader.execute_entry(
+        token, hunters, total_score, price, halve_position=halve,
+        entry_liquidity_usd=entry_liq_usd,
+    )
     pos = trader.positions.get(token)
     if not pos:
         return
@@ -233,6 +243,71 @@ async def pnl_monitor_loop():
         except Exception:
             logger.exception("PnL Loop Error")
         await asyncio.sleep(PNL_CHECK_INTERVAL)
+
+
+# =========================================
+# 后台任务：流动性结构风险检查（买入后 LP 撤池/净减 30% 即清仓）
+# =========================================
+
+async def liquidity_structural_check_loop():
+    """
+    每 60 分钟调用 DexScreener 查持仓代币流动性。
+    若流动性 < 100U（REMOVE LIQUIDITY 等价）或 当前 < 入场×0.7（LP 净减 30%），立即清仓。
+    兜底买前风险放任的一种手段。
+    """
+    logger.info(
+        "🛡️ 启动流动性结构风险监控（每 %d 分钟）...",
+        LIQUIDITY_STRUCTURAL_CHECK_INTERVAL_SEC // 60,
+    )
+    while True:
+        try:
+            await asyncio.sleep(LIQUIDITY_STRUCTURAL_CHECK_INTERVAL_SEC)
+            active = trader.get_active_tokens()
+            if not active:
+                continue
+            dex_interval = max(1.0, LIQUIDITY_CHECK_DEXSCREENER_INTERVAL_SEC)
+            for token in active:
+                pos = trader.positions.get(token)
+                if not pos or pos.total_tokens <= 0:
+                    continue
+                _, curr_liq_usd, _ = await risk_control.check_token_liquidity(token)
+                entry_liq = getattr(pos, "entry_liquidity_usd", 0.0)
+
+                # 条件1：流动性崩塌（REMOVE LIQUIDITY 等价）
+                if curr_liq_usd < LIQUIDITY_COLLAPSE_THRESHOLD_USD:
+                    logger.warning(
+                        "🛑 [结构风险] %s 流动性崩塌 ($%.0f < $%.0f)，触发清仓",
+                        token[:16] + "..", curr_liq_usd, LIQUIDITY_COLLAPSE_THRESHOLD_USD,
+                    )
+                    ok = await trader.force_close_position_for_structural_risk(
+                        token, "流动性结构风险(REMOVE_LIQUIDITY)"
+                    )
+                    if ok and token not in trader.positions:
+                        await trader.ensure_fully_closed(token)
+                        await agent.stop_tracking(token)
+                    await asyncio.sleep(dex_interval)
+                    continue
+
+                # 条件2：LP 净减少 30%
+                if entry_liq > 0 and curr_liq_usd < entry_liq * LIQUIDITY_DROP_RATIO:
+                    logger.warning(
+                        "🛑 [结构风险] %s 流动性净减 %.0f%% (入场 $%.0f -> 当前 $%.0f)，触发清仓",
+                        token[:16] + "..",
+                        (1 - curr_liq_usd / entry_liq) * 100,
+                        entry_liq,
+                        curr_liq_usd,
+                    )
+                    ok = await trader.force_close_position_for_structural_risk(
+                        token, "流动性结构风险(LP净减30%+)"
+                    )
+                    if ok and token not in trader.positions:
+                        await trader.ensure_fully_closed(token)
+                        await agent.stop_tracking(token)
+                # 每查完一个代币后间隔，避免 DexScreener 请求过密被管控
+                await asyncio.sleep(dex_interval)
+        except Exception:
+            logger.exception("流动性结构风险检查异常")
+        # 循环末尾无 sleep，因开头已 sleep 60 分钟
 
 
 # =========================================
@@ -453,6 +528,7 @@ async def main(immediate_audit: bool = False):
         monitor.start(),
         agent.start(),
         pnl_monitor_loop(),
+        liquidity_structural_check_loop(),
         daily_report_loop(),
     )
 
