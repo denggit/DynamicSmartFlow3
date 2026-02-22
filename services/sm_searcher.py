@@ -32,6 +32,7 @@ from config.settings import (
     SM_EARLY_TX_PARSE_LIMIT,
     SM_USE_ATA_FIRST,
     SM_ATA_SIG_LIMIT,
+    SM_LP_CHECK_TX_LIMIT,
     RECENT_TX_COUNT_FOR_FREQUENCY,
     MIN_SUCCESSFUL_TX_FOR_FREQUENCY,
     MAX_FAILURE_RATE_FOR_FREQUENCY,
@@ -99,16 +100,21 @@ def _get_tx_timestamp(tx: dict) -> float:
 
 def tx_is_remove_liquidity(tx: dict) -> bool:
     """
-    判断该笔交易是否为 REMOVE LIQUIDITY（移除流动性）。
-    Helius 解析交易在 description 或 type 中标注此类操作。
+    判断该笔交易是否为移除流动性（REMOVE/WITHDRAW LIQUIDITY）。
+    Helius 官方用 WITHDRAW_LIQUIDITY，部分 DEX 可能用 REMOVE 表述。
     老鼠仓：LP 先加流动性，代币拉盘后移除流动性砸盘，散户接盘。
     """
     desc = (tx.get("description") or "").upper()
     tx_type = (tx.get("type") or "").upper()
-    # 兼容 Helius 常见格式：description 含 "REMOVE LIQUIDITY" / "Remove Liquidity"
     if "REMOVE" in desc and "LIQUIDITY" in desc:
         return True
-    if tx_type in ("REMOVE_LIQUIDITY", "REMOVE LIQUIDITY"):
+    if "WITHDRAW" in desc and "LIQUIDITY" in desc:
+        return True
+    if tx_type in (
+        "REMOVE_LIQUIDITY", "REMOVE LIQUIDITY",
+        "WITHDRAW_LIQUIDITY", "WITHDRAW LIQUIDITY",  # Helius 官方格式
+        "REMOVE_FROM_POOL",
+    ):
         return True
     return False
 
@@ -116,14 +122,33 @@ def tx_is_remove_liquidity(tx: dict) -> bool:
 def tx_is_any_lp_behavior(tx: dict) -> bool:
     """
     判断该笔交易是否包含任何 LP 行为（加池/撤池等）。
-    只要涉及 ADD LIQUIDITY 或 REMOVE LIQUIDITY 即视为 LP 参与，直接淘汰该猎手。
+    只要涉及 ADD/REMOVE/WITHDRAW LIQUIDITY 或 POOL 操作即视为 LP 参与，直接淘汰该猎手。
+    Helius 官方用 WITHDRAW_LIQUIDITY；Pump.fun 等可能用 DEPOSIT/WITHDRAW+POOL。
     """
     desc = (tx.get("description") or "").upper()
     tx_type = (tx.get("type") or "").upper()
-    if "LIQUIDITY" in desc:
+    if "LIQUIDITY" in desc or ("POOL" in desc and ("ADD" in desc or "REMOVE" in desc or "WITHDRAW" in desc or "DEPOSIT" in desc)):
         return True
-    if tx_type in ("ADD_LIQUIDITY", "ADD LIQUIDITY", "REMOVE_LIQUIDITY", "REMOVE LIQUIDITY"):
+    if tx_type in (
+        "ADD_LIQUIDITY", "ADD LIQUIDITY",
+        "REMOVE_LIQUIDITY", "REMOVE LIQUIDITY",
+        "WITHDRAW_LIQUIDITY", "WITHDRAW LIQUIDITY",  # Helius 官方
+        "ADD_TO_POOL", "REMOVE_FROM_POOL",
+    ):
         return True
+    if tx_type in ("DEPOSIT", "WITHDRAW") and "POOL" in desc:
+        return True  # Pump.fun 等 AMM 的池子操作
+    return False
+
+
+def hunter_had_any_lp_anywhere(txs: list) -> bool:
+    """
+    检查交易列表中是否存在任何 LP 行为（加池/撤池），不限定代币。
+    做过 LP 的钱包视为做市商/项目方，一律拉黑。
+    """
+    for tx in (txs or []):
+        if tx_is_any_lp_behavior(tx):
+            return True
     return False
 
 
@@ -166,6 +191,27 @@ def hunter_had_remove_liquidity_on_token(
             if tt.get("fromUserAccount") == hunter_address or tt.get("toUserAccount") == hunter_address:
                 return True
     return False
+
+
+def collect_lp_participants_from_txs(txs: list) -> set:
+    """
+    从交易列表中收集所有 LP 行为（加池/撤池）的参与者地址。
+    用于初筛阶段：代币早期交易中若有 ADD/REMOVE LIQUIDITY，参与者一律不得作为猎手候选人。
+    返回参与过 LP 操作的地址集合（主钱包，非 ATA）。
+    """
+    participants = set()
+    for tx in (txs or []):
+        if not tx_is_any_lp_behavior(tx):
+            continue
+        for nt in tx.get("nativeTransfers", []):
+            addr = nt.get("fromUserAccount") or nt.get("toUserAccount")
+            if addr:
+                participants.add(addr)
+        for tt in tx.get("tokenTransfers", []):
+            addr = tt.get("fromUserAccount") or tt.get("toUserAccount")
+            if addr:
+                participants.add(addr)
+    return participants
 
 
 def _is_frequent_trader_by_blocktimes(
@@ -426,6 +472,26 @@ class SmartMoneySearcher:
                 logger.debug("解析单笔交易跳过", exc_info=True)
         return projects
 
+    async def check_hunter_has_lp_and_blacklist(
+        self, client, hunter_address: str, txs: List[dict] | None = None
+    ) -> bool:
+        """
+        检查猎手是否有任意 LP 行为；有则加入黑名单并返回 True。
+        体检时调用，发现即踢出并拉黑。
+        """
+        if txs is None:
+            sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
+            if not sigs:
+                return False
+            txs = await self.fetch_parsed_transactions(client, sigs)
+        if not txs:
+            return False
+        if hunter_had_any_lp_anywhere(txs):
+            logger.warning("⚠️ 体检发现 LP 行为: %s.. 已加入黑名单并踢出", hunter_address[:12])
+            self._add_to_wallet_blacklist(hunter_address)
+            return True
+        return False
+
     async def analyze_hunter_performance(
         self, client, hunter_address, exclude_token=None, pre_fetched_txs: List[dict] | None = None
     ):
@@ -449,6 +515,11 @@ class SmartMoneySearcher:
                 return None
         if not txs:
             return None
+
+        if hunter_had_any_lp_anywhere(txs):
+            logger.warning("⚠️ 体检发现 LP 行为: %s.. 已加入黑名单", hunter_address[:12])
+            self._add_to_wallet_blacklist(hunter_address)
+            return {"_lp_detected": True}
 
         usdc_price = await self._get_usdc_price_sol(client) if client else None
         projects = self._build_projects_from_txs(txs, exclude_token, usdc_price, hunter_address)
@@ -549,9 +620,33 @@ class SmartMoneySearcher:
         """
         计算猎手在该代币上的收益率 (ROI %)，已清仓用卖出收益算，未清仓用现价估算。
         返回 (ROI 百分比, 交易列表)，若无法计算返回 (None, None)。
-        ATA 优先模式 (SM_USE_ATA_FIRST)：先用 ATA 拉 2~50 笔算 ROI（~100 credits），
-        达标后再拉主钱包 300 笔供体检；不达标直接返回，省约 200 credits/人。
+        【LP 检测优先】第一步必须拉主钱包 SM_LP_CHECK_TX_LIMIT 笔做 LP 预检，有任意 LP 行为（加池/撤池）
+        即拉黑淘汰，永不跟仓。通过后再进行 ROI 计算。
+        ATA 优先模式 (SM_USE_ATA_FIRST)：LP 通过后用 ATA 拉 2~50 笔算 ROI，
+        达标后再拉主钱包 300 笔供体检。
         """
+        # 1. LP 检测优先：主钱包任意 LP 行为（加池/撤池）一律拉黑，直接淘汰
+        sigs_lp = await self.get_signatures(client, hunter_address, limit=SM_LP_CHECK_TX_LIMIT)
+        txs_main_wallet = None  # 复用给主钱包模式 / ATA 达标后的 analyze，避免重复拉取
+        if sigs_lp:
+            txs_lp = await self.fetch_parsed_transactions(client, sigs_lp)
+            if txs_lp:
+                if hunter_had_any_lp_anywhere(txs_lp):
+                    logger.warning(
+                        "⚠️ LP 淘汰(主钱包/%d笔): %s.. 曾做过 LP（加池/撤池），已拉黑，永不跟仓",
+                        SM_LP_CHECK_TX_LIMIT, hunter_address[:12],
+                    )
+                    self._add_to_wallet_blacklist(hunter_address)
+                    return None, None
+                if hunter_had_any_lp_on_token(txs_lp, hunter_address, token_address, ata_address=None):
+                    logger.warning(
+                        "⚠️ LP 淘汰(主钱包/该代币/%d笔): %s.. 曾对该代币 LP 操作，已拉黑，永不跟仓",
+                        SM_LP_CHECK_TX_LIMIT, hunter_address[:12],
+                    )
+                    self._add_to_wallet_blacklist(hunter_address)
+                    return None, None
+                txs_main_wallet = txs_lp  # 通过 LP 检测，复用给后续逻辑
+
         usdc_price = await self._get_usdc_price_sol(client)
         parser = TransactionParser(hunter_address)
         calc = TokenAttributionCalculator()
@@ -575,10 +670,7 @@ class SmartMoneySearcher:
             if ata_sigs:
                 txs_ata = await self.fetch_parsed_transactions(client, ata_sigs)
                 if txs_ata:
-                    if hunter_had_any_lp_on_token(txs_ata, hunter_address, token_address, ata_address=ata_used):
-                        logger.warning("⚠️ LP 行为淘汰(ATA): %s.. 已加入黑名单", hunter_address[:12])
-                        self._add_to_wallet_blacklist(hunter_address)
-                        return None, None
+                    # LP 已在函数入口主钱包 500 笔预检中完成，此处仅做 ROI 计算
                     buy_sol, sell_sol, tokens_held = 0.0, 0.0, 0.0
                     for tx in sorted(txs_ata, key=lambda x: _get_tx_timestamp(x)):
                         try:
@@ -601,36 +693,36 @@ class SmartMoneySearcher:
                     roi_ata = (total_value - buy_sol) / buy_sol * 100
                     if roi_ata < SM_MIN_TOKEN_PROFIT_PCT:
                         return None, None  # 省约 200 credits
-                    # ROI 达标，拉主钱包供 analyze 复用
+                    # ROI 达标，复用 LP 预检已拉取的主钱包交易（取前 audit_tx_limit 笔供 analyze）
+                    if txs_main_wallet:
+                        if _is_frequent_trader_by_blocktimes(sigs_lp if sigs_lp else []):
+                            return None, None
+                        txs_main = txs_main_wallet[: self.audit_tx_limit]
+                        return roi_ata, txs_main if txs_main else None
                     sigs_main = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
                     if not sigs_main or _is_frequent_trader_by_blocktimes(sigs_main):
                         return None, None
                     txs_main = await self.fetch_parsed_transactions(client, sigs_main)
                     if not txs_main:
                         return None, None
-                    if hunter_had_any_lp_on_token(txs_main, hunter_address, token_address, ata_address=None):
-                        logger.warning("⚠️ LP 行为淘汰: %s.. 主钱包含 LP，已加入黑名单", hunter_address[:12])
-                        self._add_to_wallet_blacklist(hunter_address)
-                        return None, None
                     return roi_ata, txs_main
 
-        # 主钱包模式（原逻辑 / ATA 空时 fallback）
-        sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
-        if not sigs:
-            return None, None
-        if _is_frequent_trader_by_blocktimes(sigs):
-            logger.debug("⏭️ 频率淘汰(blockTime预检) %s.. 省 Helius 解析", hunter_address[:12])
-            return None, None
-        txs = await self.fetch_parsed_transactions(client, sigs)
-        if not txs:
-            return None, None
-        if hunter_had_any_lp_on_token(txs, hunter_address, token_address, ata_address=None):
-            logger.warning(
-                "⚠️ LP 行为淘汰: %s.. 曾对该代币有 LP 操作（加池/撤池），已加入黑名单，永不跟仓",
-                hunter_address[:12],
-            )
-            self._add_to_wallet_blacklist(hunter_address)
-            return None, None
+        # 主钱包模式（原逻辑 / ATA 空时 fallback）：复用 LP 预检已拉取数据
+        if txs_main_wallet:
+            if _is_frequent_trader_by_blocktimes(sigs_lp if sigs_lp else []):
+                logger.debug("⏭️ 频率淘汰(blockTime预检) %s.. 省 Helius 解析", hunter_address[:12])
+                return None, None
+            txs = txs_main_wallet
+        else:
+            sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
+            if not sigs:
+                return None, None
+            if _is_frequent_trader_by_blocktimes(sigs):
+                logger.debug("⏭️ 频率淘汰(blockTime预检) %s.. 省 Helius 解析", hunter_address[:12])
+                return None, None
+            txs = await self.fetch_parsed_transactions(client, sigs)
+            if not txs:
+                return None, None
         buy_sol, sell_sol, tokens_held = 0.0, 0.0, 0.0
         for tx in sorted(txs, key=lambda x: _get_tx_timestamp(x)):
             try:
@@ -752,6 +844,11 @@ class SmartMoneySearcher:
             target_txs = found_early_txs[:SM_EARLY_TX_PARSE_LIMIT]
             txs = await self.fetch_parsed_transactions(client, target_txs)
 
+            # 3.1 LP 检测（初筛）：任何有 LP 行为（加池/撤池）的地址一律排除，不参与猎手挖掘
+            lp_participants = collect_lp_participants_from_txs(txs)
+            if lp_participants:
+                logger.info(f"  [LP 初筛] 代币早期交易中发现 {len(lp_participants)} 个 LP 参与者，已排除")
+
             hunters_candidates = []
             seen_buyers = set()
             usdc_price = await self._get_usdc_price_sol(client)
@@ -785,6 +882,8 @@ class SmartMoneySearcher:
                 spend_sol = spend_by_addr[spender]
                 if spender in seen_buyers:
                     continue
+                if spender in lp_participants:
+                    continue  # LP 参与者（加池/撤池）绝不入库
                 if SM_MIN_BUY_SOL <= spend_sol <= SM_MAX_BUY_SOL:
                     seen_buyers.add(spender)
                     hunters_candidates.append({"address": spender, "entry_delay": delay, "cost": spend_sol})

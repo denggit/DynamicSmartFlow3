@@ -656,6 +656,12 @@ class HunterMonitorController:
                     new_stats = await self.sm_searcher.analyze_hunter_performance(client, addr)
                     if new_stats is None:
                         continue
+                    if new_stats.get("_lp_detected"):
+                        if addr in self.storage.hunters:
+                            del self.storage.hunters[addr]
+                            removed += 1
+                        logger.info("🚫 剔除 %s.. (体检发现 LP 行为，已拉黑)", addr[:12])
+                        continue
                     pnl_ok = new_stats.get("pnl_ratio", 0) >= SM_AUDIT_MIN_PNL_RATIO
                     wr_ok = new_stats["win_rate"] >= SM_AUDIT_MIN_WIN_RATE
                     profit_ok = new_stats["total_profit"] > 0
@@ -724,7 +730,12 @@ class HunterMonitorController:
 
                             # 重新跑一遍分析
                             new_stats = await self.sm_searcher.analyze_hunter_performance(client, addr)
-                            if new_stats:
+                            if new_stats and new_stats.get("_lp_detected"):
+                                if addr in self.storage.hunters:
+                                    del self.storage.hunters[addr]
+                                    audit_removed.append(addr)
+                                logger.info("🚫 体检踢出 %s.. (发现 LP 行为，已拉黑)", addr[:12])
+                            elif new_stats:
                                 pnl_ok = new_stats.get("pnl_ratio", 0) >= SM_AUDIT_MIN_PNL_RATIO
                                 wr_ok = new_stats["win_rate"] >= SM_AUDIT_MIN_WIN_RATE
                                 profit_ok = new_stats["total_profit"] > 0

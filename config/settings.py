@@ -206,7 +206,7 @@ SM_MIN_DELAY_SEC = 60  # 初筛：开盘后至少 30 秒买入才计入
 SM_MAX_DELAY_SEC = 10800  # 3 小时内买入都算
 SM_MIN_TOKEN_PROFIT_PCT = 50.0  # 入库门槛：该代币当下至少赚 50% 才能入池；≥200%×1，100%~200%×0.9；体检时 30 天内若掉到 <50% 则踢出
 SM_AUDIT_TX_LIMIT = 300  # 体检时拉取交易笔数
-SM_LP_CHECK_TX_LIMIT = 100  # LP 预检 + 频率检测：先拉 100 笔查 LP 行为（加池/撤池）及频率，有则直接淘汰，通过后再拉满 500
+SM_LP_CHECK_TX_LIMIT = 100  # LP 检测专用：拉主钱包 100 笔查任意 LP 行为（加池/撤池），有则拉黑淘汰。必须优先于 ROI 计算执行。
 SM_EARLY_TX_PARSE_LIMIT = 300  # 初筛：最多解析多少笔早期交易（按时间取前 N 笔）
 SM_USE_ATA_FIRST = os.getenv("SM_USE_ATA_FIRST", "true").lower() in ("1", "true", "yes")  # 先用 ATA 算 ROI，达标再拉主钱包，省 Helius
 SM_ATA_SIG_LIMIT = 50  # ATA 模式最多拉签名数（通常 2~20 笔，1 次 POST=100 credits）
