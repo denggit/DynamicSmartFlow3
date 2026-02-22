@@ -286,8 +286,8 @@ async def test_rugcheck():
     try:
         from src.rugcheck.risk_control import check_is_safe_token
 
-        # JUP 为已知安全代币，RugCheck 应有收录
-        ok = await check_is_safe_token("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN")
+        # JUP 为已知安全代币，RugCheck 应有收录；返回 (can_buy, halve_position)
+        can_buy, _ = await check_is_safe_token("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN")
         logger.info("✅ RugCheck API 正常（JUP 风控检测完成）")
         return True
     except Exception as e:

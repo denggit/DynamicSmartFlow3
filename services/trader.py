@@ -86,6 +86,7 @@ class Position:
         self.entry_time: float = 0.0  # 首次开仓时间，用于邮件
         self.trade_records: List[Dict] = []  # 每笔交易，用于清仓邮件
         self.lead_hunter_score: float = lead_hunter_score  # 跟单猎手分数，用于分档止损/加仓
+        self.no_addon: bool = False  # 禁止加仓：流动性/FDV/分数触达减半仓门槛时设为 True
 
 
 class SolanaTrader:
@@ -371,8 +372,8 @@ class SolanaTrader:
     # 1. 核心交易接口 (逻辑层)
     # ==========================================
 
-    async def execute_entry(self, token_address: str, hunters: List[Dict], total_score: float, current_price_ui: float):
-        """开仓：只跟单一个猎手，按分数档位决定买入金额。"""
+    async def execute_entry(self, token_address: str, hunters: List[Dict], total_score: float, current_price_ui: float, halve_position: bool = False):
+        """开仓：只跟单一个猎手，按分数档位决定买入金额。halve_position=True 时买入减半且禁止加仓。"""
         if not self.keypair: return
         if token_address in self.positions: return
         if not hunters:
@@ -388,6 +389,9 @@ class SolanaTrader:
             decimals = 9
 
         buy_sol = tier["entry_sol"]
+        if halve_position:
+            buy_sol *= 0.5
+            logger.info("📉 风控减半仓: 计划买入 %.3f SOL（原 %.3f SOL）", buy_sol, tier["entry_sol"])
 
         logger.info(f"🚀 [准备开仓] {token_address} | 计划: {buy_sol:.3f} SOL")
 
@@ -410,8 +414,9 @@ class SolanaTrader:
         else:
             actual_price = current_price_ui
 
-        # 4. 建仓 (传入 decimals, lead_hunter_score)
+        # 4. 建仓 (传入 decimals, lead_hunter_score)，减半仓时禁止加仓
         pos = Position(token_address, actual_price, decimals, lead_hunter_score=score)
+        pos.no_addon = halve_position
         pos.total_cost_sol = buy_sol
         pos.total_tokens = token_amount_ui
         pos.entry_time = time.time()
@@ -1208,6 +1213,7 @@ class SolanaTrader:
             "total_tokens": pos.total_tokens,
             "total_cost_sol": pos.total_cost_sol,
             "lead_hunter_score": pos.lead_hunter_score,
+            "no_addon": getattr(pos, "no_addon", False),
             "tp_hit_levels": list(pos.tp_hit_levels),
             "shares": {
                 addr: {"hunter": s.hunter, "score": s.score, "token_amount": s.token_amount}
@@ -1228,6 +1234,7 @@ class SolanaTrader:
         pos.total_tokens = float(d.get("total_tokens", 0))
         pos.total_cost_sol = float(d.get("total_cost_sol", 0))
         pos.lead_hunter_score = float(d.get("lead_hunter_score", 0))
+        pos.no_addon = bool(d.get("no_addon", False))
         pos.tp_hit_levels = set(float(x) for x in d.get("tp_hit_levels", []))
         for addr, s in (d.get("shares") or {}).items():
             pos.shares[addr] = VirtualShare(

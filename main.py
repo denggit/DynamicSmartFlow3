@@ -129,8 +129,9 @@ async def _on_monitor_signal_impl(signal, sm_searcher=None):
         return
     total_score = signal["total_score"]
 
-    # 1. 风控：避免貔貅/不能卖/高税
-    if not await risk_control.check_is_safe_token(token):
+    # 1. 风控：避免貔貅/不能卖/高税；(can_buy, halve_position)
+    can_buy, halve = await risk_control.check_is_safe_token(token)
+    if not can_buy:
         logger.warning("风控未通过，跳过开仓: %s", token)
         return
 
@@ -140,8 +141,8 @@ async def _on_monitor_signal_impl(signal, sm_searcher=None):
         logger.error("无法获取 %s 价格或价格为 0，取消开仓", token)
         return
 
-    # 3. 开仓
-    await trader.execute_entry(token, hunters, total_score, price)
+    # 3. 开仓（halve 时减半仓且禁止加仓）
+    await trader.execute_entry(token, hunters, total_score, price, halve_position=halve)
     pos = trader.positions.get(token)
     if not pos:
         return
@@ -190,6 +191,10 @@ async def _on_agent_signal_impl(signal):
     elif msg_type == "HUNTER_BUY":
         pos = trader.positions.get(token)
         if not pos:
+            return
+        # 减半仓开仓的持仓不允许加仓（流动性/FDV/分数触达风控减半门槛）
+        if getattr(pos, "no_addon", False):
+            logger.info("🚫 加仓跳过: %s 为减半仓持仓，禁止加仓", token[:8])
             return
         # 首买追高限制：入场后已涨 300% 则不加仓
         if pos.average_price > 0 and price >= pos.average_price * MAX_ENTRY_PUMP_MULTIPLIER:

@@ -146,6 +146,7 @@ from config.hunter import (
 from config.risk import (
     MAX_ACCEPTABLE_BUY_TAX_PCT,
     MAX_SAFE_SCORE,
+    MIN_LIQUIDITY_REJECT,
     MIN_LIQUIDITY_USD,
     MIN_LP_LOCKED_PCT,
     MAX_TOP2_10_COMBINED_PCT,
