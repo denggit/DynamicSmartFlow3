@@ -500,12 +500,13 @@ class SolanaTrader:
             # 查余额失败，兜底 99.9%
             sell_amount_ui = min(sell_amount_ui, share.token_amount * SELL_BUFFER)
         if sell_amount_ui <= 0:
-            logger.warning("链上无持仓或余额为 0，跳过卖出")
+            logger.warning("链上无持仓或余额为 0，同步状态并停止监控")
+            self._sync_zero_and_close_position(token_address, pos)
             return
 
         logger.info(f"📉 [准备卖出] {token_address} | 数量: {sell_amount_ui:.2f}")
 
-        # === 真实卖出（失败时按 2%/5%/10% 滑点递增重试）===
+        # === 真实卖出（失败时按 2%/5%/10% 滑点递增重试，重试前会检查链上余额）===
         tx_sig, sol_got_ui = await self._jupiter_sell_with_retry(
             input_mint=token_address,
             output_mint=WSOL_MINT,
@@ -515,6 +516,10 @@ class SolanaTrader:
 
         if not tx_sig:
             logger.warning("❌ 跟随卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount_ui)
+            chain_after = await self._fetch_own_token_balance(token_address)
+            if chain_after is not None and chain_after < 1e-9:
+                logger.info("链上持仓已归零（交易或已成功），同步状态并停止监控")
+                self._sync_zero_and_close_position(token_address, pos)
             return
 
         cost_this_sell = sell_amount_ui * pos.average_price
@@ -631,6 +636,10 @@ class SolanaTrader:
 
             if not tx_sig:
                 logger.warning("❌ 止损卖出失败 (无 tx_sig): %s", token_address)
+                chain_after = await self._fetch_own_token_balance(token_address)
+                if chain_after is not None and chain_after < 1e-9:
+                    logger.info("链上持仓已归零，同步状态并停止监控")
+                    self._sync_zero_and_close_position(token_address, pos)
 
             if tx_sig:
                 cost_this_sell = sell_amount * pos.average_price
@@ -668,6 +677,10 @@ class SolanaTrader:
         for level, sell_pct in TAKE_PROFIT_LEVELS:
             if pnl_pct >= level and level not in pos.tp_hit_levels:
                 sell_amount = pos.total_tokens * sell_pct
+                remaining_after = pos.total_tokens * (1.0 - sell_pct)
+                if (remaining_after * current_price_ui) < MIN_SHARE_VALUE_SOL:
+                    sell_amount = pos.total_tokens
+                    logger.info("剩余价值不足 %.4f SOL，直接全仓止盈", MIN_SHARE_VALUE_SOL)
                 chain_bal = await self._fetch_own_token_balance(token_address)
                 if chain_bal is not None:
                     sell_amount = min(sell_amount, chain_bal)
@@ -691,18 +704,25 @@ class SolanaTrader:
 
                 if not tx_sig:
                     logger.warning("❌ 止盈卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount)
+                    chain_after = await self._fetch_own_token_balance(token_address)
+                    if chain_after is not None and chain_after < 1e-9:
+                        logger.info("链上持仓已归零，同步状态并停止监控")
+                        self._sync_zero_and_close_position(token_address, pos)
+                    self._save_state_in_background()
+                    return
 
                 if tx_sig:
                     cost_this_sell = sell_amount * pos.average_price
                     pnl_sol = sol_received - cost_this_sell
                     ts_now = time.time()
+                    sell_pct_actual = sell_amount / pos.total_tokens if pos.total_tokens > 0 else 1.0
                     pos.trade_records.append({
                         "ts": ts_now,
                         "type": "sell",
                         "sol_spent": 0.0,
                         "sol_received": sol_received,
                         "token_amount": sell_amount,
-                        "note": f"止盈{sell_pct * 100:.0f}%",
+                        "note": f"止盈{sell_pct_actual * 100:.0f}%",
                         "pnl_sol": pnl_sol,
                     })
                     if self.on_trade_recorded:
@@ -718,10 +738,10 @@ class SolanaTrader:
                             "price": pos.average_price,
                             "hunter_addr": lead,
                             "pnl_sol": pnl_sol,
-                            "note": f"止盈{sell_pct * 100:.0f}%",
+                            "note": f"止盈{sell_pct_actual * 100:.0f}%",
                         })
                     for share in pos.shares.values():
-                        share.token_amount *= (1.0 - sell_pct)
+                        share.token_amount *= (1.0 - sell_pct_actual)
                     pos.total_tokens -= sell_amount
                     pos.tp_hit_levels.add(level)
                     if pos.total_tokens <= 0:
@@ -735,13 +755,18 @@ class SolanaTrader:
         """
         卖出专用：按 SELL_SLIPPAGE_BPS_RETRIES 依次尝试，滑点递增直至成功或耗尽。
         卖出失败（滑点不足等）时优先重试而非直接放弃。
+        重试前检查链上余额，避免前次交易已成功但验证超时导致重复卖出（6024 超卖错误）。
         """
         slippage_list = SELL_SLIPPAGE_BPS_RETRIES if SELL_SLIPPAGE_BPS_RETRIES else [SLIPPAGE_BPS]
+        current_amount = amount_in_ui
         for i, bps in enumerate(slippage_list):
+            if current_amount <= 0:
+                logger.info("链上持仓已为 0，无需继续卖出重试")
+                return None, 0.0
             tx_sig, sol_out = await self._jupiter_swap(
                 input_mint=input_mint,
                 output_mint=output_mint,
-                amount_in_ui=amount_in_ui,
+                amount_in_ui=current_amount,
                 slippage_bps=bps,
                 is_sell=True,
                 token_decimals=token_decimals,
@@ -751,7 +776,18 @@ class SolanaTrader:
                     logger.info("✅ 卖出成功 (滑点 %.1f%%)", bps / 100)
                 return tx_sig, sol_out
             if i < len(slippage_list) - 1:
-                logger.warning("❌ 卖出失败，尝试下一档滑点 %.1f%%", slippage_list[i + 1] / 100)
+                chain_bal = await self._fetch_own_token_balance(input_mint)
+                if chain_bal is not None:
+                    current_amount = min(current_amount, chain_bal)
+                    if chain_bal < 1e-9:
+                        logger.info("链上持仓已归零（前次卖出或已成功），停止重试")
+                        return None, 0.0
+                    logger.warning(
+                        "❌ 卖出失败，按链上余额 %.2f 重试下一档滑点 %.1f%%",
+                        current_amount, slippage_list[i + 1] / 100,
+                    )
+                else:
+                    logger.warning("❌ 卖出失败，尝试下一档滑点 %.1f%% (无法查链上余额)", slippage_list[i + 1] / 100)
         return None, 0.0
 
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
@@ -1045,6 +1081,18 @@ class SolanaTrader:
                 ratio = h.get('score', 0) / total_score
                 new_shares[h['address']] = VirtualShare(h['address'], h.get('score', 0), total_tokens * ratio)
         pos.shares = new_shares
+
+    def _sync_zero_and_close_position(self, token_address: str, pos: Position) -> None:
+        """
+        链上持仓为 0 时同步内部状态并触发清仓回调，便于 hunter_agent 停止监控。
+        用于：链上无持仓时跳过卖出、卖出失败但链上已归零（验证超时导致误判）。
+        """
+        if token_address not in self.positions:
+            return
+        self._emit_position_closed(token_address, pos)
+        del self.positions[token_address]
+        self._save_state_in_background()
+        logger.info("📤 已同步清仓状态并移除持仓记录: %s", token_address[:16] + "..")
 
     def _emit_position_closed(self, token_address: str, pos: Position) -> None:
         """清仓时构造 snapshot 并触发回调（发邮件等）。"""
