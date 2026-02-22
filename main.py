@@ -523,7 +523,14 @@ async def main(immediate_audit: bool = False):
     await asyncio.to_thread(_migrate_closed_pnl_to_history)  # 后台线程迁移，不阻塞启动
     trader.on_position_closed_callback = _on_position_closed
     trader.on_trade_recorded = append_trade_in_background  # 后台线程写入，不阻塞跟单
+
+    async def _on_hunter_zero_skip(token_address: str) -> None:
+        """猎手持仓归零跳过监控时：校验我方链上是否归零，未归零则清仓；链上已归零则同步移除 trader_state。"""
+        await trader.ensure_fully_closed(token_address)
+
+    agent.on_hunter_zero_skip = _on_hunter_zero_skip  # 必须在 restore_agent_from_trader 前设置，否则恢复时漏删过时持仓
     await restore_agent_from_trader()
+
     def get_tracked_tokens():
         out = set(trader.positions.keys())
         out |= set(getattr(agent, "active_missions", {}).keys())
@@ -537,12 +544,6 @@ async def main(immediate_audit: bool = False):
     _sm_searcher_for_blacklist.append(monitor.sm_searcher)  # 供开仓前黑名单二次过滤
     monitor.set_agent(agent)  # 跟仓信号由 Monitor 统一推送，避免 Agent 自建 WS 漏单
     agent.signal_callback = on_agent_signal
-
-    async def _on_hunter_zero_skip(token_address: str) -> None:
-        """猎手持仓归零跳过监控时：校验我方链上是否归零，未归零则清仓。"""
-        await trader.ensure_fully_closed(token_address)
-
-    agent.on_hunter_zero_skip = _on_hunter_zero_skip
 
     async def _on_helius_credit_exhausted():
         """Helius credit 耗尽（429）时的保命操作：清仓所有持仓 + 致命错误告警。"""
