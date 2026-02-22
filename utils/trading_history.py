@@ -13,12 +13,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
-from config.settings import TRADING_HISTORY_PATH, DATA_DIR, SUMMARY_FILE_PREFIX
+from config.settings import TRADING_HISTORY_PATH, SUMMARY_DIR, SUMMARY_FILE_PREFIX
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-SUMMARY_DIR = DATA_DIR
 SUMMARY_PREFIX = SUMMARY_FILE_PREFIX
 _LOCK = threading.Lock()
 
@@ -181,13 +180,14 @@ def append_trade_in_background(record: Dict[str, Any]) -> None:
 
 
 def load_history() -> List[Dict[str, Any]]:
-    """加载完整交易历史，日报时调用。"""
+    """加载完整交易历史，日报时调用。与 append_trade/ensure_monthly_summaries 共用锁，避免读写竞态。"""
     try:
-        if not TRADING_HISTORY_PATH.exists():
-            return []
-        with open(TRADING_HISTORY_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
+        with _LOCK:
+            if not TRADING_HISTORY_PATH.exists():
+                return []
+            with open(TRADING_HISTORY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
     except Exception:
         logger.exception("❌ 加载交易历史失败")
         return []

@@ -15,6 +15,7 @@ from email.mime.multipart import MIMEMultipart
 from config.settings import (
     EMAIL_SENDER, EMAIL_RECEIVER, EMAIL_PASSWORD,
     SMTP_SERVER, SMTP_PORT, BOT_NAME,
+    HUNTER_MODE,
 )
 from utils.logger import get_logger
 
@@ -146,8 +147,9 @@ def build_daily_report_content(
     details_lines: list,
 ) -> str:
     """日报正文（旧版简化格式，已由 build_detailed_daily_report 取代）。"""
+    mode_label = (HUNTER_MODE or "MODELA").strip().upper()
     lines = [
-        "【每日收益日报】\n",
+        f"【每日收益日报 | {mode_label}】\n",
         f"今日收益(SOL): {today_pnl_sol:+.4f}\n",
         f"累计收益(SOL): {total_pnl_sol:+.4f}\n",
         "--- 今日明细 ---\n",
@@ -177,8 +179,9 @@ def build_detailed_daily_report(
     top_hunters: [(hunter_addr_short, pnl_sol, rank), ...] 前五名
     today_details: 今日每笔交易/结算说明
     """
+    mode_label = (HUNTER_MODE or "MODELA").strip().upper()
     lines = [
-        "【每日交易日报】\n",
+        f"【每日交易日报 | {mode_label}】\n",
         "───────── 猎手池 ─────────\n",
         f"当前猎手数: {hunter_pool_count}/{hunter_pool_limit}\n",
         "\n",
@@ -222,8 +225,9 @@ def send_first_entry_email(
     price_sol: float,
     hunters_summary: str,
 ) -> None:
-    """首次跟单后，在新线程发送邮件。"""
-    subject = "📈 首次跟单"
+    """首次跟单后，在新线程发送邮件。标题带 MODELA/MODELB 避免混淆。"""
+    mode_label = (HUNTER_MODE or "MODELA").strip().upper()
+    subject = f"📈 首次跟单 [{mode_label}]"
     content = build_first_entry_content(
         token_address, entry_time, buy_sol, token_amount, price_sol, hunters_summary
     )
@@ -236,22 +240,25 @@ def send_close_email(
     trade_records: list,
     total_pnl_sol: float,
 ) -> None:
-    """清仓后，在新线程发送邮件。"""
-    subject = "📉 清仓报告"
+    """清仓后，在新线程发送邮件。标题带 MODELA/MODELB 避免混淆。"""
+    mode_label = (HUNTER_MODE or "MODELA").strip().upper()
+    subject = f"📉 清仓报告 [{mode_label}]"
     content = build_close_content(token_address, entry_time, trade_records, total_pnl_sol)
     send_email_in_thread(subject, content)
 
 
 def send_daily_report_email(today_pnl_sol: float, total_pnl_sol: float, details_lines: list) -> None:
-    """日报：在新线程发送（简化版）。"""
-    subject = "📊 每日收益日报"
+    """日报：在新线程发送（简化版）。标题带 MODELA/MODELB 避免混淆。"""
+    mode_label = (HUNTER_MODE or "MODELA").strip().upper()
+    subject = f"📊 每日收益日报 [{mode_label}]"
     content = build_daily_report_content(today_pnl_sol, total_pnl_sol, details_lines)
     send_email_in_thread(subject, content)
 
 
 def send_detailed_daily_report_email(content: str) -> None:
-    """详细日报：在新线程发送。"""
-    subject = "📊 每日交易日报"
+    """详细日报：在新线程发送。标题带 MODELA/MODELB 避免多实例混淆。"""
+    mode_label = (HUNTER_MODE or "MODELA").strip().upper()
+    subject = f"📊 每日交易日报 [{mode_label}]"
     send_email_in_thread(subject, content)
 
 
@@ -264,7 +271,8 @@ def send_hunter_changes_email(
     attachment_path: str = None,
 ) -> None:
     """
-    猎手库变化通知：新增/删除/替换/僵尸剔除/体检更新等，附带 hunters.json 附件。
+    猎手库变化通知：新增/删除/替换/僵尸剔除/体检更新等。
+    MODELA 附带 hunters.json，MODELB 附带 smart_money.json。
     """
     parts = []
     if added > 0:
@@ -278,11 +286,13 @@ def send_hunter_changes_email(
     if not parts:
         return
     change_summary = "，".join(parts)
+    mode_label = (HUNTER_MODE or "MODELA").strip().upper()
+    attachment_name = "smart_money.json" if mode_label == "MODELB" else "hunters.json"
     content = (
-        f"【猎手库变化】\n\n"
+        f"【猎手库变化 | {mode_label}】\n\n"
         f"变化: {change_summary}\n"
         f"当前猎手总数: {total_count}\n\n"
-        f"附件: hunters.json（最新猎手数据）"
+        f"附件: {attachment_name}（最新猎手数据）"
     )
-    subject = "📋 猎手库变化"
+    subject = f"📋 猎手库变化 [{mode_label}]"
     send_email_in_thread(subject, content, attachment_path)

@@ -25,6 +25,7 @@ from config.settings import (
     CLOSED_PNL_PATH,
     PNL_LOOP_RATE_LIMIT_SLEEP_SEC,
 )
+from config.paths import DATA_ACTIVE_DIR
 from src.dexscreener.dex_scanner import DexScanner
 from services.hunter_agent import HunterAgentController
 from services.hunter_monitor import HunterMonitorController
@@ -54,7 +55,7 @@ HUNTER_POOL_PATH = Path(SMART_MONEY_JSON_PATH) if (HUNTER_MODE or "MODELA").stri
 
 
 def _load_closed_pnl_log() -> None:
-    """从 data/closed_pnl.json 恢复历史清仓记录。"""
+    """从 data/modelA|modelB/closed_pnl.json 恢复历史清仓记录。"""
     global closed_pnl_log
     if not CLOSED_PNL_PATH.exists():
         return
@@ -68,12 +69,11 @@ def _load_closed_pnl_log() -> None:
 
 
 def _save_closed_pnl_log() -> None:
-    """将清仓记录写入本地，避免重启后日报统计丢失。带锁防多线程竞态。"""
+    """将清仓记录写入本地（按模式放入 data/modelA/ 或 data/modelB/），避免重启后日报统计丢失。带锁防多线程竞态。"""
     with _CLOSED_PNL_LOCK:
         snapshot = list(closed_pnl_log)  # 在锁内复制，避免写时被并发修改
     try:
-        from config.settings import DATA_DIR
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        CLOSED_PNL_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(CLOSED_PNL_PATH, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, ensure_ascii=False, indent=2)
     except Exception:
@@ -399,6 +399,8 @@ def _migrate_closed_pnl_to_history():
 
 
 async def main(immediate_audit: bool = False):
+    """主入口。HUNTER_MODE 在进程启动时确定，修改 .env 后需重启生效。"""
+    logger.info("🦌 当前模式: %s | 数据目录: %s", HUNTER_MODE or "MODELA", DATA_ACTIVE_DIR)
     _load_closed_pnl_log()
     await asyncio.to_thread(_migrate_closed_pnl_to_history)  # 后台线程迁移，不阻塞启动
     trader.on_position_closed_callback = _on_position_closed
@@ -446,7 +448,7 @@ def _parse_args():
     parser.add_argument(
         "--immediate-audit",
         action="store_true",
-        help="启动时立即对 data/hunters.json 中所有猎手做一次审计体检（pnl/胜率/利润/30天收益未达标踢出，其余更新）",
+        help="启动时立即对猎手池做审计体检（MODELA: hunters.json；MODELB: smart_money.json；未达标踢出，其余更新）",
     )
     return parser.parse_args()
 

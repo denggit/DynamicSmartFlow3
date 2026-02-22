@@ -45,6 +45,9 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# 防止多线程并发写 trader_state.json 导致文件损坏
+_STATE_FILE_LOCK = threading.Lock()
+
 
 def _is_rate_limit_error(e: Exception) -> bool:
     """
@@ -643,6 +646,8 @@ class SolanaTrader:
                 if chain_after is not None and chain_after < 1e-9:
                     logger.info("链上持仓已归零，同步状态并停止监控")
                     self._sync_zero_and_close_position(token_address, pos)
+                self._save_state_in_background()
+                return
 
             if tx_sig:
                 cost_this_sell = sell_amount * pos.average_price
@@ -1136,11 +1141,12 @@ class SolanaTrader:
         }
 
     def _dict_to_position(self, d: Dict[str, Any]) -> Position:
-        """从 dict 恢复 Position。"""
+        """从 dict 恢复 Position。decimals 至少为 1 防除零。"""
+        decimals = max(1, int(d.get("decimals", 9)))
         pos = Position(
             d["token_address"],
             float(d.get("average_price", 0)),
-            int(d.get("decimals", 9)),
+            decimals,
         )
         pos.entry_time = float(d.get("entry_time", 0))
         pos.total_tokens = float(d.get("total_tokens", 0))
@@ -1157,18 +1163,19 @@ class SolanaTrader:
         return pos
 
     def _save_state_safe(self) -> None:
-        """同步写入当前持仓到本地文件（内部用）。"""
+        """同步写入当前持仓到本地文件（内部用）。带锁防多线程并发写损坏。"""
         try:
-            TRADER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            data = {
-                "positions": {
-                    token: self._position_to_dict(pos)
-                    for token, pos in self.positions.items()
-                    if pos.total_tokens > 0
+            with _STATE_FILE_LOCK:
+                TRADER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                data = {
+                    "positions": {
+                        token: self._position_to_dict(pos)
+                        for token, pos in self.positions.items()
+                        if pos.total_tokens > 0
+                    }
                 }
-            }
-            with open(TRADER_STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                with open(TRADER_STATE_PATH, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
             logger.exception("保存持仓状态失败")
 
@@ -1186,12 +1193,13 @@ class SolanaTrader:
         self._save_state_in_background()
 
     def load_state(self) -> None:
-        """从 data/trader_state.json 恢复持仓，启动时调用。"""
+        """从 data/modelA|modelB/trader_state.json 恢复持仓，启动时调用。与保存共用锁，避免读时正在写。"""
         if not TRADER_STATE_PATH.exists():
             return
         try:
-            with open(TRADER_STATE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            with _STATE_FILE_LOCK:
+                with open(TRADER_STATE_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
             positions_data = data.get("positions") or {}
             for token, pd in positions_data.items():
                 pos = self._dict_to_position(pd)

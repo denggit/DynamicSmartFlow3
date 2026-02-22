@@ -448,7 +448,10 @@ class SmartMoneySearcher:
                 if gain_24h is None:
                     gain_24h = (main_pair.get('priceChange') or {}).get('h24')
                 gain_24h = float(gain_24h or 0)
-                if 1 < gain_24h <= 20:
+                # DexScreener 可能返回乘数(1.5=50%)或百分比(150)。>100 视为已百分比，1~20 视为乘数
+                if gain_24h > 100:
+                    pass  # 已是百分比
+                elif 1 < gain_24h <= 20:
                     gain_24h = (gain_24h - 1) * 100
 
                 created_at_ms = main_pair.get('pairCreatedAt', float('inf'))

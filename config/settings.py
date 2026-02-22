@@ -15,6 +15,7 @@ from config.paths import (
     HUNTER_BACKUP_PATH,
     TRADING_HISTORY_PATH,
     SUMMARY_FILE_PREFIX,
+    SUMMARY_DIR,
     CLOSED_PNL_PATH,
     TRADER_STATE_PATH,
 )

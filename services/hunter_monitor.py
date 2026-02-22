@@ -43,9 +43,13 @@ from config.settings import (
     HOLDINGS_PRUNE_INTERVAL_SEC,
     SM_AUDIT_MIN_PNL_RATIO,
     SM_AUDIT_MIN_WIN_RATE,
-    SM_MODELB_AUDIT_MIN_PNL_RATIO,
-    SM_MODELB_AUDIT_MIN_WIN_RATE,
     SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT,
+    SM_MODELB_ENTRY_MIN_PNL_RATIO,
+    SM_MODELB_ENTRY_MIN_WIN_RATE,
+    SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL,
+    SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC,
+    SM_MODELB_ENTRY_MAX_DUST_COUNT,
+    SM_MODELB_ENTRY_MIN_TRADE_COUNT,
     SM_ROI_MULT_ONE,
     SM_ROI_MULT_TWO,
     SM_ROI_MULT_THREE,
@@ -774,28 +778,57 @@ class HunterMonitorController:
                         if addr in self.storage.hunters:
                             del self.storage.hunters[addr]
                             removed += 1
-                        logger.info("🚫 剔除 %s.. (体检发现 LP 行为，已拉黑)", addr[:12])
+                        if HUNTER_MODE == "MODELB":
+                            self.sm_searcher.add_to_trash(addr)
+                        logger.info("🚫 剔除 %s.. (体检发现 LP 行为，已加入 trash)", addr[:12])
                         continue
                     is_modelb = HUNTER_MODE == "MODELB"
-                    pnl_min = SM_MODELB_AUDIT_MIN_PNL_RATIO if is_modelb else SM_AUDIT_MIN_PNL_RATIO
-                    wr_min = SM_MODELB_AUDIT_MIN_WIN_RATE if is_modelb else SM_AUDIT_MIN_WIN_RATE
-                    roi_threshold = SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT if is_modelb else TIER_THREE_ROI
-                    pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= pnl_min if new_stats.get("pnl_ratio") != float("inf") else True
-                    wr_ok = new_stats["win_rate"] >= wr_min
-                    profit_ok = new_stats["total_profit"] > 0
-                    roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
-
-                    if not (pnl_ok and wr_ok and profit_ok):
-                        del self.storage.hunters[addr]
-                        removed += 1
-                        logger.info("🚫 剔除 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
-                    elif roi_val < roi_threshold:
-                        del self.storage.hunters[addr]
-                        removed += 1
-                        logger.info("🚫 剔除 %s.. (最大收益 %.0f%% < %s%%)", addr[:12], roi_val, roi_threshold)
+                    if is_modelb:
+                        pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= SM_MODELB_ENTRY_MIN_PNL_RATIO if new_stats.get("pnl_ratio") != float("inf") else True
+                        wr_ok = new_stats["win_rate"] >= SM_MODELB_ENTRY_MIN_WIN_RATE
+                        profit_ok = new_stats["total_profit"] > SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL
+                        avg_hold = new_stats.get("avg_hold_sec")
+                        hold_ok = avg_hold is not None and avg_hold > SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC
+                        dust_ok = (new_stats.get("dust_count", 0) or 0) < SM_MODELB_ENTRY_MAX_DUST_COUNT
+                        count_ok = (new_stats.get("count", 0) or 0) >= SM_MODELB_ENTRY_MIN_TRADE_COUNT
+                        roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
+                        roi_ok = roi_val >= SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT
+                        audit_pass = pnl_ok and wr_ok and profit_ok and hold_ok and dust_ok and count_ok and roi_ok
+                        if not audit_pass:
+                            reasons = []
+                            if not pnl_ok: reasons.append("盈亏比")
+                            if not wr_ok: reasons.append("胜率")
+                            if not profit_ok: reasons.append("总盈利≤1SOL")
+                            if not hold_ok: reasons.append("单币持仓≤5min")
+                            if not dust_ok: reasons.append("灰尘≥10")
+                            if not count_ok: reasons.append("代币数<7")
+                            if not roi_ok: reasons.append("最大收益")
+                            del self.storage.hunters[addr]
+                            removed += 1
+                            logger.info("🚫 剔除 %s.. (体检未过: %s)", addr[:12], "/".join(reasons))
+                        else:
+                            _apply_audit_update(info, new_stats, time.time(), addr)
+                            updated += 1
                     else:
-                        _apply_audit_update(info, new_stats, time.time(), addr)
-                        updated += 1
+                        pnl_min = SM_AUDIT_MIN_PNL_RATIO
+                        wr_min = SM_AUDIT_MIN_WIN_RATE
+                        roi_threshold = TIER_THREE_ROI
+                        pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= pnl_min if new_stats.get("pnl_ratio") != float("inf") else True
+                        wr_ok = new_stats["win_rate"] >= wr_min
+                        profit_ok = new_stats["total_profit"] > 0
+                        roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
+
+                        if not (pnl_ok and wr_ok and profit_ok):
+                            del self.storage.hunters[addr]
+                            removed += 1
+                            logger.info("🚫 剔除 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
+                        elif roi_val < roi_threshold:
+                            del self.storage.hunters[addr]
+                            removed += 1
+                            logger.info("🚫 剔除 %s.. (最大收益 %.0f%% < %s%%)", addr[:12], roi_val, roi_threshold)
+                        else:
+                            _apply_audit_update(info, new_stats, time.time(), addr)
+                            updated += 1
                 except Exception:
                     logger.exception("审计猎手 %s 异常，跳过", addr[:12])
                 await asyncio.sleep(AUDIT_BETWEEN_HUNTERS_SLEEP_SEC)
@@ -844,6 +877,7 @@ class HunterMonitorController:
 
                         # 核心逻辑：超过 20 天才重新打分
                         if (now - last_audit) > AUDIT_EXPIRATION:
+                            needs_audit_count += 1  # 进入体检分支即计数（含 LP 踢出、未达标踢出、更新）
                             logger.info(f"🩺 猎手 {addr} 超过{AUDIT_EXPIRATION // 86400}天未体检，正在重新审计...")
 
                             # 重新跑一遍分析
@@ -852,31 +886,59 @@ class HunterMonitorController:
                                 if addr in self.storage.hunters:
                                     del self.storage.hunters[addr]
                                     audit_removed.append(addr)
-                                logger.info("🚫 体检踢出 %s.. (发现 LP 行为，已拉黑)", addr[:12])
+                                if HUNTER_MODE == "MODELB":
+                                    self.sm_searcher.add_to_trash(addr)
+                                logger.info("🚫 体检踢出 %s.. (发现 LP 行为，已加入 trash)", addr[:12])
                             elif new_stats:
                                 is_modelb = HUNTER_MODE == "MODELB"
-                                pnl_min = SM_MODELB_AUDIT_MIN_PNL_RATIO if is_modelb else SM_AUDIT_MIN_PNL_RATIO
-                                wr_min = SM_MODELB_AUDIT_MIN_WIN_RATE if is_modelb else SM_AUDIT_MIN_WIN_RATE
-                                roi_threshold = SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT if is_modelb else TIER_THREE_ROI
-                                pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= pnl_min if new_stats.get("pnl_ratio") != float("inf") else True
-                                wr_ok = new_stats["win_rate"] >= wr_min
-                                profit_ok = new_stats["total_profit"] > 0
-                                roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
-
-                                if not (pnl_ok and wr_ok and profit_ok):
-                                    if addr in self.storage.hunters:
-                                        del self.storage.hunters[addr]
-                                        audit_removed.append(addr)
-                                        logger.info("🚫 体检踢出 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
-                                elif roi_val < roi_threshold:
-                                    if addr in self.storage.hunters:
-                                        del self.storage.hunters[addr]
-                                        audit_removed.append(addr)
-                                        logger.info("🚫 体检踢出 %s.. (最大收益 %.0f%% < %s%%)", addr[:12], roi_val, roi_threshold)
+                                if is_modelb:
+                                    pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= SM_MODELB_ENTRY_MIN_PNL_RATIO if new_stats.get("pnl_ratio") != float("inf") else True
+                                    wr_ok = new_stats["win_rate"] >= SM_MODELB_ENTRY_MIN_WIN_RATE
+                                    profit_ok = new_stats["total_profit"] > SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL
+                                    avg_hold = new_stats.get("avg_hold_sec")
+                                    hold_ok = avg_hold is not None and avg_hold > SM_MODELB_ENTRY_MIN_AVG_HOLD_SEC
+                                    dust_ok = (new_stats.get("dust_count", 0) or 0) < SM_MODELB_ENTRY_MAX_DUST_COUNT
+                                    count_ok = (new_stats.get("count", 0) or 0) >= SM_MODELB_ENTRY_MIN_TRADE_COUNT
+                                    roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
+                                    roi_ok = roi_val >= SM_MODELB_AUDIT_KICK_MAX_ROI_30D_PCT
+                                    audit_pass = pnl_ok and wr_ok and profit_ok and hold_ok and dust_ok and count_ok and roi_ok
+                                    if not audit_pass:
+                                        reasons = []
+                                        if not pnl_ok: reasons.append("盈亏比")
+                                        if not wr_ok: reasons.append("胜率")
+                                        if not profit_ok: reasons.append("总盈利≤1SOL")
+                                        if not hold_ok: reasons.append("单币持仓≤5min")
+                                        if not dust_ok: reasons.append("灰尘≥10")
+                                        if not count_ok: reasons.append("代币数<7")
+                                        if not roi_ok: reasons.append("最大收益")
+                                        if addr in self.storage.hunters:
+                                            del self.storage.hunters[addr]
+                                            audit_removed.append(addr)
+                                        logger.info("🚫 体检踢出 %s.. (%s)", addr[:12], "/".join(reasons))
+                                    else:
+                                        _apply_audit_update(info, new_stats, now, addr)
                                 else:
-                                    _apply_audit_update(info, new_stats, now, addr)
+                                    pnl_min = SM_AUDIT_MIN_PNL_RATIO
+                                    wr_min = SM_AUDIT_MIN_WIN_RATE
+                                    roi_threshold = TIER_THREE_ROI
+                                    pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= pnl_min if new_stats.get("pnl_ratio") != float("inf") else True
+                                    wr_ok = new_stats["win_rate"] >= wr_min
+                                    profit_ok = new_stats["total_profit"] > 0
+                                    roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
 
-                            needs_audit_count += 1
+                                    if not (pnl_ok and wr_ok and profit_ok):
+                                        if addr in self.storage.hunters:
+                                            del self.storage.hunters[addr]
+                                            audit_removed.append(addr)
+                                        logger.info("🚫 体检踢出 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
+                                    elif roi_val < roi_threshold:
+                                        if addr in self.storage.hunters:
+                                            del self.storage.hunters[addr]
+                                            audit_removed.append(addr)
+                                        logger.info("🚫 体检踢出 %s.. (最大收益 %.0f%% < %s%%)", addr[:12], roi_val, roi_threshold)
+                                    else:
+                                        _apply_audit_update(info, new_stats, now, addr)
+
                             await asyncio.sleep(AUDIT_BETWEEN_HUNTERS_SLEEP_SEC)  # 慢慢跑，不着急
 
                 if needs_audit_count == 0:

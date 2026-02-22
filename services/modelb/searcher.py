@@ -297,15 +297,22 @@ class SmartMoneySearcherB:
                                 new_hunters.append(result)
                     await asyncio.sleep(SM_MODELB_WALLET_ANALYZE_SLEEP_SEC)
                 except Exception:
-                    logger.exception("分析钱包 %s 异常", addr[:12])
+                    logger.exception("分析钱包 %s 异常，跳过并从 wallets.txt 移除", addr[:12])
+                    processed_addrs.add(_normalize_address(addr))
 
         self._save_smart_money(smart_money)
         self._remove_from_wallets_file(processed_addrs)
         return new_hunters
 
     def is_blacklisted(self, address: str) -> bool:
+        """MODELB 仅用 trash_wallets 作为垃圾名单，与黑名单语义一致。"""
         trash = self.load_trash_wallets()
         return _normalize_address(address) in trash
+
+    def add_to_trash(self, address: str) -> None:
+        """将地址加入 trash_wallets（体检踢出 LP 等时调用）。"""
+        trash = self.load_trash_wallets()
+        self._add_to_trash(address, trash)
 
     async def analyze_hunter_performance(self, client, hunter_address, exclude_token=None, pre_fetched_txs=None):
         if pre_fetched_txs is None:
