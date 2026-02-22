@@ -1161,8 +1161,10 @@ class SolanaTrader:
                                         "⚠️ 买入验证超时但链上余额已到账 (raw %s >= %s)，以链上为准视为成功: %s",
                                         chain_raw, min_expected, sig_str,
                                     )
-                                    # 关键：返回链上实际到账量（非 Quote 预估），否则均价 = buy_sol/token_ui 会错误
-                                    return sig_str, float(chain_raw)
+                                    # 关键：返回本笔 Swap 的 outAmount（非钱包总余额 chain_raw），
+                                    # 否则若钱包已有该代币（前次买入/重试等），chain_raw 会高估 token_amount_ui，
+                                    # 导致均价 = buy_sol/token_ui 被低估，进而错误触发止盈
+                                    return sig_str, float(out_amount_raw)
                                 if recon_attempt < TX_VERIFY_RECONCILIATION_RETRIES - 1:
                                     if alchemy_client.size >= 1:
                                         alchemy_client.mark_current_failed()
