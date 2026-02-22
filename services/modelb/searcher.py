@@ -53,6 +53,65 @@ def _normalize_address(addr: str) -> str:
     return addr.strip()
 
 
+def _parse_entry_for_validation(entry: dict) -> dict | None:
+    """
+    从已存储的 JSON 条目解析可用于校验的数值。
+    用于启动时清理历史遗留的不达标数据。
+    :return: 解析后的数值 dict，格式异常时返回 None
+    """
+    try:
+        avg_str = str(entry.get("avg_roi_pct") or "0").rstrip("%").strip()
+        wr_str = str(entry.get("win_rate") or "0").rstrip("%").strip()
+        pnl_str = str(entry.get("pnl_ratio") or "0")
+        profit_str = str(entry.get("total_profit") or "0").replace(" SOL", "").strip()
+        closed_str = str(entry.get("closed_ratio") or "0").rstrip("%").strip()
+        avg_roi = float(avg_str)
+        win_rate = float(wr_str) / 100.0
+        pnl = float("inf") if pnl_str == "∞" else float(pnl_str)
+        total_profit = float(profit_str)
+        closed_ratio = float(closed_str) / 100.0
+        count = int(entry.get("trade_frequency") or 0)
+        dust_ratio_str = str(entry.get("dust_ratio") or "0").rstrip("%").strip()
+        dust_ratio = float(dust_ratio_str) / 100.0
+        dust_count = int(dust_ratio * count) if count > 0 else 0  # 近似
+        return {
+            "avg_roi_pct": avg_roi,
+            "win_rate": win_rate,
+            "pnl_ratio": pnl,
+            "total_profit": total_profit,
+            "closed_ratio": closed_ratio,
+            "count": count,
+            "dust_count": dust_count,
+        }
+    except (ValueError, TypeError):
+        return None
+
+
+def _stored_entry_passes_criteria(entry: dict) -> bool:
+    """
+    用存储的 JSON 条目做简化校验（盈亏比、胜率、平均收益、总盈利、清仓比例、代币数、灰尘）。
+    用于启动时清理历史不达标数据。avg_hold_sec 无法从存储还原，仅校验可还原项。
+    """
+    parsed = _parse_entry_for_validation(entry)
+    if parsed is None:
+        return False
+    if parsed["pnl_ratio"] != float("inf") and parsed["pnl_ratio"] < SM_MODELB_ENTRY_MIN_PNL_RATIO:
+        return False
+    if parsed["win_rate"] < SM_MODELB_ENTRY_MIN_WIN_RATE:
+        return False
+    if parsed["total_profit"] <= SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL:
+        return False
+    if parsed["closed_ratio"] < SM_MODELB_ENTRY_MIN_CLOSED_RATIO:
+        return False
+    if parsed["avg_roi_pct"] <= SM_MODELB_ENTRY_MIN_AVG_ROI_PCT:
+        return False
+    if parsed["count"] < SM_MODELB_ENTRY_MIN_TRADE_COUNT:
+        return False
+    if parsed["dust_count"] >= SM_MODELB_ENTRY_MAX_DUST_COUNT:
+        return False
+    return True
+
+
 def check_modelb_entry_criteria(stats: dict) -> Tuple[bool, List[str]]:
     """
     MODELB 入库/体检统一判定：八项硬门槛，全部通过才合格。
@@ -61,13 +120,22 @@ def check_modelb_entry_criteria(stats: dict) -> Tuple[bool, List[str]]:
     :return: (是否通过, 未通过时的原因列表，通过时为空列表)
     """
     reasons: List[str] = []
-    pnl = stats.get("pnl_ratio", 0) or 0
+    try:
+        pnl = float(stats.get("pnl_ratio", 0) or 0)
+    except (TypeError, ValueError):
+        pnl = 0.0
     if pnl != float("inf") and pnl < SM_MODELB_ENTRY_MIN_PNL_RATIO:
         reasons.append("盈亏比")
-    wr = stats.get("win_rate", 0) or 0
+    try:
+        wr = float(stats.get("win_rate", 0) or 0)
+    except (TypeError, ValueError):
+        wr = 0.0
     if wr < SM_MODELB_ENTRY_MIN_WIN_RATE:
         reasons.append("胜率")
-    profit = stats.get("total_profit", 0) or 0
+    try:
+        profit = float(stats.get("total_profit", 0) or 0)
+    except (TypeError, ValueError):
+        profit = 0.0
     if profit <= SM_MODELB_ENTRY_MIN_TOTAL_PROFIT_SOL:
         reasons.append("总盈利≤1SOL")
     avg_hold = stats.get("avg_hold_sec")
@@ -82,7 +150,10 @@ def check_modelb_entry_criteria(stats: dict) -> Tuple[bool, List[str]]:
     closed_ratio = stats.get("closed_ratio", 0) or 0
     if closed_ratio < SM_MODELB_ENTRY_MIN_CLOSED_RATIO:
         reasons.append("清仓比例<70%")
-    avg_roi = stats.get("avg_roi_pct", 0) or 0
+    try:
+        avg_roi = float(stats.get("avg_roi_pct", 0) or 0)
+    except (TypeError, ValueError):
+        avg_roi = 0.0
     if avg_roi <= SM_MODELB_ENTRY_MIN_AVG_ROI_PCT:
         reasons.append("平均收益≤10%")
     return (len(reasons) == 0, reasons)
@@ -244,6 +315,17 @@ class SmartMoneySearcherB:
             )
             return None
 
+        # 4. 防御性二次校验：防止风控遗漏导致不合格数据入库
+        risk_ok2, risk_reasons2 = check_modelb_entry_criteria(stats)
+        if not risk_ok2:
+            logger.error(
+                "[MODELB 二次校验拦截] %s.. | 本应不通过: %s | wr=%.1f%% avg_roi=%.1f%%",
+                address[:12], "/".join(risk_reasons2),
+                (stats.get("win_rate") or 0) * 100,
+                float(stats.get("avg_roi_pct") or 0),
+            )
+            return None
+
         now = time.time()
         pnl = stats.get("pnl_ratio", 0)
         pnl_str = "∞" if pnl == float("inf") else f"{pnl:.2f}"
@@ -278,6 +360,20 @@ class SmartMoneySearcherB:
             return []
 
         smart_money = self.load_smart_money()
+        # 启动时校验存量数据：移除历史遗留的不达标条目（如 avg_roi_pct≤10%）
+        removed_legacy = []
+        for addr, info in list(smart_money.items()):
+            if not _stored_entry_passes_criteria(info):
+                removed_legacy.append(addr)
+                del smart_money[addr]
+        if removed_legacy:
+            logger.warning(
+                "[MODELB 启动清理] 移除 %d 条历史不达标数据: %s",
+                len(removed_legacy), ", ".join(a[:12] + ".." for a in removed_legacy[:5])
+                + (" ..." if len(removed_legacy) > 5 else ""),
+            )
+            self._save_smart_money(smart_money)
+
         trash_set = self.load_trash_wallets()
         smart_keys = {_normalize_address(k) for k in smart_money}
         trash_norm = {_normalize_address(t) for t in trash_set}
@@ -298,6 +394,27 @@ class SmartMoneySearcherB:
                     result = await self._analyze_wallet(client, addr, trash_set)
                     processed_addrs.add(_normalize_address(addr))
                     if result:
+                        # 入库前最后校验：防止异常数据混入（双重保险）
+                        avg_str = result.get("avg_roi_pct", "0%")
+                        wr_str = result.get("win_rate", "0%")
+                        try:
+                            avg_val = float(str(avg_str).rstrip("%"))
+                            if avg_val <= SM_MODELB_ENTRY_MIN_AVG_ROI_PCT:
+                                logger.error(
+                                    "[MODELB 入库拦截] %s.. | avg_roi_pct=%s 不达标(需>%.0f%%)，拒绝入库",
+                                    addr[:12], avg_str, SM_MODELB_ENTRY_MIN_AVG_ROI_PCT,
+                                )
+                                continue
+                            wr_val = float(str(wr_str).rstrip("%")) / 100.0
+                            if wr_val < SM_MODELB_ENTRY_MIN_WIN_RATE:
+                                logger.error(
+                                    "[MODELB 入库拦截] %s.. | win_rate=%s 不达标(需≥%.0f%%)，拒绝入库",
+                                    addr[:12], wr_str, SM_MODELB_ENTRY_MIN_WIN_RATE * 100,
+                                )
+                                continue
+                        except (ValueError, TypeError) as e:
+                            logger.warning("[MODELB 入库拦截] %s.. | 数据格式异常: %s", addr[:12], e)
+                            continue
                         key = _normalize_address(addr)
                         if len(smart_money) < self.pool_limit:
                             smart_money[key] = result

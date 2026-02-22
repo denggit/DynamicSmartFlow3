@@ -69,7 +69,7 @@ from src.dexscreener.dex_scanner import DexScanner
 from services.hunter_common import TransactionParser
 from services.modela import SmartMoneySearcher
 from services.modelb import SmartMoneySearcherB
-from services.modelb.searcher import check_modelb_entry_criteria
+from services.modelb.searcher import check_modelb_entry_criteria, _stored_entry_passes_criteria
 from services.modela.scoring import compute_hunter_score as compute_hunter_score_modela
 from services.modelb.scoring import compute_hunter_score as compute_hunter_score_modelb
 from utils.logger import get_logger
@@ -265,13 +265,24 @@ class SmartMoneyStorage:
         DATA_MODELB_DIR.mkdir(parents=True, exist_ok=True)
 
     def load_hunters(self):
-        """从 smart_money.json 加载猎手数据。"""
+        """从 smart_money.json 加载猎手数据，并移除历史遗留的不达标条目。"""
         if os.path.exists(self.data_file):
             try:
                 with open(self.data_file, "r", encoding="utf-8") as f:
                     self.hunters = json.load(f)
                 if not isinstance(self.hunters, dict):
                     self.hunters = {}
+                # 校验存量数据：移除 avg_roi_pct≤10% 等不达标条目
+                to_remove = [addr for addr, info in self.hunters.items() if not _stored_entry_passes_criteria(info)]
+                for addr in to_remove:
+                    del self.hunters[addr]
+                if to_remove:
+                    logger.warning(
+                        "[MODELB 加载清理] 移除 %d 条不达标历史数据: %s",
+                        len(to_remove), ", ".join(a[:12] + ".." for a in to_remove[:5])
+                        + (" ..." if len(to_remove) > 5 else ""),
+                    )
+                    self.save_hunters()
                 logger.info(f"📂 [MODELB] 已加载 {len(self.hunters)} 名猎手 (smart_money.json)")
             except Exception:
                 logger.exception("❌ 加载 smart_money.json 失败")
