@@ -361,10 +361,20 @@ class HunterMonitorController:
         # Helius credit 耗尽时的保命回调：清仓 + 致命错误告警（主程序注入）
         self.on_helius_credit_exhausted: Optional[Callable[[], Awaitable[None]]] = None
         self._helius_emergency_triggered = False
+        # 体检踢出猎手时的兜底回调：若该猎手正在跟仓，清仓对应持仓（主程序注入）
+        self.on_hunter_removed: Optional[Callable[[str], Awaitable[None]]] = None
 
     def set_agent(self, agent) -> None:
         """主程序注入 Agent，Monitor 消费队列命中后会把 (tx, active_hunters) 推给 Agent。"""
         self.agent = agent
+
+    async def _trigger_hunter_removed(self, addr: str) -> None:
+        """体检踢出猎手时调用，触发兜底清仓（若该猎手正在跟仓）。"""
+        if self.on_hunter_removed:
+            try:
+                await self.on_hunter_removed(addr)
+            except Exception:
+                logger.exception("on_hunter_removed 回调异常: %s", addr[:12])
 
     def set_on_helius_credit_exhausted(self, callback: Callable[[], Awaitable[None]]) -> None:
         """主程序注入：Helius credit 耗尽（429）时触发保命操作：清仓所有 + 致命错误告警。"""
@@ -778,6 +788,7 @@ class HunterMonitorController:
                         if addr in self.storage.hunters:
                             del self.storage.hunters[addr]
                             removed += 1
+                            await self._trigger_hunter_removed(addr)
                         if HUNTER_MODE == "MODELB":
                             self.sm_searcher.add_to_trash(addr)
                         logger.info("🚫 剔除 %s.. (体检发现 LP 行为，已加入 trash)", addr[:12])
@@ -805,6 +816,7 @@ class HunterMonitorController:
                             if not roi_ok: reasons.append("最大收益")
                             del self.storage.hunters[addr]
                             removed += 1
+                            await self._trigger_hunter_removed(addr)
                             logger.info("🚫 剔除 %s.. (体检未过: %s)", addr[:12], "/".join(reasons))
                         else:
                             _apply_audit_update(info, new_stats, time.time(), addr)
@@ -821,10 +833,12 @@ class HunterMonitorController:
                         if not (pnl_ok and wr_ok and profit_ok):
                             del self.storage.hunters[addr]
                             removed += 1
+                            await self._trigger_hunter_removed(addr)
                             logger.info("🚫 剔除 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
                         elif roi_val < roi_threshold:
                             del self.storage.hunters[addr]
                             removed += 1
+                            await self._trigger_hunter_removed(addr)
                             logger.info("🚫 剔除 %s.. (最大收益 %.0f%% < %s%%)", addr[:12], roi_val, roi_threshold)
                         else:
                             _apply_audit_update(info, new_stats, time.time(), addr)
@@ -867,6 +881,7 @@ class HunterMonitorController:
                     for addr in frequent_removed:
                         if addr in self.storage.hunters:
                             del self.storage.hunters[addr]
+                            await self._trigger_hunter_removed(addr)
                             logger.info("🚫 踢出频繁交易猎手 %s.. (平均间隔<5分钟)", addr)
                     if frequent_removed:
                         current_hunters = list(self.storage.hunters.items())
@@ -886,6 +901,7 @@ class HunterMonitorController:
                                 if addr in self.storage.hunters:
                                     del self.storage.hunters[addr]
                                     audit_removed.append(addr)
+                                    await self._trigger_hunter_removed(addr)
                                 if HUNTER_MODE == "MODELB":
                                     self.sm_searcher.add_to_trash(addr)
                                 logger.info("🚫 体检踢出 %s.. (发现 LP 行为，已加入 trash)", addr[:12])
@@ -914,6 +930,7 @@ class HunterMonitorController:
                                         if addr in self.storage.hunters:
                                             del self.storage.hunters[addr]
                                             audit_removed.append(addr)
+                                            await self._trigger_hunter_removed(addr)
                                         logger.info("🚫 体检踢出 %s.. (%s)", addr[:12], "/".join(reasons))
                                     else:
                                         _apply_audit_update(info, new_stats, now, addr)
@@ -930,11 +947,13 @@ class HunterMonitorController:
                                         if addr in self.storage.hunters:
                                             del self.storage.hunters[addr]
                                             audit_removed.append(addr)
+                                            await self._trigger_hunter_removed(addr)
                                         logger.info("🚫 体检踢出 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
                                     elif roi_val < roi_threshold:
                                         if addr in self.storage.hunters:
                                             del self.storage.hunters[addr]
                                             audit_removed.append(addr)
+                                            await self._trigger_hunter_removed(addr)
                                         logger.info("🚫 体检踢出 %s.. (最大收益 %.0f%% < %s%%)", addr[:12], roi_val, roi_threshold)
                                     else:
                                         _apply_audit_update(info, new_stats, now, addr)

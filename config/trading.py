@@ -30,9 +30,9 @@ MAX_ENTRY_PUMP_MULTIPLIER = 4.0
 SELL_BUFFER = 0.999
 
 TAKE_PROFIT_LEVELS = [
-    (1.0, 0.50),
-    (4.0, 0.50),
-    (10.0, 0.80),
+    (1.0, 0.25),
+    (4.0, 0.25),
+    (9.0, 0.50),
 ]
 
 MIN_SHARE_VALUE_SOL = 0.01

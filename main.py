@@ -433,6 +433,14 @@ async def main(immediate_audit: bool = False):
 
     monitor.set_on_helius_credit_exhausted(_on_helius_credit_exhausted)
 
+    async def _on_hunter_removed(hunter_addr: str) -> None:
+        """体检踢出猎手时：若该猎手正在跟仓，兜底清仓对应持仓。"""
+        closed = await trader.emergency_close_positions_by_hunter(hunter_addr)
+        if closed > 0:
+            logger.warning("🛑 体检踢出猎手 %s..，已兜底清仓其 %d 个跟仓", hunter_addr[:12], closed)
+
+    monitor.on_hunter_removed = _on_hunter_removed
+
     if immediate_audit:
         await monitor.run_immediate_audit()
 

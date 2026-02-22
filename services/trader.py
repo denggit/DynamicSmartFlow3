@@ -291,6 +291,82 @@ class SolanaTrader:
         self._save_state_in_background()
         return closed
 
+    async def emergency_close_positions_by_hunter(self, hunter_addr: str) -> int:
+        """
+        兜底清仓：体检踢出猎手时，若该猎手正在被跟仓，立即清仓对应持仓。
+        避免跟仓一个已从库中移除的猎手。
+        :param hunter_addr: 被踢出的猎手地址
+        :return: 清仓的持仓数量
+        """
+        if not self.keypair or not hunter_addr:
+            return 0
+        to_close = [
+            token for token, pos in self.positions.items()
+            if hunter_addr in pos.shares
+        ]
+        if not to_close:
+            return 0
+        logger.warning(
+            "🛑 [体检踢出兜底] 猎手 %s.. 已从库移除，清仓其 %d 个跟仓",
+            hunter_addr[:12], len(to_close),
+        )
+        closed = 0
+        for token_address in to_close:
+            pos = self.positions.get(token_address)
+            if not pos:
+                continue
+            try:
+                chain_bal = await self._fetch_own_token_balance(token_address)
+                sell_amount = chain_bal if chain_bal is not None else pos.total_tokens * SELL_BUFFER
+                if sell_amount is None or sell_amount <= 0:
+                    self._sync_zero_and_close_position(token_address, pos)
+                    closed += 1
+                    continue
+                decimals = await self._get_decimals(token_address) or pos.decimals
+                tx_sig, sol_received = await self._jupiter_sell_with_retry(
+                    input_mint=token_address,
+                    output_mint=WSOL_MINT,
+                    amount_in_ui=sell_amount,
+                    token_decimals=decimals,
+                )
+                if tx_sig:
+                    cost = sell_amount * pos.average_price
+                    pnl_sol = sol_received - cost
+                    pos.trade_records.append({
+                        "ts": time.time(),
+                        "type": "sell",
+                        "sol_spent": 0.0,
+                        "sol_received": sol_received,
+                        "token_amount": sell_amount,
+                        "note": "体检踢出猎手兜底清仓",
+                        "pnl_sol": pnl_sol,
+                    })
+                    if self.on_trade_recorded:
+                        lead = list(pos.shares.keys())[0] if pos.shares else ""
+                        self.on_trade_recorded({
+                            "date": time.strftime("%Y-%m-%d", time.localtime()),
+                            "ts": time.time(),
+                            "token": token_address,
+                            "type": "sell",
+                            "sol_spent": 0.0,
+                            "sol_received": sol_received,
+                            "token_amount": sell_amount,
+                            "price": pos.average_price,
+                            "hunter_addr": lead,
+                            "pnl_sol": pnl_sol,
+                            "note": "体检踢出猎手兜底清仓",
+                        })
+                    self._emit_position_closed(token_address, pos)
+                    del self.positions[token_address]
+                    closed += 1
+                    logger.info("✅ 兜底清仓完成: %s", token_address[:16] + "..")
+                else:
+                    logger.warning("❌ 兜底清仓失败: %s (链上余额 %.2f)", token_address, sell_amount)
+            except Exception:
+                logger.exception("兜底清仓异常: %s", token_address)
+        self._save_state_in_background()
+        return closed
+
     # ==========================================
     # 1. 核心交易接口 (逻辑层)
     # ==========================================
