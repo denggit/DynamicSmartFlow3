@@ -42,6 +42,8 @@ from config.settings import (
     TRADER_VERIFY_RETRY_SLEEP_SEC,
     RECONCILE_TX_LIMIT,
     IGNORE_MINTS,
+    STARTUP_RECONCILE_RETRY_DELAY_SEC,
+    STARTUP_RECONCILE_MAX_RETRIES,
 )
 from src.alchemy import alchemy_client
 from src.alchemy.rate_limit import with_alchemy_rate_limit
@@ -1856,6 +1858,61 @@ class SolanaTrader:
                 logger.info("📂 已从本地恢复 %s 个持仓", len(self.positions))
         except Exception:
             logger.exception("加载持仓状态失败")
+
+    async def reconcile_positions_on_startup(self) -> None:
+        """
+        启动时链上对账：恢复监控前用 Alchemy 查询我方链上持仓。
+        - 链上归零或粉尘：同步移除持仓，不启动监控。
+        - 链上有持仓但与内部状态不一致：按链上余额更新 pos.total_tokens 与 shares，避免后续交易错误。
+        - 查询失败：冷却 STARTUP_RECONCILE_RETRY_DELAY_SEC 后重试，最多 STARTUP_RECONCILE_MAX_RETRIES 次。
+        """
+        if not self.keypair or not self.positions:
+            return
+        for token_address in list(self.positions.keys()):
+            pos = self.positions.get(token_address)
+            if not pos or pos.total_tokens <= 0:
+                continue
+            chain_bal = None
+            for attempt in range(STARTUP_RECONCILE_MAX_RETRIES):
+                chain_bal = await self._fetch_own_token_balance(token_address)
+                if chain_bal is not None:
+                    break
+                if attempt < STARTUP_RECONCILE_MAX_RETRIES - 1:
+                    logger.warning(
+                        "启动对账: %s 链上余额查询失败，%ds 后重试 (%d/%d)",
+                        token_address[:16] + "..",
+                        STARTUP_RECONCILE_RETRY_DELAY_SEC,
+                        attempt + 2,
+                        STARTUP_RECONCILE_MAX_RETRIES,
+                    )
+                    await asyncio.sleep(STARTUP_RECONCILE_RETRY_DELAY_SEC)
+            if chain_bal is None:
+                logger.warning(
+                    "启动对账: %s 链上余额查询仍失败，跳过对账，保持原状态并恢复监控",
+                    token_address[:16] + "..",
+                )
+                continue
+            if chain_bal < 1e-9 or chain_bal < DUST_TOKEN_AMOUNT_UI:
+                logger.info(
+                    "启动对账: %s 链上已归零或粉尘 (%.6f)，同步移除持仓，不启动监控",
+                    token_address[:16] + "..",
+                    chain_bal,
+                )
+                self._sync_zero_and_close_position(token_address, pos)
+                continue
+            if abs(chain_bal - pos.total_tokens) > 1e-9:
+                old_total = pos.total_tokens
+                ratio = chain_bal / pos.total_tokens if pos.total_tokens > 0 else 1.0
+                for s in pos.shares.values():
+                    s.token_amount *= ratio
+                pos.total_tokens = chain_bal
+                self._save_state_safe()
+                logger.info(
+                    "启动对账: %s 以链上为准更新持仓 %.2f -> %.2f",
+                    token_address[:16] + "..",
+                    old_total,
+                    chain_bal,
+                )
 
     def get_active_tokens(self) -> List[str]:
         return [t for t, p in self.positions.items() if p.total_tokens > 0]
