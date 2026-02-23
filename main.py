@@ -232,6 +232,11 @@ async def _on_agent_signal_impl(signal):
             hunter_info = {"address": hunter_addr, "score": pos.lead_hunter_score}
             await trader.execute_add_position(token, hunter_info, "猎手大额加仓", price)
             await agent.add_hunter_to_mission(token, hunter_addr)
+        else:
+            logger.debug(
+                "⏭️ 加仓跳过: %s 猎手加仓 %.4f SOL < 阈值 %.1f SOL (数量 %.2f × 价 %.8f)",
+                token[:8], add_sol_value, HUNTER_ADD_THRESHOLD_SOL, add_amount_ui, price,
+            )
 
 
 # =========================================
