@@ -201,10 +201,10 @@ class SolanaTrader:
         result = await alchemy_client.get_token_accounts_by_owner(
             owner_b58, token_mint, http_client=self.http_client, timeout=TRADER_RPC_TIMEOUT
         )
-        if result is None or not result.get("value"):
+        if result is None:
             return None
         total_raw = 0
-        for acc in result["value"]:
+        for acc in result.get("value") or []:
             info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
             tamt = info.get("tokenAmount") or {}
             amt_str = tamt.get("amount")
@@ -213,7 +213,8 @@ class SolanaTrader:
                     total_raw += int(amt_str)
                 except (ValueError, TypeError):
                     pass
-        return total_raw if total_raw > 0 else None
+        # 余额为 0 时返回 0，不返回 None；与 _fetch_own_token_balance 语义一致
+        return total_raw
 
     async def _fetch_own_token_balance_raw_helius(self, token_mint: str) -> Optional[int]:
         """
@@ -227,9 +228,9 @@ class SolanaTrader:
             result = await helius_client.get_token_accounts_by_owner(
                 owner_b58, token_mint, http_client=self.http_client, timeout=8.0
             )
-            if result and result.get("value"):
+            if result is not None:
                 total_raw = 0
-                for acc in result["value"]:
+                for acc in result.get("value") or []:
                     info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
                     tamt = info.get("tokenAmount") or {}
                     amt_str = tamt.get("amount")
@@ -238,8 +239,8 @@ class SolanaTrader:
                             total_raw += int(amt_str)
                         except (ValueError, TypeError):
                             pass
-                if total_raw > 0:
-                    return total_raw
+                # 有有效响应即返回（含 0），不因余额为 0 而继续换 Key
+                return total_raw
             if helius_client.size > 1:
                 helius_client.mark_current_failed()
                 await asyncio.sleep(1)
