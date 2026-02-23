@@ -30,6 +30,7 @@ from config.settings import (
     LIQUIDITY_CHECK_DEXSCREENER_INTERVAL_SEC,
     RECONCILE_INTERVAL_SEC,
     RECONCILE_TX_LIMIT,
+    MANUAL_VERIFY_REPORT_INTERVAL_SEC,
 )
 from config.paths import DATA_ACTIVE_DIR
 from utils.logger import get_logger, LOGS_ROOT
@@ -39,6 +40,7 @@ from services.hunter_monitor import HunterMonitorController
 from services.trader import SolanaTrader
 from src.rugcheck import risk_control
 from services import notification
+from services.manual_verify_store import add_manual_verify_token, get_and_clear_pending
 from utils.trading_history import append_trade, append_trade_in_background, load_history, load_data_for_report
 
 logger = get_logger("Main")
@@ -167,6 +169,7 @@ async def _on_monitor_signal_impl(signal, sm_searcher=None):
             _entry_failed_tokens.add(token)
             logger.info("🚫 跟仓买入确定失败（Quote/Swap 未通过），放弃 %s（本周期不再重试）", token[:16] + "..")
         elif definitely_failed is False:
+            add_manual_verify_token(token)
             logger.warning(
                 "⚠️ 买入失败但可能已成交（RPC 验证超时），不加入放弃集：%s。"
                 "若实际已持仓请手动处理或等待链上对账",
@@ -548,6 +551,31 @@ async def daily_report_loop():
             logger.exception("❌ 日报生成失败")
 
 
+async def manual_verify_report_loop():
+    """每小时汇总需手动核对的 token，发送邮件提醒用户手动卖出。"""
+    logger.info("📋 需手动核对报告任务已启动，每 %d 分钟执行", MANUAL_VERIFY_REPORT_INTERVAL_SEC // 60)
+    while True:
+        await asyncio.sleep(MANUAL_VERIFY_REPORT_INTERVAL_SEC)
+        try:
+            addrs = get_and_clear_pending()
+            if not addrs:
+                continue
+            tokens_with_names = []
+            for addr in addrs:
+                try:
+                    _, symbol = await price_scanner.get_token_price_and_symbol(addr)
+                    label = symbol or addr[:16] + ".."
+                except Exception:
+                    label = addr[:16] + ".."
+                tokens_with_names.append((addr, label))
+            content = notification.build_manual_verify_report(tokens_with_names)
+            if content:
+                notification.send_email_in_thread("⚠️ 需手动上链核对的代币（请手动卖出）", content)
+                logger.info("📧 已发送需手动核对报告，共 %d 个代币", len(tokens_with_names))
+        except Exception:
+            logger.exception("需手动核对报告异常")
+
+
 # =========================================
 # 主入口
 # =========================================
@@ -665,6 +693,7 @@ async def main(immediate_audit: bool = False):
         liquidity_structural_check_loop(),
         reconcile_loop(),
         daily_report_loop(),
+        manual_verify_report_loop(),
     )
 
 

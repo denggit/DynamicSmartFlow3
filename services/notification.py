@@ -158,6 +158,25 @@ def build_daily_report_content(
     return "".join(lines)
 
 
+def build_manual_verify_report(tokens: list) -> str:
+    """
+    构建需手动核对的 token 报告正文。
+    tokens: [(address, name_or_address), ...] 代币地址与名称（名称获取失败时用地址）
+    """
+    if not tokens:
+        return ""
+    lines = [
+        "【需手动上链核对】\n",
+        "以下代币交易已广播但验证失败（Alchemy/Helius 无法确认），可能已成交。\n",
+        "⚠️ 这些代币未在程序跟踪中，请手动核实链上余额并卖出。\n",
+        "---\n",
+    ]
+    for i, (addr, label) in enumerate(tokens, 1):
+        lines.append(f"  {i}. {label}\n")
+        lines.append(f"     地址: {addr}\n")
+    return "".join(lines)
+
+
 def build_detailed_daily_report(
     hunter_pool_count: int,
     hunter_pool_limit: int,

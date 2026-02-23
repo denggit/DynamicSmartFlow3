@@ -32,7 +32,7 @@ from config.settings import (
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, SELL_SLIPPAGE_BPS_STOP_LOSS, jup_key_pool,
     TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
     TX_VERIFY_RECONCILIATION_DELAY_SEC, TX_VERIFY_RECONCILIATION_RETRIES,
-    TRADER_RPC_TIMEOUT,
+    TRADER_RPC_TIMEOUT, TRADER_RETRY_COOLDOWN_SEC,
     WSOL_MINT,
     LAMPORTS_PER_SOL,
     TRADER_STATE_PATH,
@@ -45,6 +45,7 @@ from config.settings import (
 from src.alchemy import alchemy_client
 from src.alchemy.rate_limit import with_alchemy_rate_limit
 from src.helius import helius_client
+from services.manual_verify_store import add_manual_verify_token
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -209,6 +210,36 @@ class SolanaTrader:
                 except (ValueError, TypeError):
                     pass
         return total_raw if total_raw > 0 else None
+
+    async def _fetch_own_token_balance_raw_helius(self, token_mint: str) -> Optional[int]:
+        """
+        Helius 兜底：Alchemy 全部 429 时用 Helius 查余额（Helius 珍贵，仅余额兜底用）。
+        遍历 Helius Key 池直至成功或耗尽。
+        """
+        if not self.keypair:
+            return None
+        owner_b58 = str(self.keypair.pubkey())
+        for _ in range(max(1, helius_client.size)):
+            result = await helius_client.get_token_accounts_by_owner(
+                owner_b58, token_mint, http_client=self.http_client, timeout=8.0
+            )
+            if result and result.get("value"):
+                total_raw = 0
+                for acc in result["value"]:
+                    info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                    tamt = info.get("tokenAmount") or {}
+                    amt_str = tamt.get("amount")
+                    if amt_str is not None:
+                        try:
+                            total_raw += int(amt_str)
+                        except (ValueError, TypeError):
+                            pass
+                if total_raw > 0:
+                    return total_raw
+            if helius_client.size > 1:
+                helius_client.mark_current_failed()
+                await asyncio.sleep(1)
+        return None
 
     async def ensure_fully_closed(self, token_address: str, remove_if_chain_unknown: bool = False) -> None:
         """
@@ -555,6 +586,7 @@ class SolanaTrader:
                     token_address[:16] + "..",
                 )
             else:
+                add_manual_verify_token(token_address)
                 logger.warning(
                     "❌ 开仓失败: %s | 已广播但验证超时，链上可能已成交",
                     token_address[:16] + "..",
@@ -1155,14 +1187,25 @@ class SolanaTrader:
             if current_amount <= 0:
                 logger.info("链上持仓已为 0，无需继续卖出重试")
                 return None, 0.0
-            # 首轮尝试前校验链上余额，避免内部状态滞后时盲目广播导致 6024 浪费 RPC
-            if i == 0:
-                chain_bal_pre = await self._fetch_own_token_balance(input_mint)
-                if chain_bal_pre is not None and chain_bal_pre < 1e-9:
+            # 任一轮尝试前：确认链上余额>0，卖出额度<=链上余额，剩余为粉尘则清仓（与批量卖出一致）
+            chain_bal_pre = await self._fetch_own_token_balance(input_mint)
+            if chain_bal_pre is None:
+                if i >= 1:
+                    logger.warning(
+                        "❌ 卖出失败且无法查链上余额，停止重试(由上层 sync 处理)，避免重复广播浪费费用"
+                    )
+                    return None, 0.0
+                # 首轮无法查余额时仍尝试，可能为 RPC 短暂故障
+            else:
+                if chain_bal_pre < 1e-9:
                     logger.info("链上持仓已归零，跳过卖出（避免无效广播）")
                     return None, 0.0
-                if chain_bal_pre is not None and chain_bal_pre < current_amount:
-                    current_amount = min(current_amount, chain_bal_pre)
+                current_amount = min(current_amount, chain_bal_pre)
+                remaining = chain_bal_pre - current_amount
+                if 0 < remaining < DUST_TOKEN_AMOUNT_UI:
+                    current_amount = chain_bal_pre
+                    logger.info("剩余 %.6f 为粉尘（阈值 %.0e），直接清仓: %s", remaining, DUST_TOKEN_AMOUNT_UI, input_mint[:16] + "..")
+                elif i == 0 and chain_bal_pre < amount_in_ui:
                     logger.debug("按链上余额 %.2f 调整卖出量", current_amount)
             tx_sig, sol_out, definitely_no_buy = await self._jupiter_swap(
                 input_mint=input_mint,
@@ -1184,22 +1227,11 @@ class SolanaTrader:
                 )
                 return None, 0.0
             if i < len(slippage_list) - 1:
-                chain_bal = await self._fetch_own_token_balance(input_mint)
-                if chain_bal is not None:
-                    current_amount = min(current_amount, chain_bal)
-                    if chain_bal < 1e-9:
-                        logger.info("链上持仓已归零（前次卖出或已成功），停止重试，避免无效广播")
-                        return None, 0.0
-                    logger.warning(
-                        "❌ 卖出失败，按链上余额 %.2f 重试下一档滑点 %.1f%%",
-                        current_amount, slippage_list[i + 1] / 100,
-                    )
-                else:
-                    # 无法查链上余额(429 等)时不再重试：前次 tx 可能已成功，继续广播会 6024 浪费 RPC
-                    logger.warning(
-                        "❌ 卖出失败且无法查链上余额，停止重试(由上层 sync 处理)，避免重复广播浪费费用"
-                    )
-                    return None, 0.0
+                await asyncio.sleep(TRADER_RETRY_COOLDOWN_SEC)
+                logger.warning(
+                    "❌ 卖出失败，冷却 %ds 后重试下一档滑点 %.1f%%",
+                    TRADER_RETRY_COOLDOWN_SEC, slippage_list[i + 1] / 100,
+                )
         return None, 0.0
 
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
@@ -1321,6 +1353,8 @@ class SolanaTrader:
                             await asyncio.sleep(TX_VERIFY_RECONCILIATION_DELAY_SEC)
                             for recon_attempt in range(TX_VERIFY_RECONCILIATION_RETRIES):
                                 chain_raw = await self._fetch_own_token_balance_raw(output_mint)
+                                if chain_raw is None and helius_client.size >= 1:
+                                    chain_raw = await self._fetch_own_token_balance_raw_helius(output_mint)
                                 if chain_raw is not None and chain_raw >= min_expected:
                                     logger.warning(
                                         "⚠️ 买入验证超时但链上余额已到账 (raw %s >= %s)，以链上为准视为成功: %s",
@@ -1340,11 +1374,13 @@ class SolanaTrader:
                                         recon_attempt + 1, TX_VERIFY_RECONCILIATION_RETRIES, backoff,
                                     )
                                     await asyncio.sleep(backoff)
-                        # 余额兜底耗尽仍失败：极可能所有 Key 均已 429，必须报致命错误
+                        # 余额兜底耗尽仍失败：Alchemy 与 Helius 均无法查到链上余额，必须报致命错误
                         # 已广播，可能实际已成交 → definitely_no_buy=False，不可加入放弃集
+                        token_for_verify = output_mint if not is_sell else input_mint
+                        add_manual_verify_token(token_for_verify)
                         logger.critical(
-                            "🚨 致命：所有 RPC Key 或已 429 超额，链上余额无法查询，交易 %s 无法确认。"
-                            "可能导致漏跟卖，请立即检查 API 配额并增加 Key！",
+                            "🚨 致命：Alchemy 与 Helius 均无法查询链上余额，交易 %s 无法确认。"
+                            "交易可能已成交请手动核对，并检查 API 配额！",
                             sig_str,
                         )
                         return None, 0.0, False
