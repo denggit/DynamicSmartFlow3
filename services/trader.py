@@ -783,10 +783,7 @@ class SolanaTrader:
         if hunter_addr not in pos.shares:
             return
 
-        if pos.tp_hit_levels:
-            logger.info("💰 [加仓跳过] %s 止盈已触发，禁止加仓", token_address[:8])
-            return
-
+        # max_sol 为总投入上限（开仓+所有加仓），达到后不再加仓；清仓后重新开仓则一切重置
         score = float(trigger_hunter.get('score', 0)) or pos.lead_hunter_score
         tier = get_tier_config(score) or get_tier_config(pos.lead_hunter_score)
         if not tier:
