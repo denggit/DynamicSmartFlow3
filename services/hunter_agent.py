@@ -31,6 +31,7 @@ from config.settings import (
     AGENT_TOKEN_ACCOUNTS_TIMEOUT,
     AGENT_WS_ERROR_SLEEP_SEC,
     AGENT_POLL_SLEEP_SEC,
+    ALCHEMY_MIN_INTERVAL_SEC,
     IGNORE_MINTS,
 )
 from src.alchemy import alchemy_client
@@ -312,7 +313,7 @@ class HunterAgentController:
                                 mission.hunter_states[hunter] = real_balance
                         except Exception:
                             logger.debug("同步单猎手余额异常", exc_info=True)
-                        await asyncio.sleep(AGENT_POLL_SLEEP_SEC)
+                        await asyncio.sleep(max(AGENT_POLL_SLEEP_SEC, ALCHEMY_MIN_INTERVAL_SEC))
             except Exception:
                 logger.exception("sync_positions_loop 异常")
 

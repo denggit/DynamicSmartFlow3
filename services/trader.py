@@ -32,7 +32,7 @@ from config.settings import (
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, SELL_SLIPPAGE_BPS_STOP_LOSS, jup_key_pool,
     TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
     TX_VERIFY_RECONCILIATION_DELAY_SEC, TX_VERIFY_RECONCILIATION_RETRIES,
-    TRADER_RPC_TIMEOUT, TRADER_RETRY_COOLDOWN_SEC,
+    TRADER_RPC_TIMEOUT, TRADER_RETRY_COOLDOWN_SEC, TRADER_VERIFY_POLL_INTERVAL_SEC,
     WSOL_MINT,
     LAMPORTS_PER_SOL,
     TRADER_STATE_PATH,
@@ -770,16 +770,15 @@ class SolanaTrader:
 
         sell_amount_ui = min(sell_amount_ui, share.token_amount)
 
-        # 链上余额为准：查到多少卖多少；查余额失败时兜底 99.9% 防超卖
-        chain_bal = await self._fetch_own_token_balance(token_address)
-        if chain_bal is not None:
-            if sell_amount_ui > chain_bal:
-                logger.warning(
-                    "⚠️ 状态与链上不一致: 计划卖 %.2f 但链上仅 %.2f，以链上为准",
-                    sell_amount_ui, chain_bal
-                )
-                sell_amount_ui = min(sell_amount_ui, chain_bal)
-        # 卖出前再拉一次链上余额，应对连续多笔跟卖时的延迟
+        # 链上余额为准：复用入口已查的 chain_bal_early，避免重复 RPC（原 4 次→2 次）
+        chain_bal = chain_bal_early
+        if chain_bal is not None and sell_amount_ui > chain_bal:
+            logger.warning(
+                "⚠️ 状态与链上不一致: 计划卖 %.2f 但链上仅 %.2f，以链上为准",
+                sell_amount_ui, chain_bal
+            )
+            sell_amount_ui = min(sell_amount_ui, chain_bal)
+        # 卖出前再拉一次链上余额，应对连续多笔跟卖时的延迟（唯一二次查询）
         chain_bal2 = await self._fetch_own_token_balance(token_address)
         if chain_bal2 is not None and sell_amount_ui > chain_bal2:
             sell_amount_ui = min(sell_amount_ui, chain_bal2)
@@ -801,10 +800,10 @@ class SolanaTrader:
             return
         sell_value_sol = sell_amount_ui * current_price
         if sell_value_sol < MIN_SHARE_VALUE_SOL:
-            # 卖出价值过小：若链上已归零，必须 sync 避免重复触发
-            chain_recheck = chain_bal if chain_bal is not None else (
-                chain_bal2 if chain_bal2 is not None else await self._fetch_own_token_balance(token_address)
-            )
+            # 卖出价值过小：若链上已归零，必须 sync 避免重复触发（复用已有结果，仅双 None 时再查一次）
+            chain_recheck = chain_bal2 if chain_bal2 is not None else chain_bal
+            if chain_recheck is None:
+                chain_recheck = await self._fetch_own_token_balance(token_address)
             if chain_recheck is not None and chain_recheck < 1e-9:
                 logger.info(
                     "✅ 跟随卖出跳过(链上已归零): 同步状态: %s",
@@ -962,7 +961,7 @@ class SolanaTrader:
             if not proceed_stop_loss:
                 return
 
-            chain_bal = await self._fetch_own_token_balance(token_address)
+            chain_bal = chain_bal_early  # 复用入口查询，减少 RPC
             if chain_bal is not None and chain_bal < 1e-9:
                 logger.info(
                     "✅ 止损前链上已归零（前次卖出或已成交），同步状态并跳过: %s",
@@ -1063,7 +1062,7 @@ class SolanaTrader:
                 if (remaining_after * current_price_ui) < MIN_SHARE_VALUE_SOL:
                     sell_amount = pos.total_tokens
                     logger.info("剩余价值不足 %.4f SOL，直接全仓止盈", MIN_SHARE_VALUE_SOL)
-                chain_bal = await self._fetch_own_token_balance(token_address)
+                chain_bal = chain_bal_pre  # 复用入口查询，减少 RPC
                 if chain_bal is not None:
                     sell_amount = min(sell_amount, chain_bal)
                     if chain_bal < pos.total_tokens * 0.99:
@@ -1084,8 +1083,8 @@ class SolanaTrader:
                     return
                 sell_value_sol = sell_amount * current_price_ui
                 if sell_value_sol < MIN_SHARE_VALUE_SOL:
-                    # 卖出价值过小：链上归零/几乎归零或整仓为粉尘，同步关闭避免每轮 PnL 重复检查浪费 RPC
-                    chain_bal_recheck = chain_bal if chain_bal is not None else await self._fetch_own_token_balance(token_address)
+                    # 卖出价值过小：链上归零/几乎归零或整仓为粉尘，同步关闭（复用 chain_bal，不再额外查）
+                    chain_bal_recheck = chain_bal
                     if chain_bal_recheck is not None and (
                         chain_bal_recheck < 1e-9 or chain_bal_recheck < pos.total_tokens * 0.01
                     ):
@@ -1460,10 +1459,11 @@ class SolanaTrader:
         """
         if max_wait_sec is None:
             max_wait_sec = TX_VERIFY_MAX_WAIT_SEC
+        poll_interval = max(1, TRADER_VERIFY_POLL_INTERVAL_SEC)
         try:
             from solders.signature import Signature
             sig = Signature.from_string(sig_str) if isinstance(sig_str, str) else sig_str
-            for _ in range(max_wait_sec):
+            for _ in range(0, max_wait_sec, poll_interval):
                 try:
                     resp = await with_alchemy_rate_limit(
                         lambda: self.rpc_client.get_signature_statuses([sig])
@@ -1475,15 +1475,15 @@ class SolanaTrader:
                         await asyncio.sleep(TRADER_VERIFY_RETRY_SLEEP_SEC)
                         continue
                     logger.debug("验证交易确认异常", exc_info=True)
-                    await asyncio.sleep(TRADER_VERIFY_RETRY_SLEEP_SEC)
+                    await asyncio.sleep(poll_interval)
                     continue
                 vals = getattr(resp, "value", None) or []
                 if not vals:
-                    await asyncio.sleep(TRADER_VERIFY_RETRY_SLEEP_SEC)
+                    await asyncio.sleep(poll_interval)
                     continue
                 st = vals[0]
                 if st is None:
-                    await asyncio.sleep(TRADER_VERIFY_RETRY_SLEEP_SEC)
+                    await asyncio.sleep(poll_interval)
                     continue
                 err = getattr(st, "err", None)
                 if err is not None:
@@ -1493,7 +1493,7 @@ class SolanaTrader:
                 if conf in ("confirmed", "finalized") or getattr(st, "confirmationStatus", "") in (
                 "confirmed", "finalized"):
                     return True
-                await asyncio.sleep(1)
+                await asyncio.sleep(poll_interval)
         except Exception:
             logger.debug("验证交易确认异常", exc_info=True)
 
