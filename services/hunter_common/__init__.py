@@ -4,7 +4,7 @@
 @Description: 猎手挖掘共用模块（MODELA 与 MODELB 共享）
               - 交易解析：TransactionParser、TokenAttributionCalculator
               - LP 检测：hunter_had_any_lp_anywhere、tx_is_any_lp_behavior 等
-              - 高频检测：_is_frequent_trader_by_blocktimes
+              - 高频检测：_is_frequent_trader_by_blocktimes、_is_frequent_trader_by_buy_sell_activities
 """
 
 from services.hunter_common.shared import (
@@ -18,6 +18,9 @@ from services.hunter_common.shared import (
     hunter_had_remove_liquidity_on_token,
     collect_lp_participants_from_txs,
     _is_frequent_trader_by_blocktimes,
+    _is_frequent_trader_by_buy_sell_activities,
+    _is_frequent_trader_by_buy_sell_activities_rpc,
+    _tx_is_buy_sell_activity_rpc,
     TransactionParser,
     TokenAttributionCalculator,
 )
@@ -33,6 +36,9 @@ __all__ = [
     "hunter_had_remove_liquidity_on_token",
     "collect_lp_participants_from_txs",
     "_is_frequent_trader_by_blocktimes",
+    "_is_frequent_trader_by_buy_sell_activities",
+    "_is_frequent_trader_by_buy_sell_activities_rpc",
+    "_tx_is_buy_sell_activity_rpc",
     "TransactionParser",
     "TokenAttributionCalculator",
 ]

@@ -91,19 +91,16 @@ def _save_closed_pnl_log() -> None:
 
 def _on_position_closed(snapshot: dict) -> None:
     """
-    清仓回调：记入日志、后台线程写 closed_pnl、新线程发清仓邮件。
+    清仓回调：记入日志、后台线程写 closed_pnl。
     不阻塞跟单主流程。closed_pnl_log.append 在锁内执行，避免多线程竞态。
+    清仓不再发邮件，周报中会汇总。
     """
     token_address = snapshot["token_address"]
-    entry_time = snapshot["entry_time"]
-    trade_records = snapshot["trade_records"]
     total_pnl_sol = snapshot["total_pnl_sol"]
     today_str = datetime.now().strftime("%Y-%m-%d")
     with _CLOSED_PNL_LOCK:
         closed_pnl_log.append({"date": today_str, "token": token_address, "pnl_sol": total_pnl_sol})
     threading.Thread(target=_save_closed_pnl_log, daemon=True).start()  # 不阻塞
-    entry_time_str = datetime.fromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S") if entry_time else "-"
-    notification.send_close_email(token_address, entry_time_str, trade_records, total_pnl_sol)
 
 
 # =========================================
@@ -174,17 +171,7 @@ async def _on_monitor_signal_impl(signal, sm_searcher=None):
         # definitely_failed is None：未尝试（keypair/已有仓位等），不记录
         return
 
-    # 4. 首次跟单邮件（新线程发送，不阻塞）
-    entry_time_str = datetime.fromtimestamp(pos.entry_time).strftime("%Y-%m-%d %H:%M:%S")
-    hunters_summary = ", ".join(f"{h.get('address', '')}..({h.get('score', 0)})" for h in hunters[:5])
-    notification.send_first_entry_email(
-        token_address=token,
-        entry_time=entry_time_str,
-        buy_sol=pos.total_cost_sol,
-        token_amount=pos.total_tokens,
-        price_sol=price,
-        hunters_summary=hunters_summary or "-",
-    )
+    # 4. 买入不再发邮件，周报中会汇总
 
     # 5. Agent 启动监控（只跟单一个猎手）
     hunter_addrs = [h["address"] for h in hunters]

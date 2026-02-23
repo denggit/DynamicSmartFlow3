@@ -235,12 +235,27 @@ class SolanaTrader:
             "⚠️ 关闭监控前发现链上仍有持仓 %.6f，执行清仓",
             chain_bal
         )
+        # 卖出前二次校验：避免期间已清仓/前次卖出已成功导致盲目广播浪费网费
+        chain_bal_recheck = await self._fetch_own_token_balance(token_address)
+        if chain_bal_recheck is not None and chain_bal_recheck < 1e-9:
+            logger.info(
+                "✅ 卖出前二次校验：链上已归零，同步状态并跳过卖出: %s",
+                token_address[:16] + "..",
+            )
+            if pos:
+                self._sync_zero_and_close_position(token_address, pos)
+            return
+        sell_amount = chain_bal_recheck if chain_bal_recheck is not None else chain_bal
+        if sell_amount <= 0:
+            if pos:
+                self._sync_zero_and_close_position(token_address, pos)
+            return
         decimals = await self._get_decimals(token_address)
         decimals = decimals or 6
         tx_sig, _ = await self._jupiter_sell_with_retry(
             input_mint=token_address,
             output_mint=WSOL_MINT,
-            amount_in_ui=chain_bal,
+            amount_in_ui=sell_amount,
             token_decimals=decimals,
         )
         if not tx_sig:

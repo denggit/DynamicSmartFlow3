@@ -861,7 +861,7 @@ class HunterMonitorController:
                 async with AsyncClient() as client:
                     # 0. 体检剔除：pnl_ratio<2 或 wr<20% 或 profit<=0 或 30天最大收益<50%
                     audit_removed = []
-                    # 1. 频繁交易剔除：最近 100 笔平均间隔 < 5 分钟的踢出猎手池
+                    # 1. 频繁交易剔除：单币平均持仓 ≤ 5 分钟的踢出猎手池
                     frequent_removed = []
                     for addr, _ in current_hunters:
                         if await self.sm_searcher.is_frequent_trader(client, addr):
@@ -870,7 +870,7 @@ class HunterMonitorController:
                         if addr in self.storage.hunters:
                             del self.storage.hunters[addr]
                             await self._trigger_hunter_removed(addr)
-                            logger.info("🚫 踢出频繁交易猎手 %s.. (平均间隔<5分钟)", addr)
+                            logger.info("🚫 踢出频繁交易猎手 %s.. (平均持仓≤5分钟)", addr[:12])
                     if frequent_removed:
                         current_hunters = list(self.storage.hunters.items())
 

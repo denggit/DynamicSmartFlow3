@@ -36,7 +36,7 @@ from src.alchemy import alchemy_client
 from src.helius import helius_client
 from utils.logger import get_logger
 
-from services.hunter_common import hunter_had_any_lp_anywhere, _is_frequent_trader_by_blocktimes
+from services.hunter_common import hunter_had_any_lp_anywhere, _is_frequent_trader_by_buy_sell_activities
 from services.modela import SmartMoneySearcher
 from services.modelb.analyzer import analyze_wallet_modelb
 from services.modelb.scoring import compute_hunter_score
@@ -273,15 +273,16 @@ class SmartMoneySearcherB:
     async def _analyze_wallet(
         self, client, address: str, trash_set: Set[str]
     ) -> dict | None:
-        sigs = await self.get_signatures(client, address, limit=self.tx_limit)
+        from config.settings import FREQUENCY_CHECK_SIG_LIMIT
+        sigs = await self.get_signatures(client, address, limit=FREQUENCY_CHECK_SIG_LIMIT)
         if not sigs:
-            return None
-        if _is_frequent_trader_by_blocktimes(sigs):
-            logger.info("⏭️ [MODELB] 剔除频繁交易地址 %s..", address[:12])
-            self._add_to_trash(address, trash_set)
             return None
         txs = await self.fetch_parsed_transactions(client, sigs)
         if not txs:
+            return None
+        if _is_frequent_trader_by_buy_sell_activities(txs, address, usdc_price_sol=0.01):
+            logger.info("⏭️ [MODELB] 剔除频繁交易地址 %s.. (买卖活动平均间隔<5分钟)", address[:12])
+            self._add_to_trash(address, trash_set)
             return None
         if hunter_had_any_lp_anywhere(txs):
             logger.warning("⚠️ [MODELB] LP 淘汰: %s.. 扔入 trash", address[:12])

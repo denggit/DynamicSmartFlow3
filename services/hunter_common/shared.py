@@ -13,6 +13,7 @@ from config.settings import (
     USDC_MINT,
     WSOL_MINT,
     RECENT_TX_COUNT_FOR_FREQUENCY,
+    FREQUENCY_CHECK_SIG_LIMIT,
     MIN_SUCCESSFUL_TX_FOR_FREQUENCY,
     MAX_FAILURE_RATE_FOR_FREQUENCY,
     MIN_AVG_TX_INTERVAL_SEC,
@@ -154,6 +155,184 @@ def collect_lp_participants_from_txs(txs: list) -> set:
     return participants
 
 
+# 买卖活动判定：至少 0.0001 SOL 变动才算真实 swap，排除纯 transfer
+MIN_SOL_CHANGE_FOR_SWAP = 0.0001
+LAMPORTS_PER_SOL = 1e9
+
+
+def _parse_rpc_tx_balance_changes(tx_rpc: dict, hunter_address: str) -> Tuple[float, Dict[str, float], int]:
+    """
+    从 Alchemy/RPC 标准格式（getTransaction 返回）解析 SOL 与 Token 变动。
+    不依赖 Helius，用于频率检测等场景。
+    :return: (sol_change_sol, {mint: delta_ui}, block_time)
+    """
+    sol_change = 0.0
+    token_changes = {}
+    block_time = int(tx_rpc.get("blockTime") or 0)
+    meta = tx_rpc.get("meta") or {}
+    if not meta:
+        return sol_change, token_changes, block_time
+
+    # 1. Account keys：版本化交易可能在 message 不同结构
+    tx_body = tx_rpc.get("transaction") or {}
+    msg = tx_body.get("message") or tx_body
+    account_keys_raw = msg.get("accountKeys") or []
+    account_keys = []
+    for k in account_keys_raw:
+        if isinstance(k, dict):
+            pk = k.get("pubkey")
+            if pk:
+                account_keys.append(pk)
+        elif isinstance(k, str):
+            account_keys.append(k)
+
+    # 2. 本地址的 native SOL 变动（preBalances/postBalances 与 account_keys 对齐）
+    pre_bal = meta.get("preBalances") or []
+    post_bal = meta.get("postBalances") or []
+    for i, pk in enumerate(account_keys):
+        if pk != hunter_address:
+            continue
+        pre = int(pre_bal[i]) if i < len(pre_bal) else 0
+        post = int(post_bal[i]) if i < len(post_bal) else 0
+        sol_change += (post - pre) / LAMPORTS_PER_SOL
+
+    # 3. Token 变动（preTokenBalances/postTokenBalances 有 owner 字段）
+    pre_tok = {}
+    post_tok = {}
+    dec_map = {}
+    for bal in meta.get("preTokenBalances") or []:
+        if bal.get("owner") != hunter_address:
+            continue
+        mint = bal.get("mint", "")
+        uita = bal.get("uiTokenAmount") or {}
+        raw = float(uita.get("amount", 0) or 0)
+        dec = int(uita.get("decimals", 6) or 6)
+        pre_tok[mint] = raw
+        dec_map[mint] = dec
+    for bal in meta.get("postTokenBalances") or []:
+        if bal.get("owner") != hunter_address:
+            continue
+        mint = bal.get("mint", "")
+        uita = bal.get("uiTokenAmount") or {}
+        raw = float(uita.get("amount", 0) or 0)
+        dec = int(uita.get("decimals", 6) or 6)
+        post_tok[mint] = raw
+        dec_map[mint] = dec
+
+    for mint in set(pre_tok.keys()) | set(post_tok.keys()):
+        pre = pre_tok.get(mint, 0)
+        post = post_tok.get(mint, 0)
+        dec = dec_map.get(mint, 6)
+        delta_raw = post - pre
+        if abs(delta_raw) >= 1:
+            token_changes[mint] = delta_raw / (10**dec) if dec else delta_raw
+
+    return sol_change, token_changes, block_time
+
+
+def _tx_is_buy_sell_activity_rpc(tx_rpc: dict, hunter_address: str) -> bool:
+    """
+    从 RPC 格式判断是否为买卖活动（swap），排除纯 transfer。
+    不依赖 Helius，用于 Alchemy 拉取后的频率检测。
+    """
+    try:
+        sol_change, token_changes, _ = _parse_rpc_tx_balance_changes(tx_rpc, hunter_address)
+        has_non_ignore_token = any(m not in IGNORE_MINTS and abs(a) >= 1e-9 for m, a in (token_changes or {}).items())
+        has_sol_move = abs(sol_change or 0) >= MIN_SOL_CHANGE_FOR_SWAP
+        return bool(has_non_ignore_token and has_sol_move)
+    except Exception:
+        return False
+
+
+def _tx_is_buy_sell_activity(tx: dict, hunter_address: str, parser: "TransactionParser", usdc_price_sol: float) -> bool:
+    """
+    判断该笔交易是否为买卖活动（swap），排除纯 transfer。
+    条件：有非 IGNORE 代币的 token 变动，且 SOL 有显著变动（买入花 SOL / 卖出收 SOL）。
+    """
+    try:
+        sol_change, token_changes, _ = parser.parse_transaction(tx, usdc_price_sol=usdc_price_sol)
+        has_non_ignore_token = any(m not in IGNORE_MINTS and abs(a) >= 1e-9 for m, a in (token_changes or {}).items())
+        has_sol_move = abs(sol_change or 0) >= MIN_SOL_CHANGE_FOR_SWAP
+        return bool(has_non_ignore_token and has_sol_move)
+    except Exception:
+        return False
+
+
+def _is_frequent_trader_by_buy_sell_activities_rpc(
+    txs_rpc: list,
+    hunter_address: str,
+    max_interval_sec: float = MIN_AVG_TX_INTERVAL_SEC,
+    min_successful: int = MIN_SUCCESSFUL_TX_FOR_FREQUENCY,
+) -> bool:
+    """
+    基于买卖活动判定高频（RPC 格式，不依赖 Helius）。
+    只统计 buy/sell 交易，排除 transfer。
+    :param txs_rpc: Alchemy getTransaction 返回的 RPC 格式交易列表
+    """
+    if not txs_rpc or len(txs_rpc) < 2:
+        return False
+    buy_sell_times = []
+    for tx in txs_rpc:
+        if not _tx_is_buy_sell_activity_rpc(tx, hunter_address):
+            continue
+        _, _, block_time = _parse_rpc_tx_balance_changes(tx, hunter_address)
+        if block_time and block_time > 0:
+            buy_sell_times.append(int(block_time))
+    if len(buy_sell_times) < min_successful:
+        return False
+    if len(buy_sell_times) < 2:
+        return False
+    buy_sell_times.sort()
+    span = buy_sell_times[-1] - buy_sell_times[0]
+    if span <= 0:
+        return False
+    avg_interval = span / (len(buy_sell_times) - 1)
+    return avg_interval < max_interval_sec
+
+
+def _is_frequent_trader_by_buy_sell_activities(
+    txs: list,
+    hunter_address: str,
+    usdc_price_sol: float = 0.01,
+    max_interval_sec: float = MIN_AVG_TX_INTERVAL_SEC,
+    min_successful: int = MIN_SUCCESSFUL_TX_FOR_FREQUENCY,
+) -> bool:
+    """
+    基于买卖活动判定高频：只统计 buy/sell 交易，排除 transfer。
+    拉取 300 条解析后过滤出买卖，若买卖平均间隔 < 5 分钟视为高频。
+    :param txs: Helius 解析后的交易列表（或 RPC 格式，自动检测）
+    :param hunter_address: 猎手地址（用于 TransactionParser）
+    :param usdc_price_sol: USDC 折算 SOL 价（仅 Helius 格式需要）
+    """
+    if not txs or len(txs) < 2:
+        return False
+    # 若为首条含 RPC 特征（meta.preTokenBalances），用 RPC 解析，不依赖 Helius
+    sample = txs[0] if txs else {}
+    meta = sample.get("meta") if isinstance(sample, dict) else None
+    if isinstance(sample, dict) and meta is not None and ("preTokenBalances" in meta or "preBalances" in meta):
+        return _is_frequent_trader_by_buy_sell_activities_rpc(
+            txs, hunter_address, max_interval_sec, min_successful
+        )
+    parser = TransactionParser(hunter_address)
+    buy_sell_times = []
+    for tx in txs:
+        if not _tx_is_buy_sell_activity(tx, hunter_address, parser, usdc_price_sol):
+            continue
+        ts = _get_tx_timestamp(tx)
+        if ts and ts > 0:
+            buy_sell_times.append(int(ts))
+    if len(buy_sell_times) < min_successful:
+        return False  # 买卖笔数不足，无法判定，视为非高频
+    if len(buy_sell_times) < 2:
+        return False
+    buy_sell_times.sort()
+    span = buy_sell_times[-1] - buy_sell_times[0]
+    if span <= 0:
+        return False
+    avg_interval = span / (len(buy_sell_times) - 1)
+    return avg_interval < max_interval_sec
+
+
 def _is_frequent_trader_by_blocktimes(
     sigs: list,
     sample_count: int = RECENT_TX_COUNT_FOR_FREQUENCY,
@@ -166,6 +345,7 @@ def _is_frequent_trader_by_blocktimes(
     - 高失败率（>= 30%）：Spam Bot 反向指标，直接否决。
     - 成功交易数 < 10：死号/新号/矩阵号，无稳定盈利历史，直接否决。
     - 若成功交易平均间隔 < 5 分钟，视为高频机器人。
+    注：此方法统计所有交易（含 transfer），精确判定请用 _is_frequent_trader_by_buy_sell_activities。
     """
     sample = [s for s in (sigs or [])[:sample_count] if isinstance(s, dict)]
     if len(sample) < 2:

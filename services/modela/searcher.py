@@ -27,6 +27,7 @@ from config.settings import (
     SM_USE_ATA_FIRST,
     SM_ATA_SIG_LIMIT,
     SM_LP_CHECK_TX_LIMIT,
+    FREQUENCY_CHECK_SIG_LIMIT,
     SCANNED_HISTORY_FILE,
     SM_MIN_DELAY_SEC,
     SM_MAX_DELAY_SEC,
@@ -66,6 +67,7 @@ from services.hunter_common import (
     hunter_had_any_lp_on_token,
     collect_lp_participants_from_txs,
     _is_frequent_trader_by_blocktimes,
+    _is_frequent_trader_by_buy_sell_activities,
 )
 from services.modela.scoring import compute_hunter_score
 
@@ -152,11 +154,20 @@ class SmartMoneySearcher:
         )
 
     async def is_frequent_trader(self, client, address: str) -> bool:
-        """判断是否为高频交易（供 MODELB 等复用）。"""
-        sigs = await self.get_signatures(client, address, limit=100)
+        """
+        判断是否为高频交易（供 MODELB / 维护体检复用）。
+        拉 300 条解析后只统计买卖活动，排除 transfer；买卖平均间隔 < 5 分钟视为高频。
+        使用 Alchemy getTransaction（RPC 格式），不依赖 Helius。
+        """
+        sigs = await self.get_signatures(client, address, limit=FREQUENCY_CHECK_SIG_LIMIT)
         if not sigs:
             return False
-        return _is_frequent_trader_by_blocktimes(sigs)
+        txs_rpc = await alchemy_client.fetch_parsed_transactions(
+            sigs, http_client=client, chunk_size=30, timeout=30.0
+        )
+        if not txs_rpc:
+            return False
+        return _is_frequent_trader_by_buy_sell_activities_rpc(txs_rpc, address)
 
     async def fetch_parsed_transactions(self, client, signatures):
         if not signatures:
@@ -212,13 +223,14 @@ class SmartMoneySearcher:
         if pre_fetched_txs is not None:
             txs = pre_fetched_txs
         else:
-            sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
-            if not sigs:
+            sigs = await self.get_signatures(client, hunter_address, limit=FREQUENCY_CHECK_SIG_LIMIT)
+            txs = await self.fetch_parsed_transactions(client, sigs) if sigs else []
+            if not txs:
                 return None
-            if _is_frequent_trader_by_blocktimes(sigs):
-                logger.info("⏭️ 剔除频繁交易地址 %s.. (blockTime 预检密集)", hunter_address)
+            usdc_price = await self._get_usdc_price_sol(client) if client else 0.01
+            if _is_frequent_trader_by_buy_sell_activities(txs, hunter_address, usdc_price_sol=usdc_price):
+                logger.info("⏭️ 剔除频繁交易地址 %s.. (买卖活动平均间隔<5分钟)", hunter_address)
                 return None
-            txs = await self.fetch_parsed_transactions(client, sigs)
             if not txs:
                 return None
         if not txs:
@@ -320,7 +332,8 @@ class SmartMoneySearcher:
     async def get_hunter_profit_on_token(
         self, client, hunter_address: str, token_address: str
     ) -> Tuple[float | None, List[dict] | None]:
-        sigs_lp = await self.get_signatures(client, hunter_address, limit=SM_LP_CHECK_TX_LIMIT)
+        # 拉 300 条用于 LP 检测 + 买卖频率判定（过滤后统计）
+        sigs_lp = await self.get_signatures(client, hunter_address, limit=FREQUENCY_CHECK_SIG_LIMIT)
         txs_main_wallet = None
         if sigs_lp:
             txs_lp = await self.fetch_parsed_transactions(client, sigs_lp)
@@ -328,14 +341,14 @@ class SmartMoneySearcher:
                 if hunter_had_any_lp_anywhere(txs_lp):
                     logger.warning(
                         "⚠️ LP 淘汰(主钱包/%d笔): %s.. 曾做过 LP，已拉黑",
-                        SM_LP_CHECK_TX_LIMIT, hunter_address[:12],
+                        FREQUENCY_CHECK_SIG_LIMIT, hunter_address[:12],
                     )
                     self._add_to_wallet_blacklist(hunter_address)
                     return None, None
                 if hunter_had_any_lp_on_token(txs_lp, hunter_address, token_address, ata_address=None):
                     logger.warning(
                         "⚠️ LP 淘汰(主钱包/该代币/%d笔): %s.. 已拉黑",
-                        SM_LP_CHECK_TX_LIMIT, hunter_address[:12],
+                        FREQUENCY_CHECK_SIG_LIMIT, hunter_address[:12],
                     )
                     self._add_to_wallet_blacklist(hunter_address)
                     return None, None
@@ -386,7 +399,9 @@ class SmartMoneySearcher:
                     if roi_ata < SM_MIN_TOKEN_PROFIT_PCT:
                         return None, None
                     if txs_main_wallet:
-                        if _is_frequent_trader_by_blocktimes(sigs_lp if sigs_lp else []):
+                        if _is_frequent_trader_by_buy_sell_activities(
+                            txs_main_wallet, hunter_address, usdc_price_sol=usdc_price
+                        ):
                             return None, None
                         txs_main = txs_main_wallet[: self.audit_tx_limit]
                         return roi_ata, txs_main if txs_main else None
@@ -399,16 +414,18 @@ class SmartMoneySearcher:
                     return roi_ata, txs_main
 
         if txs_main_wallet:
-            if _is_frequent_trader_by_blocktimes(sigs_lp if sigs_lp else []):
+            if _is_frequent_trader_by_buy_sell_activities(
+                txs_main_wallet, hunter_address, usdc_price_sol=usdc_price
+            ):
                 return None, None
             txs = txs_main_wallet
         else:
-            sigs = await self.get_signatures(client, hunter_address, limit=self.audit_tx_limit)
-            if not sigs:
+            sigs = await self.get_signatures(client, hunter_address, limit=FREQUENCY_CHECK_SIG_LIMIT)
+            txs = await self.fetch_parsed_transactions(client, sigs) if sigs else []
+            if not txs or _is_frequent_trader_by_buy_sell_activities(
+                txs, hunter_address, usdc_price_sol=usdc_price
+            ):
                 return None, None
-            if _is_frequent_trader_by_blocktimes(sigs):
-                return None, None
-            txs = await self.fetch_parsed_transactions(client, sigs)
             if not txs:
                 return None, None
         buy_sol, sell_sol, tokens_held = 0.0, 0.0, 0.0
