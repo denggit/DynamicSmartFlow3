@@ -49,6 +49,8 @@ MIN_SHARE_VALUE_SOL = 0.0001
 DUST_TOKEN_AMOUNT_UI = 1e-5
 # 持仓数量 floor 精度：存储时向下取整，避免 round 进位导致记录 > 链上，卖出超量失败
 TOKEN_AMOUNT_FLOOR_DECIMALS = 6
+# 卖出失败时减量重试：如 6400.40 失败则试 6400.39，应对精度导致超量失败
+SELL_RETRY_DECREMENT = 0.01
 MIN_SELL_RATIO = 0.3
 FOLLOW_SELL_THRESHOLD = 0.05
 

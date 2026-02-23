@@ -28,6 +28,7 @@ from solders.transaction import VersionedTransaction
 from config.settings import (
     get_tier_config, TAKE_PROFIT_LEVELS,
     MIN_SHARE_VALUE_SOL, DUST_TOKEN_AMOUNT_UI, TOKEN_AMOUNT_FLOOR_DECIMALS,
+    SELL_RETRY_DECREMENT,
     MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
     FRESH_POSITION_RPC_GRACE_SEC, FRESH_POSITION_RETRY_DELAY_SEC,
     SOLANA_PRIVATE_KEY_BASE58,
@@ -182,7 +183,8 @@ class SolanaTrader:
     async def _fetch_own_token_balance(self, token_mint: str) -> Optional[float]:
         """
         获取我方钱包在链上的 Token 余额（UI 单位）。
-        优先用 uiAmountString 避免 uiAmount 的 JSON 精度丢失；返回时 floor 避免记录 > 链上。
+        优先用 uiAmountString，否则用 amount+decimals 精确计算，避免 uiAmount 的 JSON 精度丢失。
+        返回时 floor 避免记录 > 链上，防止卖出时超量失败（如链上 6400.396606 若记录为 6400.40 会卖失败）。
         """
         if not self.keypair:
             return None
@@ -198,16 +200,24 @@ class SolanaTrader:
         for acc in result["value"]:
             info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
             tamt = info.get("tokenAmount") or {}
+            add_ui = None
             ui_str = tamt.get("uiAmountString")
             if ui_str is not None:
                 try:
-                    total_ui += float(ui_str)
+                    add_ui = float(ui_str)
                 except (ValueError, TypeError):
-                    ui = tamt.get("uiAmount")
-                    if ui is not None:
-                        total_ui += float(ui)
-            elif tamt.get("uiAmount") is not None:
-                total_ui += float(tamt["uiAmount"])
+                    pass
+            if add_ui is None:
+                amt_str, dec = tamt.get("amount"), tamt.get("decimals")
+                if amt_str is not None and dec is not None:
+                    try:
+                        add_ui = int(amt_str) / (10 ** int(dec))
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        pass
+            if add_ui is None and tamt.get("uiAmount") is not None:
+                add_ui = float(tamt["uiAmount"])
+            if add_ui is not None:
+                total_ui += add_ui
         return _floor_token_amount(total_ui) if total_ui > 0 else total_ui
 
     async def _fetch_own_token_balance_raw(self, token_mint: str) -> Optional[int]:
@@ -909,19 +919,18 @@ class SolanaTrader:
 
         sell_amount_ui = min(sell_amount_ui, share.token_amount)
 
-        # 链上余额为准：复用入口已查的 chain_bal_early，避免重复 RPC（原 4 次→2 次）
+        # 链上余额为准：以链上为准且 floor，避免 6400.40>6400.396606 导致 Jupiter 卖出超量失败
         chain_bal = chain_bal_early
         if chain_bal is not None and sell_amount_ui > chain_bal:
             logger.warning(
-                "⚠️ 状态与链上不一致: 计划卖 %.2f 但链上仅 %.2f，以链上为准",
+                "⚠️ 状态与链上不一致: 计划卖 %.6f 但链上仅 %.6f，以链上为准",
                 sell_amount_ui, chain_bal
             )
-            sell_amount_ui = min(sell_amount_ui, chain_bal)
-        # 卖出前再拉一次链上余额，应对连续多笔跟卖时的延迟（唯一二次查询）
+            sell_amount_ui = _floor_token_amount(min(sell_amount_ui, chain_bal))
         chain_bal2 = await self._fetch_own_token_balance(token_address)
         if chain_bal2 is not None and sell_amount_ui > chain_bal2:
-            sell_amount_ui = min(sell_amount_ui, chain_bal2)
-            logger.debug("二次校验链上余额 %.2f，最终卖出 %.2f", chain_bal2, sell_amount_ui)
+            sell_amount_ui = _floor_token_amount(min(sell_amount_ui, chain_bal2))
+            logger.debug("二次校验链上余额 %.6f，最终卖出 %.6f", chain_bal2, sell_amount_ui)
             # 使用 chain_bal2（二次校验成功）进行状态同步，避免 chain_bal 为 None 时 TypeError
             if chain_bal2 < pos.total_tokens * 0.99:
                 old_total = pos.total_tokens
@@ -931,8 +940,8 @@ class SolanaTrader:
                     for s in pos.shares.values():
                         s.token_amount = _floor_token_amount(s.token_amount * ratio)
         else:
-            # 查余额失败，兜底 99.9%
-            sell_amount_ui = min(sell_amount_ui, share.token_amount * SELL_BUFFER)
+            # 查余额失败，兜底 99.9% 并 floor，避免超量
+            sell_amount_ui = _floor_token_amount(min(sell_amount_ui, share.token_amount * SELL_BUFFER))
         if sell_amount_ui <= 0:
             logger.warning("链上无持仓或余额为 0，同步状态并停止监控")
             self._sync_zero_and_close_position(token_address, pos)
@@ -956,7 +965,7 @@ class SolanaTrader:
             )
             return
 
-        logger.info(f"📉 [准备卖出] {token_address} | 数量: {sell_amount_ui:.2f}")
+        logger.info(f"📉 [准备卖出] {token_address} | 数量: {sell_amount_ui:.6f}")
 
         # === 真实卖出（失败时按 2%/5%/10% 滑点递增重试，重试前会检查链上余额）===
         tx_sig, sol_got_ui = await self._jupiter_sell_with_retry(
@@ -1532,6 +1541,27 @@ class SolanaTrader:
                     "❌ 卖出失败，冷却 %ds 后重试下一档滑点 %.1f%%",
                     TRADER_RETRY_COOLDOWN_SEC, slippage_list[i + 1] / 100,
                 )
+        # 全部滑点重试仍失败：可能是精度导致超量（如 6400.40>6400.396606），减量再试一次
+        decrement = SELL_RETRY_DECREMENT if amount_in_ui >= 0.1 else 0.000001
+        retry_amount = _floor_token_amount(max(0, amount_in_ui - decrement))
+        if retry_amount >= 1e-9 and retry_amount < amount_in_ui:
+            chain_retry = await self._fetch_own_token_balance(input_mint)
+            if chain_retry is not None and chain_retry >= retry_amount:
+                logger.info(
+                    "🔄 卖出失败，减量 %.6f -> %.6f 重试一次（应对精度超量）: %s",
+                    amount_in_ui, retry_amount, input_mint[:16] + "..",
+                )
+                await asyncio.sleep(TRADER_RETRY_COOLDOWN_SEC)
+                tx_sig, sol_out, _ = await self._jupiter_swap(
+                    input_mint=input_mint,
+                    output_mint=output_mint,
+                    amount_in_ui=retry_amount,
+                    slippage_bps=slippage_list[-1],
+                    is_sell=True,
+                    token_decimals=token_decimals,
+                )
+                if tx_sig is not None:
+                    return tx_sig, sol_out
         return None, 0.0
 
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
