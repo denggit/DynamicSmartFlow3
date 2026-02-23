@@ -188,7 +188,8 @@ class SolanaTrader:
             ui = tamt.get("uiAmount")
             if ui is not None:
                 total_ui += float(ui)
-        return total_ui if total_ui > 0 else None
+        # 余额为 0 时返回 0.0，不返回 None；否则会被误判为「RPC 失败」导致对账重试
+        return total_ui
 
     async def _fetch_own_token_balance_raw(self, token_mint: str) -> Optional[int]:
         """

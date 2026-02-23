@@ -630,11 +630,19 @@ async def main(immediate_audit: bool = False):
         await trader.ensure_fully_closed(token_address, remove_if_chain_unknown=True)
 
     agent.on_hunter_zero_skip = _on_hunter_zero_skip  # 必须在 restore_agent_from_trader 前设置，否则恢复时漏删过时持仓
-    # 先启动监控，再对账：对账完成后再修复（链上无持仓则停监控，持仓量不对则更新，正确则不变）
+    # 恢复监控后立即启动各模块，对账在后台异步执行，不阻塞 Monitor/Agent/PnL 等
     await restore_agent_from_trader()
-    removed_tokens = await trader.reconcile_positions_on_startup()
-    for token in removed_tokens:
-        await agent.stop_tracking(token)
+
+    async def _startup_reconcile_task() -> None:
+        """后台异步执行启动对账。完成后对需移除的 token 停监控。不阻塞其他模块启动。"""
+        try:
+            removed_tokens = await trader.reconcile_positions_on_startup()
+            for token in removed_tokens:
+                await agent.stop_tracking(token)
+            if removed_tokens:
+                logger.info("📋 [启动对账] 已完成：移除 %d 个已归零持仓", len(removed_tokens))
+        except Exception:
+            logger.exception("启动对账异常")
 
     def get_tracked_tokens():
         out = set(trader.positions.keys())
@@ -691,6 +699,7 @@ async def main(immediate_audit: bool = False):
         await monitor.run_immediate_audit()
 
     await asyncio.gather(
+        _startup_reconcile_task(),  # 启动对账异步执行，完成后自动停监控已归零 token
         monitor.start(),
         agent.start(),
         pnl_monitor_loop(),
