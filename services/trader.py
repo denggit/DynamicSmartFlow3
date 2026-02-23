@@ -612,7 +612,7 @@ class SolanaTrader:
             })
         # 极小价格用更多小数位避免精度丢失导致止盈/止损误判
         price_fmt = f"{actual_price:.8f}" if actual_price < 0.0001 else f"{actual_price:.6f}"
-        logger.info(f"✅ 开仓成功 | 均价: {price_fmt} SOL | 持仓: {token_amount_ui:.2f}")
+        logger.info(f"✅ 开仓成功 | %s | 均价: {price_fmt} SOL | 持仓: {token_amount_ui:.2f}", token_address)
 
     async def execute_add_position(self, token_address: str, trigger_hunter: Dict, add_reason: str,
                                    current_price: float):
