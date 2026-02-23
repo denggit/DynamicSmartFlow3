@@ -630,9 +630,11 @@ async def main(immediate_audit: bool = False):
         await trader.ensure_fully_closed(token_address, remove_if_chain_unknown=True)
 
     agent.on_hunter_zero_skip = _on_hunter_zero_skip  # 必须在 restore_agent_from_trader 前设置，否则恢复时漏删过时持仓
-    # 恢复监控前：用 Alchemy 查链上持仓，归零/粉尘则不同步监控；查询失败冷却后重试；并以链上为准更新持仓数量
-    await trader.reconcile_positions_on_startup()
+    # 先启动监控，再对账：对账完成后再修复（链上无持仓则停监控，持仓量不对则更新，正确则不变）
     await restore_agent_from_trader()
+    removed_tokens = await trader.reconcile_positions_on_startup()
+    for token in removed_tokens:
+        await agent.stop_tracking(token)
 
     def get_tracked_tokens():
         out = set(trader.positions.keys())
