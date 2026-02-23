@@ -36,6 +36,7 @@ from config.settings import (
     DISCOVERY_INTERVAL_WHEN_FULL_SEC,
     FETCH_TX_MAX_RETRIES,
     FETCH_TX_RETRY_DELAY_BASE,
+    HELIUS_429_EMERGENCY_CLOSE,
     SIG_QUEUE_BATCH_SIZE,
     SIG_QUEUE_DRAIN_TIMEOUT,
     WALLET_WS_RESUBSCRIBE_SEC,
@@ -641,17 +642,24 @@ class HunterMonitorController:
                         break
                     else:
                         logger.warning("批量拉取失败（已重试 %d 次）", FETCH_TX_MAX_RETRIES)
-                        # 若为 429（credit 耗尽/限流）且未触发过，执行保命：清仓所有 + 致命错误告警
-                        if (
-                            resp.status_code == 429
-                            and not self._helius_emergency_triggered
-                            and self.on_helius_credit_exhausted
-                        ):
-                            self._helius_emergency_triggered = True
-                            try:
-                                await self.on_helius_credit_exhausted()
-                            except Exception:
-                                logger.exception("on_helius_credit_exhausted 回调异常")
+                        if resp.status_code == 429:
+                            if (
+                                HELIUS_429_EMERGENCY_CLOSE
+                                and not self._helius_emergency_triggered
+                                and self.on_helius_credit_exhausted
+                            ):
+                                self._helius_emergency_triggered = True
+                                try:
+                                    await self.on_helius_credit_exhausted()
+                                except Exception:
+                                    logger.exception("on_helius_credit_exhausted 回调异常")
+                            else:
+                                backoff = 120
+                                logger.warning(
+                                    "⚠️ Helius 批量拉取 429，冷却 %ds 后继续（HELIUS_429_EMERGENCY_CLOSE=%s，不执行紧急清仓）",
+                                    backoff, str(HELIUS_429_EMERGENCY_CLOSE).lower(),
+                                )
+                                await asyncio.sleep(backoff)
             except Exception:
                 logger.exception("消费队列异常")
                 await asyncio.sleep(CONSUME_QUEUE_ERROR_SLEEP_SEC)
