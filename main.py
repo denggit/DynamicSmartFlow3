@@ -12,7 +12,8 @@ from pathlib import Path
 
 from config.settings import (
     PNL_CHECK_INTERVAL,
-    HUNTER_ADD_THRESHOLD_SOL,
+    HUNTER_ADD_THRESHOLD_SOL_MIN,
+    HUNTER_ADD_THRESHOLD_SOL_MAX,
     MAX_ENTRY_PUMP_MULTIPLIER,
     DAILY_REPORT_HOUR,
     POOL_SIZE_LIMIT,
@@ -228,14 +229,19 @@ async def _on_agent_signal_impl(signal):
             decimals = pos.decimals if pos.decimals is not None and pos.decimals > 0 else 9
             add_amount_ui = signal.get("add_amount_raw", 0) / (10 ** decimals)
         add_sol_value = add_amount_ui * price
-        if add_sol_value >= HUNTER_ADD_THRESHOLD_SOL:
+        if HUNTER_ADD_THRESHOLD_SOL_MIN <= add_sol_value <= HUNTER_ADD_THRESHOLD_SOL_MAX:
             hunter_info = {"address": hunter_addr, "score": pos.lead_hunter_score}
             await trader.execute_add_position(token, hunter_info, "猎手大额加仓", price)
             await agent.add_hunter_to_mission(token, hunter_addr)
+        elif add_sol_value < HUNTER_ADD_THRESHOLD_SOL_MIN:
+            logger.debug(
+                "⏭️ 加仓跳过: %s 猎手加仓 %.4f SOL < 下限 %.1f SOL",
+                token[:8], add_sol_value, HUNTER_ADD_THRESHOLD_SOL_MIN,
+            )
         else:
             logger.debug(
-                "⏭️ 加仓跳过: %s 猎手加仓 %.4f SOL < 阈值 %.1f SOL (数量 %.2f × 价 %.8f)",
-                token[:8], add_sol_value, HUNTER_ADD_THRESHOLD_SOL, add_amount_ui, price,
+                "⏭️ 加仓跳过: %s 猎手加仓 %.4f SOL > 上限 %.1f SOL，视为异常大单不跟",
+                token[:8], add_sol_value, HUNTER_ADD_THRESHOLD_SOL_MAX,
             )
 
 
