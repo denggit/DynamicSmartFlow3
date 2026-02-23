@@ -89,9 +89,13 @@ def _save_closed_pnl_log() -> None:
         logger.exception("保存清仓记录失败")
 
 
-def _on_position_closed(snapshot: dict) -> None:
+# 猎手连续亏损计数：达到 3 次触发即时体检
+_hunter_consecutive_losses: dict = {}
+
+
+def _on_position_closed_base(snapshot: dict) -> None:
     """
-    清仓回调：记入日志、后台线程写 closed_pnl。
+    清仓回调基逻辑：记入日志、后台线程写 closed_pnl。
     不阻塞跟单主流程。closed_pnl_log.append 在锁内执行，避免多线程竞态。
     清仓不再发邮件，周报中会汇总。
     """
@@ -168,7 +172,9 @@ async def _on_monitor_signal_impl(signal, sm_searcher=None):
                 "若实际已持仓请手动处理或等待链上对账",
                 token[:16] + "..",
             )
-        # definitely_failed is None：未尝试（keypair/已有仓位等），不记录
+        else:
+            # definitely_failed is None：未尝试（keypair/已有仓位/无猎手等）
+            logger.info("⏭️ 开仓未执行: %s（trader 已跳过，详见上方日志）", token[:16] + "..")
         return
 
     # 4. 买入不再发邮件，周报中会汇总
@@ -318,10 +324,10 @@ async def liquidity_structural_check_loop():
 # 后台任务：每日日报（从 trading_history.json 读取，仅日报时读）
 # =========================================
 
-def _build_daily_report_from_history(trader_instance):
+async def _build_daily_report_from_history(trader_instance, price_scanner_instance):
     """
     从 月度汇总 + 当月 trading_history + 当前持仓 + hunters.json 生成详细日报内容。
-    仅加载少量数据（当月记录 + 若干月度 summary 文件），不占用大量内存。
+    含今日/累计猎手盈利亏损 TOP5、未清仓持仓估值。price_scanner 用于拉取当前价格。
     """
     history, summaries = load_data_for_report()  # 内部会先做月度汇总与裁剪
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -335,7 +341,7 @@ def _build_daily_report_from_history(trader_instance):
     today_tokens_settled = len(set(r.get("token") for r in sell_today if r.get("token")))
 
     today_pnl = sum(r.get("pnl_sol") or 0 for r in sell_today)
-    # 累计：各月度汇总 + 当月（history 经裁剪后仅为当月记录）
+    # 累计：各月度汇总 + 当月
     month_sells = [r for r in history if r.get("type") == "sell" and r.get("pnl_sol") is not None]
     total_pnl = sum(s.get("total_pnl", 0) for s in summaries) + sum(r.get("pnl_sol", 0) for r in month_sells)
     total_trades = sum(s.get("total_trades", 0) for s in summaries) + len(history)
@@ -357,7 +363,7 @@ def _build_daily_report_from_history(trader_instance):
         if costs:
             today_avg_roi_pct = (today_pnl / sum(costs)) * 100 if sum(costs) > 0 else 0
 
-    # 猎手池数量（MODELA: hunters.json, MODELB: smart_money.json）
+    # 猎手池数量
     hunter_pool_count = 0
     if HUNTER_POOL_PATH.exists():
         try:
@@ -367,7 +373,24 @@ def _build_daily_report_from_history(trader_instance):
         except Exception:
             pass
 
-    # 跟单猎手 TOP5：各月 hunter_pnl 合并 + 当月卖出
+    # 今日猎手盈亏（按猎人合并多 token）
+    daily_hunter_pnl = {}
+    for r in sell_today:
+        addr = r.get("hunter_addr") or ""
+        if addr:
+            daily_hunter_pnl[addr] = daily_hunter_pnl.get(addr, 0) + (r.get("pnl_sol") or 0)
+    daily_profit_top5 = sorted(
+        [(a, p) for a, p in daily_hunter_pnl.items() if p > 0],
+        key=lambda x: -x[1],
+    )[:5]
+    daily_loss_top5 = sorted(
+        [(a, p) for a, p in daily_hunter_pnl.items() if p < 0],
+        key=lambda x: x[1],
+    )[:5]
+    daily_profit_top5 = [(a, p) for a, p in daily_profit_top5]
+    daily_loss_top5 = [(a, p) for a, p in daily_loss_top5]
+
+    # 累计猎手盈亏
     hunter_pnl = {}
     for s in summaries:
         for addr, pnl in (s.get("hunter_pnl") or {}).items():
@@ -377,24 +400,83 @@ def _build_daily_report_from_history(trader_instance):
         addr = r.get("hunter_addr") or ""
         if addr:
             hunter_pnl[addr] = hunter_pnl.get(addr, 0) + (r.get("pnl_sol") or 0)
-    top_hunters = sorted(hunter_pnl.items(), key=lambda x: -x[1])[:5]
-    top_hunters = [(f"{addr[:12]}..", pnl, i + 1) for i, (addr, pnl) in enumerate(top_hunters)]
+    overall_profit_top5 = sorted(
+        [(a, p) for a, p in hunter_pnl.items() if p > 0],
+        key=lambda x: -x[1],
+    )[:5]
+    overall_loss_top5 = sorted(
+        [(a, p) for a, p in hunter_pnl.items() if p < 0],
+        key=lambda x: x[1],
+    )[:5]
+    overall_profit_top5 = [(a, p) for a, p in overall_profit_top5]
+    overall_loss_top5 = [(a, p) for a, p in overall_loss_top5]
 
-    # 今日明细
+    # 未清仓持仓估值：按猎手合并（仅当能获取价格时计入），带代币名称
+    unrealized_by_hunter = []
+    if trader_instance.positions and price_scanner_instance:
+        hunter_cost: dict = {}
+        hunter_value: dict = {}
+        hunter_tokens: dict = {}  # addr -> [symbol or addr, ...]
+        tokens_to_fetch = [
+            (t, p) for t, p in trader_instance.positions.items()
+            if p and p.total_tokens > 0
+        ]
+        for token_address, pos in tokens_to_fetch:
+            try:
+                price, symbol = await price_scanner_instance.get_token_price_and_symbol(token_address)
+                await asyncio.sleep(0.3)  # 避免 DexScreener 限流
+            except Exception:
+                price, symbol = None, None
+            if not price or price <= 0:
+                continue
+            token_label = symbol or token_address
+            total_cost = pos.total_cost_sol
+            total_tokens = pos.total_tokens
+            for addr, share in pos.shares.items():
+                if share.token_amount <= 0:
+                    continue
+                ratio = share.token_amount / total_tokens
+                cost = ratio * total_cost
+                value = share.token_amount * price
+                hunter_cost[addr] = hunter_cost.get(addr, 0) + cost
+                hunter_value[addr] = hunter_value.get(addr, 0) + value
+                hunter_tokens.setdefault(addr, []).append(token_label)
+        for addr in hunter_cost:
+            c = hunter_cost[addr]
+            v = hunter_value.get(addr, 0)
+            tokens_str = ", ".join(dict.fromkeys(hunter_tokens.get(addr, [])))  # 去重保序
+            unrealized_by_hunter.append((addr, tokens_str, c, v, v - c))
+        unrealized_by_hunter.sort(key=lambda x: -x[4])  # 按浮盈排序
+
+    # 今日明细：拉取代币 symbol，展示完整地址与名称
+    token_symbol_cache: dict = {}
+    today_token_addrs = list(set(r.get("token", "") for r in today_records if r.get("token")))
+    for token_addr in today_token_addrs:
+        if token_addr and token_addr not in token_symbol_cache:
+            if price_scanner_instance:
+                try:
+                    _, sym = await price_scanner_instance.get_token_price_and_symbol(token_addr)
+                    token_symbol_cache[token_addr] = sym or token_addr
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    token_symbol_cache[token_addr] = token_addr
+            else:
+                token_symbol_cache[token_addr] = token_addr
     today_details = []
     for r in today_records:
         ts = r.get("ts") or 0
         time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "-"
         typ = r.get("type", "")
-        token = (r.get("token") or "")[:12]
+        token_addr = r.get("token") or ""
+        token_label = f"{token_symbol_cache.get(token_addr, token_addr)} ({token_addr})" if token_addr else "(未知)"
         note = r.get("note", "")
         if typ == "buy":
             sol = r.get("sol_spent") or 0
-            today_details.append(f"  [{time_str}] {token}.. 买入 {sol:.4f} SOL | {note}\n")
+            today_details.append(f"  [{time_str}] {token_label} 买入 {sol:.4f} SOL | {note}\n")
         else:
             pnl = r.get("pnl_sol")
             pnl_str = f" {pnl:+.4f} SOL" if pnl is not None else ""
-            today_details.append(f"  [{time_str}] {token}.. 卖出 | {note}{pnl_str}\n")
+            today_details.append(f"  [{time_str}] {token_label} 卖出 | {note}{pnl_str}\n")
     if not today_details:
         today_details = ["(今日无交易)\n"]
 
@@ -411,8 +493,13 @@ def _build_daily_report_from_history(trader_instance):
         today_profit_factor=today_profit_factor,
         total_pnl_sol=total_pnl,
         total_trades=total_trades,
-        top_hunters=top_hunters,
+        top_hunters=[],
         today_details=today_details,
+        daily_profit_top5=daily_profit_top5,
+        daily_loss_top5=daily_loss_top5,
+        overall_profit_top5=overall_profit_top5,
+        overall_loss_top5=overall_loss_top5,
+        unrealized_by_hunter=unrealized_by_hunter,
     )
     return content
 
@@ -454,8 +541,8 @@ async def daily_report_loop():
         await asyncio.sleep(max(1, wait_sec))
 
         try:
-            # 日报生成含文件读写，放到线程池执行，不阻塞主流程与跟单
-            content = await asyncio.to_thread(_build_daily_report_from_history, trader)
+            # 日报生成含文件读写与价格拉取，使用 async 以支持 price_scanner
+            content = await _build_daily_report_from_history(trader, price_scanner)
             notification.send_detailed_daily_report_email(content)
         except Exception:
             logger.exception("❌ 日报生成失败")
@@ -508,7 +595,6 @@ async def main(immediate_audit: bool = False):
     """主入口。HUNTER_MODE 在进程启动时确定，修改 .env 后需重启生效。"""
     _load_closed_pnl_log()
     await asyncio.to_thread(_migrate_closed_pnl_to_history)  # 后台线程迁移，不阻塞启动
-    trader.on_position_closed_callback = _on_position_closed
     trader.on_trade_recorded = append_trade_in_background  # 后台线程写入，不阻塞跟单
 
     async def _on_hunter_zero_skip(token_address: str) -> None:
@@ -550,6 +636,24 @@ async def main(immediate_audit: bool = False):
             logger.warning("🛑 体检踢出猎手 %s..，已兜底清仓其 %d 个跟仓", hunter_addr[:12], closed)
 
     monitor.on_hunter_removed = _on_hunter_removed
+
+    def _on_position_closed(snapshot: dict) -> None:
+        """清仓回调：记日志 + 连续亏损 3 次即时时体检。"""
+        _on_position_closed_base(snapshot)
+        hunter_addrs = snapshot.get("hunter_addrs") or []
+        total_pnl_sol = snapshot.get("total_pnl_sol", 0)
+        if total_pnl_sol < 0:
+            for addr in hunter_addrs:
+                _hunter_consecutive_losses[addr] = _hunter_consecutive_losses.get(addr, 0) + 1
+                if _hunter_consecutive_losses[addr] >= 3:
+                    logger.warning("🩺 猎手 %s.. 连续 3 次亏损，触发即时体检", addr[:12])
+                    asyncio.create_task(monitor.run_audit_for_hunter(addr))
+                    _hunter_consecutive_losses[addr] = 0
+        else:
+            for addr in hunter_addrs:
+                _hunter_consecutive_losses[addr] = 0
+
+    trader.on_position_closed_callback = _on_position_closed
 
     if immediate_audit:
         await monitor.run_immediate_audit()

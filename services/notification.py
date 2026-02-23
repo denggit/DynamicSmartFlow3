@@ -173,10 +173,18 @@ def build_detailed_daily_report(
     total_trades: int,
     top_hunters: list,
     today_details: list,
+    daily_profit_top5: list = None,
+    daily_loss_top5: list = None,
+    overall_profit_top5: list = None,
+    overall_loss_top5: list = None,
+    unrealized_by_hunter: list = None,
 ) -> str:
     """
     构建详细日报正文。
-    top_hunters: [(hunter_addr_short, pnl_sol, rank), ...] 前五名
+    top_hunters: [(hunter_addr_short, pnl_sol, rank), ...] 累计前五（兼容旧逻辑）
+    daily_profit_top5 / daily_loss_top5: [(addr, pnl_sol), ...] 今日盈利/亏损前五，addr 为完整地址
+    overall_profit_top5 / overall_loss_top5: [(addr, pnl_sol), ...] 累计盈利/亏损前五，addr 为完整地址
+    unrealized_by_hunter: [(addr, tokens_str, cost_sol, value_sol, unrealized_sol), ...] 未清仓猎手持仓成本与估值
     today_details: 今日每笔交易/结算说明
     """
     mode_label = (HUNTER_MODE or "MODELA").strip().upper()
@@ -202,13 +210,49 @@ def build_detailed_daily_report(
         f"累计盈亏: {total_pnl_sol:+.4f} SOL\n",
         f"累计成交笔数: {total_trades}\n",
         "\n",
-        "───────── 跟单猎手表现 TOP5 ─────────\n",
+        "───────── 今日盈利猎手 TOP5 ─────────\n",
     ])
-    if top_hunters:
-        for i, (addr, pnl, _) in enumerate(top_hunters, 1):
-            lines.append(f"  {i}. {addr}.. 累计盈亏: {pnl:+.4f} SOL\n")
+    if daily_profit_top5:
+        for i, (addr, pnl) in enumerate(daily_profit_top5, 1):
+            lines.append(f"  {i}. {addr} 今日盈利: {pnl:+.4f} SOL\n")
+    else:
+        lines.append("  (今日暂无)\n")
+    lines.extend([
+        "\n",
+        "───────── 今日亏损猎手 TOP5 ─────────\n",
+    ])
+    if daily_loss_top5:
+        for i, (addr, pnl) in enumerate(daily_loss_top5, 1):
+            lines.append(f"  {i}. {addr} 今日亏损: {pnl:+.4f} SOL\n")
+    else:
+        lines.append("  (今日暂无)\n")
+    lines.extend([
+        "\n",
+        "───────── 累计盈利猎手 TOP5 ─────────\n",
+    ])
+    if overall_profit_top5:
+        for i, (addr, pnl) in enumerate(overall_profit_top5, 1):
+            lines.append(f"  {i}. {addr} 累计盈利: {pnl:+.4f} SOL\n")
     else:
         lines.append("  (暂无数据)\n")
+    lines.extend([
+        "\n",
+        "───────── 累计亏损猎手 TOP5 ─────────\n",
+    ])
+    if overall_loss_top5:
+        for i, (addr, pnl) in enumerate(overall_loss_top5, 1):
+            lines.append(f"  {i}. {addr} 累计亏损: {pnl:+.4f} SOL\n")
+    else:
+        lines.append("  (暂无数据)\n")
+    if unrealized_by_hunter:
+        lines.extend([
+            "\n",
+            "───────── 未清仓持仓估值 ─────────\n",
+        ])
+        for addr, tokens_str, cost_sol, value_sol, unrealized in unrealized_by_hunter:
+            u_str = f" (浮盈 {unrealized:+.4f})" if unrealized >= 0 else f" (浮亏 {unrealized:+.4f})"
+            tok_part = f" [{tokens_str}]" if tokens_str else ""
+            lines.append(f"  {addr}{tok_part} 成本 {cost_sol:.4f} SOL → 估值 {value_sol:.4f} SOL{u_str}\n")
     lines.extend([
         "\n",
         "───────── 今日明细 ─────────\n",

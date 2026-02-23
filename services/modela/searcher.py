@@ -68,6 +68,7 @@ from services.hunter_common import (
     collect_lp_participants_from_txs,
     _is_frequent_trader_by_blocktimes,
     _is_frequent_trader_by_buy_sell_activities,
+    _is_frequent_trader_by_buy_sell_activities_rpc,
 )
 from services.modela.scoring import compute_hunter_score
 

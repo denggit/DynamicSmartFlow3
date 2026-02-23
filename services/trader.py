@@ -27,7 +27,7 @@ from solders.transaction import VersionedTransaction
 
 from config.settings import (
     get_tier_config, TAKE_PROFIT_LEVELS,
-    MIN_SHARE_VALUE_SOL, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
+    MIN_SHARE_VALUE_SOL, DUST_TOKEN_AMOUNT_UI, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
     SOLANA_PRIVATE_KEY_BASE58,
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, SELL_SLIPPAGE_BPS_STOP_LOSS, jup_key_pool,
     TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
@@ -247,6 +247,15 @@ class SolanaTrader:
             return
         sell_amount = chain_bal_recheck if chain_bal_recheck is not None else chain_bal
         if sell_amount <= 0:
+            if pos:
+                self._sync_zero_and_close_position(token_address, pos)
+            return
+        # 粉尘余额：Jupiter 无路由，卖出无意义，仅同步并关闭
+        if sell_amount < DUST_TOKEN_AMOUNT_UI:
+            logger.info(
+                "链上余额 %.6f 已为粉尘（阈值 %.0e），跳过卖出并同步关闭: %s",
+                sell_amount, DUST_TOKEN_AMOUNT_UI, token_address[:16] + "..",
+            )
             if pos:
                 self._sync_zero_and_close_position(token_address, pos)
             return
@@ -505,9 +514,14 @@ class SolanaTrader:
         halve_position=True 时买入减半且禁止加仓。
         entry_liquidity_usd: 入场时 DexScreener 流动性，用于跟仓期结构风险检查（LP 撤池/净减 30% 即清仓）。
         """
-        if not self.keypair: return
-        if token_address in self.positions: return
+        if not self.keypair:
+            logger.warning("❌ 开仓跳过: 未配置私钥")
+            return
+        if token_address in self.positions:
+            logger.info("⏭️ 开仓跳过: %s 已有持仓", token_address[:16] + "..")
+            return
         if not hunters:
+            logger.warning("❌ 开仓跳过: 无有效猎手")
             return
         lead = hunters[0]  # 只跟单猎手（共振时已取最高分）
         score = float(lead.get('score', 0))
@@ -535,7 +549,16 @@ class SolanaTrader:
         )
 
         if not tx_sig:
-            # 供 main 判断：仅 definite 时可加入放弃集，避免实际已买入却误放弃后续跟仓
+            if definitely_no_buy:
+                logger.warning(
+                    "❌ 开仓失败: %s | Quote/Swap 未通过，从未广播",
+                    token_address[:16] + "..",
+                )
+            else:
+                logger.warning(
+                    "❌ 开仓失败: %s | 已广播但验证超时，链上可能已成交",
+                    token_address[:16] + "..",
+                )
             return definitely_no_buy
 
         # 3. 转换 UI Amount
@@ -851,6 +874,16 @@ class SolanaTrader:
             logger.warning("止盈跳过: 均价异常 %.6f", pos.average_price)
             return
 
+        # 整仓价值为粉尘时直接同步关闭，避免每轮 PnL 循环重复检查浪费 RPC
+        total_value_sol = pos.total_tokens * current_price_ui
+        if total_value_sol < MIN_SHARE_VALUE_SOL:
+            logger.info(
+                "⏭️ 止盈入口: 持仓总值 %.4f SOL < %.2f SOL 无意义，同步关闭: %s",
+                total_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
+            )
+            self._sync_zero_and_close_position(token_address, pos)
+            return
+
         pnl_pct = (current_price_ui - pos.average_price) / pos.average_price
 
         # DexScreener 价格可能因 base/quote 解析错误虚高，当 pnl>200% 时用 Jupiter 校验真实可卖价
@@ -1019,22 +1052,22 @@ class SolanaTrader:
                     return
                 sell_value_sol = sell_amount * current_price_ui
                 if sell_value_sol < MIN_SHARE_VALUE_SOL:
-                    # 卖出价值过小：若链上已归零或远小于内部（说明实际已清仓），必须 sync 并返回，否则无限循环浪费 RPC
+                    # 卖出价值过小：链上归零/几乎归零或整仓为粉尘，同步关闭避免每轮 PnL 重复检查浪费 RPC
                     chain_bal_recheck = chain_bal if chain_bal is not None else await self._fetch_own_token_balance(token_address)
                     if chain_bal_recheck is not None and (
                         chain_bal_recheck < 1e-9 or chain_bal_recheck < pos.total_tokens * 0.01
                     ):
                         logger.info(
-                            "✅ 止盈跳过(链上已归零或几乎归零): 内部 %.2f vs 链上 %.2f，同步状态: %s",
+                            "✅ 止盈跳过(链上已归零或几乎归零): 内部 %.2f vs 链上 %.2f，同步: %s",
                             pos.total_tokens, chain_bal_recheck, token_address[:16] + "..",
                         )
-                        self._sync_zero_and_close_position(token_address, pos)
-                        return
-                    logger.info(
-                        "⏭️ 止盈跳过: 卖出价值 %.4f SOL < %.2f SOL，无意义: %s",
-                        sell_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
-                    )
-                    continue
+                    else:
+                        logger.info(
+                            "⏭️ 止盈跳过: 卖出价值 %.4f SOL < %.2f SOL 无意义，同步关闭: %s",
+                            sell_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
+                        )
+                    self._sync_zero_and_close_position(token_address, pos)
+                    return
                 logger.info(f"💰 [止盈触发] {token_address} (+{pnl_pct * 100:.0f}%) | 卖出 {sell_amount:.2f}")
 
                 # === 真实卖出（失败时按 2%/5%/10% 滑点递增重试）===
@@ -1202,7 +1235,9 @@ class SolanaTrader:
                         await asyncio.sleep(backoff_sec)
                         continue
                 if quote_resp.status_code != 200:
-                    logger.error("Quote Error: %s", quote_resp.text)
+                    direction = "卖出" if is_sell else "买入"
+                    token_ref = (input_mint if is_sell else output_mint)[:16] + ".."
+                    logger.error("Quote Error [%s %s]: %s", direction, token_ref, quote_resp.text)
                     return None, 0.0, True  # 确定失败：从未广播
 
                 quote_data = quote_resp.json()
@@ -1229,7 +1264,9 @@ class SolanaTrader:
                         await asyncio.sleep(backoff_sec)
                         continue
                 if swap_resp.status_code != 200:
-                    logger.error("Swap Build Error: %s", swap_resp.text)
+                    direction = "卖出" if is_sell else "买入"
+                    token_ref = (input_mint if is_sell else output_mint)[:16] + ".."
+                    logger.error("Swap Build Error [%s %s]: %s", direction, token_ref, swap_resp.text)
                     return None, 0.0, True  # 确定失败：从未广播
 
                 swap_data = swap_resp.json()
@@ -1498,7 +1535,7 @@ class SolanaTrader:
         logger.info("📤 已同步清仓状态并移除持仓记录: %s", token_address[:16] + "..")
 
     def _emit_position_closed(self, token_address: str, pos: Position) -> None:
-        """清仓时构造 snapshot 并触发回调（发邮件等）。"""
+        """清仓时构造 snapshot 并触发回调（发邮件等）。hunter_addrs 用于连续亏损体检。"""
         total_spent = sum(float(r.get("sol_spent") or 0) for r in pos.trade_records)
         total_received = sum(float(r.get("sol_received") or 0) for r in pos.trade_records)
         snapshot = {
@@ -1506,6 +1543,7 @@ class SolanaTrader:
             "entry_time": pos.entry_time,
             "trade_records": list(pos.trade_records),
             "total_pnl_sol": total_received - total_spent,
+            "hunter_addrs": list(pos.shares.keys()),
         }
         if self.on_position_closed_callback:
             try:

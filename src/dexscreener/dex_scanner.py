@@ -128,6 +128,16 @@ class DexScanner:
                 logger.debug("get_token_price_usd 失败 %s", token_address[:12])
         return None
 
+    def _symbol_from_pair(self, pair: dict, token_address: str) -> str | None:
+        """从 pair 的 baseToken/quoteToken 中提取本 token 的 symbol。"""
+        base = pair.get("baseToken") or {}
+        quote = pair.get("quoteToken") or {}
+        if (base.get("address") or "").strip() == (token_address or "").strip():
+            return (base.get("symbol") or "").strip() or None
+        if (quote.get("address") or "").strip() == (token_address or "").strip():
+            return (quote.get("symbol") or "").strip() or None
+        return None
+
     async def get_token_price(self, token_address: str):
         """
         获取代币当前价格 (1 token = ? SOL)。
@@ -155,6 +165,42 @@ class DexScanner:
             except Exception:
                 logger.exception("Error fetching price for %s", token_address)
         return None
+
+    async def get_token_price_and_symbol(self, token_address: str) -> tuple[float | None, str | None]:
+        """
+        一次请求获取代币价格与 symbol。
+        返回 (price_sol, symbol)；任一失败为 None。
+        """
+        url = f"{self.base_url}/latest/dex/tokens/{token_address}"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url, timeout=DEXSCREENER_TOKEN_TIMEOUT)
+                if response.status_code != 200:
+                    return None, None
+                data = response.json()
+                pairs = data.get("pairs", []) or []
+                sol_pairs = []
+                for p in pairs:
+                    if p.get("chainId") != "solana":
+                        continue
+                    price = self._parse_sol_per_token(p, token_address)
+                    if price is not None:
+                        sol_pairs.append((p, price))
+                if not sol_pairs:
+                    return None, None
+                best_pair, price = max(sol_pairs, key=lambda x: float(x[0].get("liquidity", {}).get("usd", 0) or 0))
+                symbol = self._symbol_from_pair(best_pair, token_address)
+                return price, symbol
+            except Exception:
+                logger.debug("get_token_price_and_symbol 失败 %s", token_address[:16])
+        return None, None
+
+    async def get_token_symbol(self, token_address: str) -> str | None:
+        """
+        获取代币 symbol（名称）。单独请求，用于不关心价格的场景。
+        """
+        _, symbol = await self.get_token_price_and_symbol(token_address)
+        return symbol
 
     async def scan(self):
         logger.info("正在扫描 Solana 潜力币...")

@@ -838,52 +838,110 @@ class HunterMonitorController:
         await asyncio.to_thread(self.storage.save_hunters)
         logger.info("🩺 [立即审计] 完成 | 剔除 %d 名 | 更新 %d 名", removed, updated)
 
+    async def run_audit_for_hunter(self, addr: str) -> bool:
+        """
+        对单个猎手执行即时体检（如连续亏损触发）。
+        复用 run_immediate_audit 的体检逻辑：LP 检测、达标判定、更新或踢出。
+        :return: True 若猎手被踢出，False 若保留或不在池中。
+        """
+        from httpx import AsyncClient
+
+        if addr not in self.storage.hunters:
+            logger.debug("🩺 猎手 %s.. 不在池中，跳过体检", addr[:12])
+            return False
+
+        info = self.storage.hunters[addr]
+        try:
+            async with AsyncClient() as client:
+                new_stats = await self.sm_searcher.analyze_hunter_performance(client, addr)
+                if new_stats is None:
+                    return False
+                if new_stats.get("_lp_detected"):
+                    del self.storage.hunters[addr]
+                    await self._trigger_hunter_removed(addr)
+                    if HUNTER_MODE == "MODELB":
+                        self.sm_searcher.add_to_trash(addr)
+                    logger.info("🚫 [即时体检] 剔除 %s.. (发现 LP 行为，已加入 trash)", addr[:12])
+                    await asyncio.to_thread(self.storage.save_hunters)
+                    return True
+                is_modelb = HUNTER_MODE == "MODELB"
+                if is_modelb:
+                    audit_pass, reasons = check_modelb_entry_criteria(new_stats)
+                    if not audit_pass:
+                        del self.storage.hunters[addr]
+                        await self._trigger_hunter_removed(addr)
+                        logger.info("🚫 [即时体检] 剔除 %s.. (未过: %s)", addr[:12], "/".join(reasons))
+                        await asyncio.to_thread(self.storage.save_hunters)
+                        return True
+                    _apply_audit_update(info, new_stats, time.time(), addr)
+                else:
+                    pnl_min = SM_AUDIT_MIN_PNL_RATIO
+                    wr_min = SM_AUDIT_MIN_WIN_RATE
+                    roi_threshold = TIER_THREE_ROI
+                    pnl_ok = (new_stats.get("pnl_ratio", 0) or 0) >= pnl_min if new_stats.get("pnl_ratio") != float("inf") else True
+                    wr_ok = new_stats["win_rate"] >= wr_min
+                    profit_ok = new_stats["total_profit"] > 0
+                    roi_val = new_stats.get("max_roi_pct", 0) or new_stats.get("max_roi_30d", 0)
+                    if not (pnl_ok and wr_ok and profit_ok):
+                        del self.storage.hunters[addr]
+                        await self._trigger_hunter_removed(addr)
+                        logger.info("🚫 [即时体检] 剔除 %s.. (盈亏比/胜率/利润未达标)", addr[:12])
+                        await asyncio.to_thread(self.storage.save_hunters)
+                        return True
+                    if roi_val < roi_threshold:
+                        del self.storage.hunters[addr]
+                        await self._trigger_hunter_removed(addr)
+                        logger.info("🚫 [即时体检] 剔除 %s.. (最大收益 %.0f%% < %s%%)", addr[:12], roi_val, roi_threshold)
+                        await asyncio.to_thread(self.storage.save_hunters)
+                        return True
+                    _apply_audit_update(info, new_stats, time.time(), addr)
+                await asyncio.to_thread(self.storage.save_hunters)
+                return False
+        except Exception:
+            logger.exception("即时体检猎手 %s 异常", addr[:12])
+            return False
+
     # --- 线程 3: 维护 (Maintenance - 优化版) ---
     async def maintenance_loop(self):
         """
         每 10 天检查，对超过 20 天未体检的猎手重新审计；并清理频繁交易者。
         """
-        logger.info("🛠️ [线程3] 维护线程启动 (每 %d 天检查体检)", MAINTENANCE_DAYS)
+        logger.info("🛠️ [线程3] 维护线程启动 (每 %d 天检查，体检有效期 %d 天)", MAINTENANCE_DAYS, AUDIT_EXPIRATION // 86400)
 
-        # 启动时先睡一会，错开高峰，或者直接运行一次也行
-        # 这里选择立即运行第一次，然后按天循环
+        # 先休眠再运行：避免每次启动都触发维护，体检有效期 20 天内不会重检
+        logger.info(f"💤 维护线程首次休眠 {MAINTENANCE_DAYS} 天，之后每 {MAINTENANCE_DAYS} 天检查一次")
+        await asyncio.sleep(MAINTENANCE_INTERVAL)
 
         while True:
             try:
                 logger.info("🏥 开始例行维护（检查体检、清理僵尸）...")
                 now = time.time()
 
-                # 1. 遍历检查是否需要体检
+                # 1. 遍历检查是否需要体检（仅对超过 20 天未体检的猎手执行）
                 current_hunters = list(self.storage.hunters.items())
                 needs_audit_count = 0
 
                 from httpx import AsyncClient
                 async with AsyncClient() as client:
-                    # 0. 体检剔除：pnl_ratio<2 或 wr<20% 或 profit<=0 或 30天最大收益<50%
                     audit_removed = []
-                    # 1. 频繁交易剔除：单币平均持仓 ≤ 5 分钟的踢出猎手池
-                    frequent_removed = []
-                    for addr, _ in current_hunters:
-                        if await self.sm_searcher.is_frequent_trader(client, addr):
-                            frequent_removed.append(addr)
-                    for addr in frequent_removed:
-                        if addr in self.storage.hunters:
-                            del self.storage.hunters[addr]
-                            await self._trigger_hunter_removed(addr)
-                            logger.info("🚫 踢出频繁交易猎手 %s.. (平均持仓≤5分钟)", addr[:12])
-                    if frequent_removed:
-                        current_hunters = list(self.storage.hunters.items())
-
-                    # 合并 audit_removed 与 frequent_removed 供后续统计；audit 时动态踢人
                     for addr, info in current_hunters:
                         last_audit = info.get('last_audit', 0)
 
-                        # 核心逻辑：超过 20 天才重新打分
+                        # 核心逻辑：超过 20 天才重新打分（体检有效期内不检查）
                         if (now - last_audit) > AUDIT_EXPIRATION:
-                            needs_audit_count += 1  # 进入体检分支即计数（含 LP 踢出、未达标踢出、更新）
-                            logger.info(f"🩺 猎手 {addr} 超过{AUDIT_EXPIRATION // 86400}天未体检，正在重新审计...")
+                            needs_audit_count += 1
+                            logger.info(f"🩺 猎手 {addr[:12]}.. 超过{AUDIT_EXPIRATION // 86400}天未体检，正在重新审计...")
 
-                            # 重新跑一遍分析
+                            # 先查频繁交易，再跑体检分析
+                            if await self.sm_searcher.is_frequent_trader(client, addr):
+                                if addr in self.storage.hunters:
+                                    del self.storage.hunters[addr]
+                                    audit_removed.append(addr)
+                                    await self._trigger_hunter_removed(addr)
+                                logger.info("🚫 体检踢出 %s.. (平均持仓≤5分钟，频繁交易)", addr[:12])
+                                await asyncio.sleep(AUDIT_BETWEEN_HUNTERS_SLEEP_SEC)
+                                continue
+
                             new_stats = await self.sm_searcher.analyze_hunter_performance(client, addr)
                             if new_stats and new_stats.get("_lp_detected"):
                                 if addr in self.storage.hunters:
