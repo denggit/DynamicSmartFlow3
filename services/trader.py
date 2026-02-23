@@ -682,14 +682,23 @@ class SolanaTrader:
         logger.info(f"➕ [准备加仓] {token_address} | 金额: {add_sol:.3f} SOL")
 
         # === 真实买入 ===
-        tx_sig, token_got_raw, _ = await self._jupiter_swap(
+        tx_sig, token_got_raw, definitely_no_buy = await self._jupiter_swap(
             input_mint=WSOL_MINT,
             output_mint=token_address,
             amount_in_ui=add_sol,
             slippage_bps=SLIPPAGE_BPS
         )
 
-        if not tx_sig: return
+        if not tx_sig:
+            if not definitely_no_buy:
+                add_manual_verify_token(token_address)
+                logger.warning(
+                    "❌ 加仓失败: %s | 已广播但验证超时，链上可能已成交，已加入需手动核对",
+                    token_address[:16] + "..",
+                )
+            else:
+                logger.warning("❌ 加仓失败: %s | Quote/Swap 未通过，从未广播", token_address[:16] + "..")
+            return
 
         # [关键修复] UI Amount 转换
         token_got_ui = token_got_raw / (10 ** pos.decimals)
@@ -1198,6 +1207,12 @@ class SolanaTrader:
                             cost = sell_amount * pos.average_price
                             for share in pos.shares.values():
                                 share.token_amount *= (1.0 - sell_pct_actual)
+                            # 归一化 shares 使 sum(shares) == chain_after_2，避免浮点误差导致不一致
+                            sum_shares = sum(s.token_amount for s in pos.shares.values())
+                            if sum_shares > 0 and abs(sum_shares - chain_after_2) > 1e-9:
+                                ratio = chain_after_2 / sum_shares
+                                for s in pos.shares.values():
+                                    s.token_amount *= ratio
                             pos.total_tokens = chain_after_2
                             pos.tp_hit_levels.add(level)
                             ts_now = time.time()
