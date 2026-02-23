@@ -257,6 +257,8 @@ async def pnl_monitor_loop():
             active_tokens = trader.get_active_tokens()
             if active_tokens:
                 for token in active_tokens:
+                    if trader.is_in_follow_sell(token):
+                        continue  # 跟卖执行中跳过，避免与止盈入口「持仓总值<MIN」竞态
                     price = await price_scanner.get_token_price(token)
                     if price is not None:  # 含 0：代币归零时也应触发止损
                         await trader.check_pnl_and_stop_profit(token, price)

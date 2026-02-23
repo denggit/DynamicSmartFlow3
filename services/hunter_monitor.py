@@ -694,10 +694,17 @@ class HunterMonitorController:
                 if hunter in self.active_holdings[mint]:
                     first_buyer = self._first_buyer.get(mint)
                     del self.active_holdings[mint][hunter]
-                    # 首买者在共振前清仓 → 永久禁止该代币共振
+                    # 首买者在共振前清仓 → 永久禁止该代币共振。若有仓位/监控中说明已共振过（含重启后恢复），不禁止
                     if first_buyer == hunter and mint not in self._resonance_emitted:
-                        self._blacklisted_mints.add(mint)
-                        trade_logger.info("🚫 首买者 %s 已清仓且未达共振，代币 %s 永久禁止共振", hunter[:8], mint[:8])
+                        tracked = set()
+                        if self.tracked_tokens_getter:
+                            try:
+                                tracked = self.tracked_tokens_getter()
+                            except Exception:
+                                pass
+                        if mint not in tracked:
+                            self._blacklisted_mints.add(mint)
+                            trade_logger.info("🚫 首买者 %s 已清仓且未达共振，代币 %s 永久禁止共振", hunter[:8], mint[:8])
                 trade_logger.info(f"📤 卖出: {hunter} -> {mint}")
             await self.check_resonance(mint)
 

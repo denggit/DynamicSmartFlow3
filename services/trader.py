@@ -124,6 +124,7 @@ class SolanaTrader:
         self.positions: Dict[str, Position] = {}
         self.on_position_closed_callback: Optional[Callable[[dict], None]] = None  # 清仓时回调
         self.on_trade_recorded: Optional[Callable[[dict], None]] = None  # 每笔买卖后回调，用于 trading_history
+        self._tokens_in_follow_sell: Set[str] = set()  # 跟卖执行中的 token，pnl_loop 跳过以避免重复同步
 
         # 初始化钱包
         if not SOLANA_PRIVATE_KEY_BASE58:
@@ -332,10 +333,16 @@ class SolanaTrader:
                 logger.info("链上已归零，同步移除过时持仓记录: %s", token_address[:16] + "..")
                 self._sync_zero_and_close_position(token_address, pos)
             return
-        logger.warning(
-            "⚠️ 关闭监控前发现链上仍有持仓 %.6f，执行清仓",
-            chain_bal
-        )
+        if pos is None:
+            logger.warning(
+                "⚠️ 记录已移除(止盈入口/跟卖等)但链上仍有持仓 %.6f，执行清仓: %s",
+                chain_bal, token_address[:16] + "..",
+            )
+        else:
+            logger.warning(
+                "⚠️ 关闭监控前发现链上仍有持仓 %.6f，执行清仓: %s",
+                chain_bal, token_address[:16] + "..",
+            )
         # 卖出前二次校验：避免期间已清仓/前次卖出已成功导致盲目广播浪费网费
         chain_bal_recheck = await self._fetch_own_token_balance(token_address)
         if chain_bal_recheck is not None and chain_bal_recheck < 1e-9:
@@ -689,6 +696,14 @@ class SolanaTrader:
                 token_amount_ui, token_address[:16] + "..",
             )
 
+        # 3.5 持仓为 0 时二次链上确认：RPC 延迟可能导致误记录 0，延迟后重试避免开仓即被止盈误关
+        if token_amount_ui < 1e-9:
+            await asyncio.sleep(8)
+            chain_final = await self._fetch_own_token_balance(token_address)
+            if chain_final is not None and chain_final >= 1e-9:
+                token_amount_ui = chain_final
+                logger.info("开仓持仓 0 二次确认链上查到 %.2f，以链上为准: %s", token_amount_ui, token_address[:16] + "..")
+
         # 4. 计算均价：成本(buy_sol)/持仓量(token_amount_ui)，单个 token 成本用于止盈止损
         if token_amount_ui > 0:
             actual_price = buy_sol / token_amount_ui
@@ -888,6 +903,16 @@ class SolanaTrader:
         if not pos:
             return
 
+        self._tokens_in_follow_sell.add(token_address)
+        try:
+            await self._execute_follow_sell_impl(token_address, hunter_addr, sell_ratio, current_price, pos)
+        finally:
+            self._tokens_in_follow_sell.discard(token_address)
+
+    async def _execute_follow_sell_impl(
+        self, token_address: str, hunter_addr: str, sell_ratio: float, current_price: float, pos: Position
+    ):
+        """跟卖实现，由 execute_follow_sell 在 _tokens_in_follow_sell 标记下调用。"""
         share = pos.shares.get(hunter_addr)
         if not share or share.token_amount <= 0:
             return
@@ -1094,15 +1119,35 @@ class SolanaTrader:
             logger.warning("止盈跳过: 均价异常 %.6f", pos.average_price)
             return
 
-        # 整仓价值为粉尘时直接同步关闭，避免每轮 PnL 循环重复检查浪费 RPC
+        # 整仓价值为粉尘时的处理。重要：开仓成功但持仓 0 多为记录异常，应先以链上为准更新再判断
         total_value_sol = pos.total_tokens * current_price_ui
         if total_value_sol < MIN_SHARE_VALUE_SOL:
-            logger.info(
-                "⏭️ 止盈入口: 持仓总值 %.4f SOL < %.2f SOL 无意义，同步关闭: %s",
-                total_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
-            )
-            self._sync_zero_and_close_position(token_address, pos)
-            return
+            if chain_bal_early is not None and chain_bal_early >= 1e-9:
+                # 链上有持仓但内部为 0 或价值算成粉尘：先以链上为准更新持仓，不应直接卖出
+                old_total = pos.total_tokens
+                self._sync_pos_total_from_chain(pos, chain_bal_early)
+                logger.info(
+                    "📋 止盈入口: 内部持仓 %.2f 与链上 %.2f 不一致，以链上为准更新后重算: %s",
+                    old_total, chain_bal_early, token_address[:16] + "..",
+                )
+                self._save_state_in_background()
+                total_value_sol = pos.total_tokens * current_price_ui
+                if total_value_sol < MIN_SHARE_VALUE_SOL:
+                    # 更新后仍为粉尘（如 price=0 代币归零），才清仓
+                    logger.info(
+                        "⏭️ 止盈入口: 以链上更新后持仓总值 %.4f SOL 仍 < MIN，执行清仓: %s",
+                        total_value_sol, token_address[:16] + "..",
+                    )
+                    await self.ensure_fully_closed(token_address)
+                    return
+                # 更新后有价值，继续正常止盈/止损流程
+            else:
+                logger.info(
+                    "⏭️ 止盈入口: 持仓总值 %.4f SOL < %.2f SOL 无意义，同步关闭: %s",
+                    total_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
+                )
+                self._sync_zero_and_close_position(token_address, pos)
+                return
 
         pnl_pct = (current_price_ui - pos.average_price) / pos.average_price
 
@@ -1902,6 +1947,34 @@ class SolanaTrader:
                 logger.exception("获取 decimals 失败，使用默认 6")
             return 6  # pump.fun 代币常见精度
 
+    def _sync_pos_total_from_chain(self, pos: Position, chain_bal: float) -> None:
+        """
+        以链上余额为准更新 pos.total_tokens 与 shares。
+        用于：开仓记录为 0 但链上实际有持仓、RPC 延迟导致内部与链上不一致。
+        当 old_total=0 时按 score 比例分配；否则按 ratio 缩放。
+        """
+        old_total = pos.total_tokens
+        pos.total_tokens = _floor_token_amount(chain_bal)
+        if not pos.shares:
+            return
+        if old_total <= 0 or old_total < 1e-9:
+            total_score = sum(getattr(s, "score", 0) for s in pos.shares.values())
+            n = len(pos.shares)
+            if n == 0:
+                return
+            if total_score <= 0:
+                amt = _floor_token_amount(chain_bal / n)
+                for s in pos.shares.values():
+                    s.token_amount = amt
+            else:
+                for s in pos.shares.values():
+                    ratio = (getattr(s, "score", 0) or 0) / total_score
+                    s.token_amount = _floor_token_amount(chain_bal * ratio)
+        else:
+            ratio = chain_bal / old_total
+            for s in pos.shares.values():
+                s.token_amount = _floor_token_amount(s.token_amount * ratio)
+
     def _rebalance_shares_logic(self, pos: Position, hunters: List[Dict]):
         """
         份额分配：谁卖跟谁跑。
@@ -2166,6 +2239,12 @@ class SolanaTrader:
 
     def get_active_tokens(self) -> List[str]:
         return [t for t, p in self.positions.items() if p.total_tokens > 0]
+
+    def is_in_follow_sell(self, token_address: str) -> bool:
+        """
+        是否正在执行跟卖，用于 pnl_loop 跳过，避免 HUNTER_SELL 跟卖与止盈入口「持仓总值<MIN」同时触发造成冗余同步。
+        """
+        return token_address in self._tokens_in_follow_sell
 
     async def reconcile_from_chain(
         self,
