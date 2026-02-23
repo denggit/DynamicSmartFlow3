@@ -13,6 +13,7 @@ from pathlib import Path
 from config.settings import (
     PNL_CHECK_INTERVAL,
     HUNTER_ADD_THRESHOLD_SOL_MIN,
+    START_TRACKING_BASELINE_DELAY_SEC,
     HUNTER_ADD_THRESHOLD_SOL_MAX,
     MAX_ENTRY_PUMP_MULTIPLIER,
     DAILY_REPORT_HOUR,
@@ -183,9 +184,9 @@ async def _on_monitor_signal_impl(signal, sm_searcher=None):
 
     # 4. 买入不再发邮件，周报中会汇总
 
-    # 5. Agent 启动监控（只跟单一个猎手）
+    # 5. Agent 启动监控（只跟单一个猎手）。开仓后延迟再拉猎手底仓，确保含共振买入+过往持仓
     hunter_addrs = [h["address"] for h in hunters]
-    await agent.start_tracking(token, hunter_addrs)
+    await agent.start_tracking(token, hunter_addrs, delay_before_fetch_sec=START_TRACKING_BASELINE_DELAY_SEC)
 
 
 async def on_agent_signal(signal):

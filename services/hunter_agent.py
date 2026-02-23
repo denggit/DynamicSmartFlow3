@@ -97,6 +97,9 @@ class HunterAgentController:
 
         # 新增猎手加仓节流：1 分钟内同一 token 只发一次 HUNTER_BUY，避免多人同时入场重复跟仓
         self._last_new_hunter_signal_at: Dict[str, float] = {}
+        # 同一 tx (hunter, token, sig) 短时去重，避免 Monitor 重推或重复解析导致误加仓
+        self._recent_analyzed_tx: Dict[str, float] = {}  # key="h:token:sig" -> timestamp
+        self._recent_analyzed_ttl = 120  # 秒
 
     async def start(self):
         """启动 Agent：只跑持仓同步兜底；交易信号由 Monitor 统一推送，避免自建 WS 漏单。"""
@@ -140,9 +143,16 @@ class HunterAgentController:
 
     # === 1. 任务管理接口 (供主程序调用) ===
 
-    async def start_tracking(self, token_address: str, hunters: List[str], creation_time: float = 0):
+    async def start_tracking(
+        self,
+        token_address: str,
+        hunters: List[str],
+        creation_time: float = 0,
+        delay_before_fetch_sec: float = 0,
+    ):
         """
-        [指令] 开始监控一个新币
+        [指令] 开始监控一个新币。
+        :param delay_before_fetch_sec: 开仓后延迟 N 秒再拉猎手底仓，确保 RPC 已索引，底仓=猎手共振买入+过往持仓
         """
         if token_address in self.active_missions:
             logger.warning(f"⚠️ 任务已存在: {token_address}")
@@ -152,6 +162,14 @@ class HunterAgentController:
 
         mission = TokenMission(token_address, creation_time or time.time())
         self.active_missions[token_address] = mission
+
+        # 0. 开仓后延迟再拉底仓，确保猎手持仓=共振买入+过往持仓，避免 RPC 未索引导致底仓偏小
+        if delay_before_fetch_sec > 0:
+            logger.info(
+                "⏳ 开仓后等待 %.0fs 再拉猎手底仓，确保含过往持仓: %s",
+                delay_before_fetch_sec, token_address[:12] + "..",
+            )
+            await asyncio.sleep(delay_before_fetch_sec)
 
         # 1. 【关键】先建立 hunter_map 索引，再拉链上余额。
         #    否则：_fetch_token_balance 耗时期间，Monitor 消费队列可能已把「猎手卖出」tx 推给 on_tx_from_monitor，
@@ -298,13 +316,27 @@ class HunterAgentController:
                             if abs(delta) < 1e-9:
                                 continue
                             # 发现减仓（可能漏了订阅）。注意：old_bal 须正确，若 baseline 被基线前 tx 污染会误判
-                            # 二次确认：间隔 1 秒再拉一次，若仍为 real_balance 才触发，避免 RPC 缓存/抖动误判
+                            # 二次确认：1s 后再拉一次，两次误差 < 2% 才继续
+                            # 三次确认：再 4s 后拉一次，若接近 old_bal 说明 RPC 曾返回错误低值，不触发
                             if delta < 0 and abs(delta) >= old_bal * SYNC_MIN_DELTA_RATIO:
                                 await asyncio.sleep(1.0)
                                 real_balance_2 = await self._fetch_token_balance(hunter, token_address)
-                                if real_balance_2 is not None and abs(real_balance_2 - real_balance) < old_bal * 0.02:
-                                    # 两次结果一致（误差 < 2%），视为真实减仓
-                                    mission.hunter_states[hunter] = max(0.0, real_balance)
+                                if real_balance_2 is None or abs(real_balance_2 - real_balance) >= old_bal * 0.02:
+                                    continue  # 二次不一致，跳过
+                                await asyncio.sleep(4.0)
+                                real_balance_3 = await self._fetch_token_balance(hunter, token_address)
+                                if real_balance_3 is not None and abs(real_balance_3 - old_bal) < old_bal * 0.05:
+                                    # 三次接近 old_bal：RPC 曾短暂返回低值，可能是缓存/节点不同步，不触发
+                                    trade_logger.info(
+                                        "⏭️ [Agent 同步] 三次确认跳过: 猎手 %s %s 疑似 RPC 波动 "
+                                        "(old=%.2f r1=%.2f r2=%.2f r3=%.2f)",
+                                        hunter[:8], token_address[:6], old_bal, real_balance, real_balance_2, real_balance_3,
+                                    )
+                                    mission.hunter_states[hunter] = real_balance_3  # 以三次为准修正
+                                    continue
+                                if real_balance_3 is not None and abs(real_balance_3 - real_balance) < old_bal * 0.02:
+                                    # 三次仍接近 r1/r2，视为真实减仓
+                                    mission.hunter_states[hunter] = max(0.0, real_balance_3)
                                     sell_amount = abs(delta)
                                     ratio = (sell_amount / old_bal) if old_bal > 0 else 1.0
                                     new_bal = mission.hunter_states[hunter]
@@ -322,6 +354,9 @@ class HunterAgentController:
                                             "timestamp": now,
                                         }
                                         await self._trigger_callback(signal)
+                                elif real_balance_3 is not None:
+                                    # 三次结果不明确，保守不触发，以 r3 更新基线避免重复误判
+                                    mission.hunter_states[hunter] = real_balance_3
                             elif delta > 0:
                                 mission.hunter_states[hunter] = real_balance
                         except Exception:
@@ -492,6 +527,21 @@ class HunterAgentController:
         mission = self.active_missions.get(token)
         if not mission:
             return
+
+        # 同 tx 短时去重：避免 Monitor 重推或同一笔 tx 被重复解析导致误加仓
+        sig = (tx or {}).get("signature")
+        if isinstance(sig, list):
+            sig = sig[0] if sig else None
+        if sig:
+            key = f"{hunter[:8]}:{token[:8]}:{str(sig)[:32]}"
+            now = time.time()
+            if key in self._recent_analyzed_tx and (now - self._recent_analyzed_tx[key]) < self._recent_analyzed_ttl:
+                trade_logger.debug("⏭️ [Agent] 跳过重复 tx %s %s sig=%s", hunter[:8], token[:6], str(sig)[:16])
+                return
+            self._recent_analyzed_tx[key] = now
+            for k in list(self._recent_analyzed_tx.keys()):
+                if now - self._recent_analyzed_tx[k] > self._recent_analyzed_ttl * 2:
+                    del self._recent_analyzed_tx[k]
 
         # 基线前交易：发生在 start_tracking 之前的 tx，已含在初始 snapshot 中，跳过
         if timestamp > 0 and timestamp < mission.start_time:
