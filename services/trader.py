@@ -821,21 +821,38 @@ class SolanaTrader:
 
         token_got_ui = token_got_raw / (10 ** pos.decimals)
 
-        # 以链上为准重置持仓与均价：加仓后查询链上余额，(总成本/链上总量)=均价
+        # 以链上为准重置持仓与均价：加仓后查询链上余额，(总成本/链上总量)=均价。
+        # 若 chain_bal < old_total（RPC 可能未索引本笔加仓），不得覆盖为更小值，否则止损会误卖部分仓位。
         old_total = pos.total_tokens
         shares_updated_from_chain = False
         chain_bal = await self._fetch_own_token_balance(token_address)
         if chain_bal is not None and chain_bal >= 1e-9:
-            pos.total_cost_sol += add_sol
-            pos.total_tokens = _floor_token_amount(chain_bal)
-            pos.average_price = pos.total_cost_sol / chain_bal if chain_bal > 0 else pos.average_price
-            add_amount_chain = chain_bal - old_total
-            if hunter_addr in pos.shares:
-                pos.shares[hunter_addr].token_amount += add_amount_chain
+            # RPC 延迟：chain 可能尚未包含本笔加仓，若 chain <= old_total 则用 old_total + Jupiter 返回值
+            if chain_bal <= old_total + 1e-6:
+                new_total_tokens = old_total + token_got_ui
+                pos.total_cost_sol += add_sol
+                pos.total_tokens = _floor_token_amount(new_total_tokens)
+                pos.average_price = pos.total_cost_sol / new_total_tokens if new_total_tokens > 0 else pos.average_price
+                if hunter_addr in pos.shares:
+                    pos.shares[hunter_addr].token_amount += token_got_ui
+                else:
+                    pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), token_got_ui)
+                shares_updated_from_chain = True
+                logger.warning(
+                    "加仓后链上 %.2f < 加仓前 %.2f（RPC 可能未索引），用 old+Jupiter %.2f 避免覆盖: %s",
+                    chain_bal, old_total, new_total_tokens, token_address[:16] + "..",
+                )
             else:
-                pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), add_amount_chain)
-            shares_updated_from_chain = True
-            logger.debug("加仓以链上为准: %.2f tokens，均价 %.6f", chain_bal, pos.average_price)
+                pos.total_cost_sol += add_sol
+                pos.total_tokens = _floor_token_amount(chain_bal)
+                pos.average_price = pos.total_cost_sol / chain_bal if chain_bal > 0 else pos.average_price
+                add_amount_chain = chain_bal - old_total
+                if hunter_addr in pos.shares:
+                    pos.shares[hunter_addr].token_amount += add_amount_chain
+                else:
+                    pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), add_amount_chain)
+                shares_updated_from_chain = True
+                logger.debug("加仓以链上为准: %.2f tokens，均价 %.6f", chain_bal, pos.average_price)
         elif chain_bal is not None and chain_bal < 1e-9:
             await asyncio.sleep(5)
             chain_bal_retry = await self._fetch_own_token_balance(token_address)
@@ -1171,6 +1188,18 @@ class SolanaTrader:
         if pos.average_price <= 0:
             logger.warning("止盈跳过: 均价异常 %.6f", pos.average_price)
             return
+
+        # 链上与内部不一致时以链上为准同步，避免加仓 RPC 延迟/竞态导致 pos 严重偏小、止损误卖部分仓位
+        if chain_bal_early is not None and chain_bal_early >= 1e-9:
+            diff_ratio = abs(chain_bal_early - pos.total_tokens) / max(pos.total_tokens, 1e-9)
+            if diff_ratio > 0.01:
+                old_total = pos.total_tokens
+                self._sync_pos_total_from_chain(pos, chain_bal_early)
+                logger.info(
+                    "📋 止盈入口: 内部 %.2f 与链上 %.2f 不一致(差 %.1f%%)，以链上为准更新: %s",
+                    old_total, chain_bal_early, diff_ratio * 100, token_address[:16] + "..",
+                )
+                self._save_state_in_background()
 
         # 整仓价值为粉尘时的处理。重要：开仓成功但持仓 0 多为记录异常，应先以链上为准更新再判断
         total_value_sol = pos.total_tokens * current_price_ui
