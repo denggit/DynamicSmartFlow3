@@ -34,7 +34,7 @@ def get_tier_config(score: float) -> dict:
 
 
 # 猎手加仓跟单范围：仅当猎手加仓金额在此区间才跟（低于视为噪音，高于视为异常大单不跟）
-HUNTER_ADD_THRESHOLD_SOL_MIN = 0.5
+HUNTER_ADD_THRESHOLD_SOL_MIN = 0.49
 HUNTER_ADD_THRESHOLD_SOL_MAX = 5.0
 MAX_ENTRY_PUMP_MULTIPLIER = 4.0
 SELL_BUFFER = 0.999
