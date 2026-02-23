@@ -374,6 +374,22 @@ class SolanaTrader:
                 del self.positions[token_address]
                 self._save_state_in_background()
                 return True
+            # 卖出失败：若链上已归零（前次 tx 可能已成功），sync 并视为成功，避免重复尝试
+            chain_after = await self._fetch_own_token_balance(token_address)
+            if chain_after is not None and chain_after < 1e-9:
+                logger.info(
+                    "✅ 结构性风险清仓失败但链上已归零，同步状态: %s",
+                    token_address[:16] + "..",
+                )
+                self._sync_zero_and_close_position(token_address, pos)
+                return True
+            if chain_after is None:
+                logger.warning(
+                    "⚠️ 结构性风险清仓失败且无法查链上余额，假定已成交并同步，避免重复卖出: %s",
+                    token_address[:16] + "..",
+                )
+                self._sync_zero_and_close_position(token_address, pos)
+                return True
             logger.warning("❌ 结构性风险清仓失败: %s (链上余额 %.2f)", token_address[:16] + "..", sell_amount)
             return False
         except Exception:
@@ -647,12 +663,25 @@ class SolanaTrader:
 
     async def execute_follow_sell(self, token_address: str, hunter_addr: str, sell_ratio: float, current_price: float):
         """跟随卖出逻辑。文档: 猎手卖出<5%不跟，跟随时我方至少卖该份额的 MIN_SELL_RATIO。"""
-        if not self.keypair: return
+        if not self.keypair:
+            return
         pos = self.positions.get(token_address)
-        if not pos: return
+        if not pos:
+            return
 
         share = pos.shares.get(hunter_addr)
-        if not share or share.token_amount <= 0: return
+        if not share or share.token_amount <= 0:
+            return
+
+        # 入口提前校验：链上已归零则立即同步并返回，避免内部状态滞后导致无限尝试卖出
+        chain_bal_early = await self._fetch_own_token_balance(token_address)
+        if chain_bal_early is not None and chain_bal_early < 1e-9:
+            logger.info(
+                "✅ [跟卖入口] 链上已归零，同步状态: %s",
+                token_address[:16] + "..",
+            )
+            self._sync_zero_and_close_position(token_address, pos)
+            return
 
         # 猎手微调（卖出比例过小）不跟，避免噪音
         if sell_ratio < FOLLOW_SELL_THRESHOLD:
@@ -702,6 +731,17 @@ class SolanaTrader:
             return
         sell_value_sol = sell_amount_ui * current_price
         if sell_value_sol < MIN_SHARE_VALUE_SOL:
+            # 卖出价值过小：若链上已归零，必须 sync 避免重复触发
+            chain_recheck = chain_bal if chain_bal is not None else (
+                chain_bal2 if chain_bal2 is not None else await self._fetch_own_token_balance(token_address)
+            )
+            if chain_recheck is not None and chain_recheck < 1e-9:
+                logger.info(
+                    "✅ 跟随卖出跳过(链上已归零): 同步状态: %s",
+                    token_address[:16] + "..",
+                )
+                self._sync_zero_and_close_position(token_address, pos)
+                return
             logger.info(
                 "⏭️ 跟随卖出跳过: 卖出价值 %.4f SOL < %.2f SOL，无意义: %s",
                 sell_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
@@ -778,9 +818,20 @@ class SolanaTrader:
         止损：亏损达到 get_tier_config(lead_hunter_score).stop_loss_pct 时全仓止损（当前档位均为 40%）。
         止盈：盈利达到 TAKE_PROFIT_LEVELS 各级阈值时按对应比例分批卖出（如 1000% 卖 80%）。
         """
-        if not self.keypair: return
+        if not self.keypair:
+            return
         pos = self.positions.get(token_address)
-        if not pos or pos.total_tokens <= 0: return
+        if not pos or pos.total_tokens <= 0:
+            return
+        # 入口提前校验：链上已归零则立即同步并返回，避免内部状态滞后导致无限尝试卖出浪费 RPC
+        chain_bal_early = await self._fetch_own_token_balance(token_address)
+        if chain_bal_early is not None and chain_bal_early < 1e-9:
+            logger.info(
+                "✅ [止盈入口] 链上已归零，同步状态并跳过: %s",
+                token_address[:16] + "..",
+            )
+            self._sync_zero_and_close_position(token_address, pos)
+            return
         if pos.average_price <= 0:
             logger.warning("止盈跳过: 均价异常 %.6f", pos.average_price)
             return
@@ -937,6 +988,14 @@ class SolanaTrader:
                     sell_amount = min(sell_amount, chain_bal)
                     if chain_bal < pos.total_tokens * 0.99:
                         logger.warning("⚠️ 止盈前状态与链上不一致: 内部 %.2f vs 链上 %.2f", pos.total_tokens, chain_bal)
+                    # 链上已归零或 dust：必须同步并返回，不能 continue，否则会无限循环尝试卖出浪费 RPC
+                    if chain_bal < 1e-9:
+                        logger.info(
+                            "✅ 止盈前链上已归零（内部 %.2f vs 链上 %.2f），同步状态并跳过: %s",
+                            pos.total_tokens, chain_bal, token_address[:16] + "..",
+                        )
+                        self._sync_zero_and_close_position(token_address, pos)
+                        return
                 else:
                     sell_amount = min(sell_amount, pos.total_tokens * SELL_BUFFER)  # 查余额失败，兜底 99.9%
                 if sell_amount <= 0:
@@ -945,6 +1004,17 @@ class SolanaTrader:
                     return
                 sell_value_sol = sell_amount * current_price_ui
                 if sell_value_sol < MIN_SHARE_VALUE_SOL:
+                    # 卖出价值过小：若链上已归零或远小于内部（说明实际已清仓），必须 sync 并返回，否则无限循环浪费 RPC
+                    chain_bal_recheck = chain_bal if chain_bal is not None else await self._fetch_own_token_balance(token_address)
+                    if chain_bal_recheck is not None and (
+                        chain_bal_recheck < 1e-9 or chain_bal_recheck < pos.total_tokens * 0.01
+                    ):
+                        logger.info(
+                            "✅ 止盈跳过(链上已归零或几乎归零): 内部 %.2f vs 链上 %.2f，同步状态: %s",
+                            pos.total_tokens, chain_bal_recheck, token_address[:16] + "..",
+                        )
+                        self._sync_zero_and_close_position(token_address, pos)
+                        return
                     logger.info(
                         "⏭️ 止盈跳过: 卖出价值 %.4f SOL < %.2f SOL，无意义: %s",
                         sell_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
@@ -1037,6 +1107,15 @@ class SolanaTrader:
             if current_amount <= 0:
                 logger.info("链上持仓已为 0，无需继续卖出重试")
                 return None, 0.0
+            # 首轮尝试前校验链上余额，避免内部状态滞后时盲目广播导致 6024 浪费 RPC
+            if i == 0:
+                chain_bal_pre = await self._fetch_own_token_balance(input_mint)
+                if chain_bal_pre is not None and chain_bal_pre < 1e-9:
+                    logger.info("链上持仓已归零，跳过卖出（避免无效广播）")
+                    return None, 0.0
+                if chain_bal_pre is not None and chain_bal_pre < current_amount:
+                    current_amount = min(current_amount, chain_bal_pre)
+                    logger.debug("按链上余额 %.2f 调整卖出量", current_amount)
             tx_sig, sol_out, _ = await self._jupiter_swap(
                 input_mint=input_mint,
                 output_mint=output_mint,
@@ -1054,14 +1133,18 @@ class SolanaTrader:
                 if chain_bal is not None:
                     current_amount = min(current_amount, chain_bal)
                     if chain_bal < 1e-9:
-                        logger.info("链上持仓已归零（前次卖出或已成功），停止重试")
+                        logger.info("链上持仓已归零（前次卖出或已成功），停止重试，避免无效广播")
                         return None, 0.0
                     logger.warning(
                         "❌ 卖出失败，按链上余额 %.2f 重试下一档滑点 %.1f%%",
                         current_amount, slippage_list[i + 1] / 100,
                     )
                 else:
-                    logger.warning("❌ 卖出失败，尝试下一档滑点 %.1f%% (无法查链上余额)", slippage_list[i + 1] / 100)
+                    # 无法查链上余额(429 等)时不再重试：前次 tx 可能已成功，继续广播会 6024 浪费 RPC
+                    logger.warning(
+                        "❌ 卖出失败且无法查链上余额，停止重试(由上层 sync 处理)，避免重复广播浪费费用"
+                    )
+                    return None, 0.0
         return None, 0.0
 
     async def _jupiter_swap(self, input_mint: str, output_mint: str, amount_in_ui: float, slippage_bps: int,
