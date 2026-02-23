@@ -1549,44 +1549,64 @@ class SolanaTrader:
     async def _verify_tx_confirmed(self, sig_str: str, max_wait_sec: int | None = None) -> bool:
         """
         轮询 get_signature_statuses，确认交易成功落地。
+        必须传 searchTransactionHistory: true，否则 RPC 只查「最近状态缓存」，交易稍旧即返回 null 导致误判失败。
         链上失败（滑点等）时返回 False。遇 Alchemy 429 时切换 Key 继续轮询，避免限流误判。
         所有 Alchemy Key 均超时/失败时，用 Helius 做一次兜底查询（Helius 珍贵，仅兜底使用）。
         """
         if max_wait_sec is None:
             max_wait_sec = TX_VERIFY_MAX_WAIT_SEC
         poll_interval = max(1, TRADER_VERIFY_POLL_INTERVAL_SEC)
+        # searchTransactionHistory: true 关键！否则只查 recent cache，交易超出一小段时间即返回 null
+        verify_params = [[sig_str], {"searchTransactionHistory": True}]
+
+        def _parse_verify_result(resp) -> tuple:
+            """解析 getSignatureStatuses 返回，兼容 dict 与 object。"""
+            vals = []
+            if isinstance(resp, dict):
+                vals = resp.get("value") or []
+            else:
+                vals = getattr(resp, "value", None) or []
+            if not vals:
+                return None, None
+            st = vals[0]
+            if st is None:
+                return None, None
+            err = st.get("err") if isinstance(st, dict) else getattr(st, "err", None)
+            conf = (
+                (st.get("confirmationStatus") or st.get("confirmation_status") or "")
+                if isinstance(st, dict)
+                else (getattr(st, "confirmation_status", None) or getattr(st, "confirmationStatus", "") or "")
+            )
+            return err, conf
+
         try:
-            from solders.signature import Signature
-            sig = Signature.from_string(sig_str) if isinstance(sig_str, str) else sig_str
             for _ in range(0, max_wait_sec, poll_interval):
                 try:
-                    resp = await with_alchemy_rate_limit(
-                        lambda: self.rpc_client.get_signature_statuses([sig])
+                    resp = await alchemy_client.rpc_post(
+                        "getSignatureStatuses", verify_params,
+                        http_client=self.http_client, timeout=10.0,
                     )
                 except Exception as e:
                     if _is_rate_limit_error(e) and alchemy_client.size > 1:
                         logger.warning("验证交易时 Alchemy 429，切换 Key 继续: %s", e)
                         await self._recreate_rpc_client()
+                        alchemy_client.mark_current_failed()
                         await asyncio.sleep(TRADER_VERIFY_RETRY_SLEEP_SEC)
                         continue
                     logger.debug("验证交易确认异常", exc_info=True)
                     await asyncio.sleep(poll_interval)
                     continue
-                vals = getattr(resp, "value", None) or []
-                if not vals:
+                if resp is None:
                     await asyncio.sleep(poll_interval)
                     continue
-                st = vals[0]
-                if st is None:
+                err, conf = _parse_verify_result(resp)
+                if err is None and conf is None:
                     await asyncio.sleep(poll_interval)
                     continue
-                err = getattr(st, "err", None)
                 if err is not None:
                     logger.warning("交易链上执行失败 err=%s", err)
                     return False
-                conf = getattr(st, "confirmation_status", None) or ""
-                if conf in ("confirmed", "finalized") or getattr(st, "confirmationStatus", "") in (
-                "confirmed", "finalized"):
+                if conf in ("confirmed", "finalized"):
                     return True
                 await asyncio.sleep(poll_interval)
         except Exception:
@@ -1596,10 +1616,11 @@ class SolanaTrader:
         try:
             if helius_client.size < 1:
                 return False
+            helius_params = [[sig_str], {"commitment": "confirmed", "searchTransactionHistory": True}]
             for _ in range(helius_client.size):
                 result = await helius_client.rpc_post(
                     "getSignatureStatuses",
-                    [[sig_str], {"commitment": "confirmed"}],
+                    helius_params,
                     http_client=self.http_client,
                     timeout=8.0,
                 )
