@@ -421,8 +421,9 @@ class SolanaTrader:
                             "pnl_sol": pnl_sol,
                             "note": "紧急清仓(Helius credit耗尽)",
                         })
-                    self._emit_position_closed(token_address, pos)
-                    del self.positions[token_address]
+                    popped = self.positions.pop(token_address, None)
+                    if popped is not None:
+                        self._emit_position_closed(token_address, popped)
                     closed += 1
                 else:
                     logger.warning("❌ 紧急清仓失败: %s (链上余额 %.2f)", token_address, sell_amount)
@@ -485,8 +486,9 @@ class SolanaTrader:
                         "pnl_sol": pnl_sol,
                         "note": reason,
                     })
-                self._emit_position_closed(token_address, pos)
-                del self.positions[token_address]
+                popped = self.positions.pop(token_address, None)
+                if popped is not None:
+                    self._emit_position_closed(token_address, popped)
                 self._save_state_in_background()
                 return True
             # 卖出失败：若链上已归零（前次 tx 可能已成功），sync 并视为成功，避免重复尝试
@@ -576,8 +578,9 @@ class SolanaTrader:
                             "pnl_sol": pnl_sol,
                             "note": "体检踢出猎手兜底清仓",
                         })
-                    self._emit_position_closed(token_address, pos)
-                    del self.positions[token_address]
+                    popped = self.positions.pop(token_address, None)
+                    if popped is not None:
+                        self._emit_position_closed(token_address, popped)
                     closed += 1
                     logger.info("✅ 兜底清仓完成: %s", token_address[:16] + "..")
                 else:
@@ -1013,8 +1016,9 @@ class SolanaTrader:
                             "pnl_sol": est_sol - cost_this, "note": "跟随卖出(验证超时按链上确认)",
                         })
                     if pos.total_tokens <= 0:
-                        self._emit_position_closed(token_address, pos)
-                        del self.positions[token_address]
+                        popped = self.positions.pop(token_address, None)
+                        if popped is not None:
+                            self._emit_position_closed(token_address, popped)
                     self._save_state_in_background()
                 else:
                     logger.warning("❌ 跟随卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount_ui)
@@ -1052,8 +1056,9 @@ class SolanaTrader:
             if hunter_addr in pos.shares:
                 del pos.shares[hunter_addr]
         if pos.total_tokens <= 0:
-            self._emit_position_closed(token_address, pos)
-            del self.positions[token_address]
+            popped = self.positions.pop(token_address, None)
+            if popped is not None:
+                self._emit_position_closed(token_address, popped)
         self._save_state_in_background()
 
     async def check_pnl_and_stop_profit(self, token_address: str, current_price_ui: float):
@@ -1228,8 +1233,9 @@ class SolanaTrader:
                         "pnl_sol": pnl_sol,
                         "note": f"止损{stop_loss_pct * 100:.0f}%",
                     })
-                self._emit_position_closed(token_address, pos)
-                del self.positions[token_address]
+                popped = self.positions.pop(token_address, None)
+                if popped is not None:
+                    self._emit_position_closed(token_address, popped)
             self._save_state_in_background()
             return
 
@@ -1415,8 +1421,9 @@ class SolanaTrader:
                                     "note": f"止盈{sell_pct_actual*100:.0f}%(验证超时按链上确认)",
                                 })
                             if pos.total_tokens <= 0:
-                                self._emit_position_closed(token_address, pos)
-                                del self.positions[token_address]
+                                popped = self.positions.pop(token_address, None)
+                                if popped is not None:
+                                    self._emit_position_closed(token_address, popped)
                         else:
                             logger.warning("❌ 止盈卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount)
                     self._save_state_in_background()
@@ -1456,8 +1463,9 @@ class SolanaTrader:
                     pos.total_tokens = _floor_token_amount(pos.total_tokens - sell_amount)
                     pos.tp_hit_levels.add(level)
                     if pos.total_tokens <= 0:
-                        self._emit_position_closed(token_address, pos)
-                        del self.positions[token_address]
+                        popped = self.positions.pop(token_address, None)
+                        if popped is not None:
+                            self._emit_position_closed(token_address, popped)
                 self._save_state_in_background()
 
     async def _jupiter_sell_with_retry(
@@ -1903,8 +1911,10 @@ class SolanaTrader:
         用于：链上无持仓时跳过卖出、卖出失败但链上已归零（验证超时导致误判）、手动清仓。
         会更新 trader_state.json，并补录 trading_history（手动清仓时盈亏未知）。
         """
-        if token_address not in self.positions:
+        popped = self.positions.pop(token_address, None)
+        if popped is None:
             return
+        pos = popped
         # 手动清仓时补录 trading_history，避免遗漏（实际盈亏链上未知，需人工核验）
         if self.on_trade_recorded and pos.total_tokens > 0:
             lead = list(pos.shares.keys())[0] if pos.shares else ""
@@ -1922,7 +1932,6 @@ class SolanaTrader:
                 "note": "链上对账补录-手动清仓",
             })
         self._emit_position_closed(token_address, pos)
-        del self.positions[token_address]
         self._save_state_safe()  # 同步写入，确保移除过时持仓后立即持久化，避免重启又恢复
         logger.info("📤 已同步清仓状态并移除持仓记录: %s", token_address[:16] + "..")
 
