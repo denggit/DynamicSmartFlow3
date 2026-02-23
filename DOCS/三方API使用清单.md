@@ -44,7 +44,7 @@
 **业务使用**：
 - `sm_searcher.py`：`get_signatures_for_address`（频率预检、ATA 签名）
 - `hunter_agent.py`：WebSocket 订阅、`get_transaction`、`get_token_accounts_by_owner`
-- `trader.py`：RPC 客户端（广播、验证、余额、decimals），经 `with_alchemy_rate_limit` 限流
+- `trader.py`：RPC 客户端（广播、验证、余额、decimals），经 `with_alchemy_rate_limit` 限流；**必须传入 lambda 延迟创建协程**，避免限流等待期间 `_recreate_rpc_client` 关闭旧 client 导致 "client has been closed"
 
 ---
 

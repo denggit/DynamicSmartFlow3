@@ -781,7 +781,7 @@ class SolanaTrader:
                 self._sync_zero_and_close_position(token_address, pos)
                 return
             logger.info(
-                "⏭️ 跟随卖出跳过: 卖出价值 %.4f SOL < %.2f SOL，无意义: %s",
+                "⏭️ 跟随卖出跳过: 卖出价值 %.4f SOL < %.4f SOL，无意义: %s",
                 sell_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
             )
             return
@@ -1063,7 +1063,7 @@ class SolanaTrader:
                         )
                     else:
                         logger.info(
-                            "⏭️ 止盈跳过: 卖出价值 %.4f SOL < %.2f SOL 无意义，同步关闭: %s",
+                            "⏭️ 止盈跳过: 卖出价值 %.4f SOL < %.4f SOL 无意义，同步关闭: %s",
                             sell_value_sol, MIN_SHARE_VALUE_SOL, token_address[:16] + "..",
                         )
                     self._sync_zero_and_close_position(token_address, pos)
@@ -1164,7 +1164,7 @@ class SolanaTrader:
                 if chain_bal_pre is not None and chain_bal_pre < current_amount:
                     current_amount = min(current_amount, chain_bal_pre)
                     logger.debug("按链上余额 %.2f 调整卖出量", current_amount)
-            tx_sig, sol_out, _ = await self._jupiter_swap(
+            tx_sig, sol_out, definitely_no_buy = await self._jupiter_swap(
                 input_mint=input_mint,
                 output_mint=output_mint,
                 amount_in_ui=current_amount,
@@ -1176,6 +1176,13 @@ class SolanaTrader:
                 if i > 0:
                     logger.info("✅ 卖出成功 (滑点 %.1f%%)", bps / 100)
                 return tx_sig, sol_out
+            # 已广播但验证失败（definitely_no_buy=False 表示可能已成交）时禁止滑点重试，避免重复卖出
+            if not definitely_no_buy:
+                logger.warning(
+                    "⏸️ 卖出已广播但验证超时，停止滑点重试，由上层按链上余额兜底: %s",
+                    input_mint[:16] + "..",
+                )
+                return None, 0.0
             if i < len(slippage_list) - 1:
                 chain_bal = await self._fetch_own_token_balance(input_mint)
                 if chain_bal is not None:
@@ -1280,7 +1287,7 @@ class SolanaTrader:
                 signed_tx = VersionedTransaction.populate(tx.message, [signature])
                 opts = TxOpts(skip_preflight=True, max_retries=3)
                 result = await with_alchemy_rate_limit(
-                    self.rpc_client.send_transaction(signed_tx, opts=opts)
+                    lambda: self.rpc_client.send_transaction(signed_tx, opts=opts)
                 )
                 sig_str = str(getattr(result, "value", result))
                 logger.info("⏳ 交易已广播: %s", sig_str)
@@ -1413,6 +1420,7 @@ class SolanaTrader:
         """
         轮询 get_signature_statuses，确认交易成功落地。
         链上失败（滑点等）时返回 False。遇 Alchemy 429 时切换 Key 继续轮询，避免限流误判。
+        所有 Alchemy Key 均超时/失败时，用 Helius 做一次兜底查询（Helius 珍贵，仅兜底使用）。
         """
         if max_wait_sec is None:
             max_wait_sec = TX_VERIFY_MAX_WAIT_SEC
@@ -1422,7 +1430,7 @@ class SolanaTrader:
             for _ in range(max_wait_sec):
                 try:
                     resp = await with_alchemy_rate_limit(
-                        self.rpc_client.get_signature_statuses([sig])
+                        lambda: self.rpc_client.get_signature_statuses([sig])
                     )
                 except Exception as e:
                     if _is_rate_limit_error(e) and alchemy_client.size > 1:
@@ -1452,6 +1460,40 @@ class SolanaTrader:
                 await asyncio.sleep(1)
         except Exception:
             logger.debug("验证交易确认异常", exc_info=True)
+
+        # Alchemy 耗尽后：用 Helius 池内所有 Key 兜底（Helius 珍贵，仅此处兜底；部分 Key 可能 credit 耗尽，逐个试）
+        try:
+            if helius_client.size < 1:
+                return False
+            for _ in range(helius_client.size):
+                result = await helius_client.rpc_post(
+                    "getSignatureStatuses",
+                    [[sig_str], {"commitment": "confirmed"}],
+                    http_client=self.http_client,
+                    timeout=8.0,
+                )
+                if result and isinstance(result, dict):
+                    vals = result.get("value") or []
+                    if vals:
+                        st = vals[0]
+                        if st and isinstance(st, dict):
+                            if st.get("err") is not None:
+                                logger.warning("Helius 兜底验证: 交易链上失败 err=%s", st.get("err"))
+                                return False
+                            conf = st.get("confirmationStatus") or st.get("confirmation_status") or ""
+                            if conf in ("confirmed", "finalized"):
+                                logger.info("✅ Helius 兜底验证成功: %s", sig_str[:16] + "..")
+                                return True
+                # 当前 Key 失败（429/超时等），切换下一 Key 再试
+                if helius_client.size > 1:
+                    helius_client.mark_current_failed()
+                    await asyncio.sleep(1)
+        except Exception:
+            logger.debug("Helius 兜底验证异常", exc_info=True)
+        logger.warning(
+            "❌ 交易验证失败: Alchemy 与 Helius 均无法确认 %s，交易可能已成交请手动核对链上",
+            sig_str[:16] + "..",
+        )
         return False
 
     async def _get_decimals(self, mint_address: str) -> int:
@@ -1461,7 +1503,7 @@ class SolanaTrader:
         """
         try:
             pubkey = Pubkey.from_string(mint_address)
-            resp = await with_alchemy_rate_limit(self.rpc_client.get_token_supply(pubkey))
+            resp = await with_alchemy_rate_limit(lambda: self.rpc_client.get_token_supply(pubkey))
             return resp.value.decimals
         except Exception as e:
             if _is_rate_limit_error(e):

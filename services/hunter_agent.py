@@ -284,25 +284,30 @@ class HunterAgentController:
                             if abs(delta) < 1e-9:
                                 continue
                             # 发现减仓（可能漏了订阅）。注意：old_bal 须正确，若 baseline 被基线前 tx 污染会误判
+                            # 二次确认：间隔 1 秒再拉一次，若仍为 real_balance 才触发，避免 RPC 缓存/抖动误判
                             if delta < 0 and abs(delta) >= old_bal * SYNC_MIN_DELTA_RATIO:
-                                mission.hunter_states[hunter] = max(0.0, real_balance)
-                                sell_amount = abs(delta)
-                                ratio = (sell_amount / old_bal) if old_bal > 0 else 1.0
-                                new_bal = mission.hunter_states[hunter]
-                                trade_logger.info(
-                                    f"📉 [Agent 同步] 猎手 {hunter} 卖出 {token_address[:6]} | "
-                                    f"数量: {sell_amount:.2f} | 比例: {ratio:.1%} (剩 {new_bal:.2f}) [漏订阅兜底]"
-                                )
-                                if self.signal_callback:
-                                    signal = {
-                                        "type": "HUNTER_SELL",
-                                        "token": token_address,
-                                        "hunter": hunter,
-                                        "sell_ratio": ratio,
-                                        "remaining_balance": new_bal,
-                                        "timestamp": now,
-                                    }
-                                    await self._trigger_callback(signal)
+                                await asyncio.sleep(1.0)
+                                real_balance_2 = await self._fetch_token_balance(hunter, token_address)
+                                if real_balance_2 is not None and abs(real_balance_2 - real_balance) < old_bal * 0.02:
+                                    # 两次结果一致（误差 < 2%），视为真实减仓
+                                    mission.hunter_states[hunter] = max(0.0, real_balance)
+                                    sell_amount = abs(delta)
+                                    ratio = (sell_amount / old_bal) if old_bal > 0 else 1.0
+                                    new_bal = mission.hunter_states[hunter]
+                                    trade_logger.info(
+                                        f"📉 [Agent 同步] 猎手 {hunter} 卖出 {token_address[:6]} | "
+                                        f"数量: {sell_amount:.2f} | 比例: {ratio:.1%} (剩 {new_bal:.2f}) [漏订阅兜底]"
+                                    )
+                                    if self.signal_callback:
+                                        signal = {
+                                            "type": "HUNTER_SELL",
+                                            "token": token_address,
+                                            "hunter": hunter,
+                                            "sell_ratio": ratio,
+                                            "remaining_balance": new_bal,
+                                            "timestamp": now,
+                                        }
+                                        await self._trigger_callback(signal)
                             elif delta > 0:
                                 mission.hunter_states[hunter] = real_balance
                         except Exception:

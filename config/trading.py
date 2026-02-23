@@ -41,7 +41,8 @@ TAKE_PROFIT_LEVELS = [
     (9.0, 0.50),
 ]
 
-MIN_SHARE_VALUE_SOL = 0.01
+# 卖出价值下限：低于此值认为无意义（网费约 0.000011 SOL，0.0001 以下卖出可能净亏）
+MIN_SHARE_VALUE_SOL = 0.0001
 # 粉尘余额阈值（UI 数量）：低于此值的持仓不再尝试卖出，Jupiter 通常无路由
 DUST_TOKEN_AMOUNT_UI = 1e-5
 MIN_SELL_RATIO = 0.3
