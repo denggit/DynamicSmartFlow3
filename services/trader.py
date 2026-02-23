@@ -33,6 +33,7 @@ from config.settings import (
     TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
     TX_VERIFY_RECONCILIATION_DELAY_SEC, TX_VERIFY_RECONCILIATION_RETRIES,
     TRADER_RPC_TIMEOUT, TRADER_RETRY_COOLDOWN_SEC, TRADER_VERIFY_POLL_INTERVAL_SEC,
+    TRADER_CHAIN_AFTER_RETRY_DELAY_SEC,
     WSOL_MINT,
     LAMPORTS_PER_SOL,
     TRADER_STATE_PATH,
@@ -842,7 +843,46 @@ class SolanaTrader:
                 )
                 self._sync_zero_and_close_position(token_address, pos)
             else:
-                logger.warning("❌ 跟随卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount_ui)
+                logger.info(
+                    "⏳ 跟卖验证超时但链上余额 %.2f > 0，%ds 后二次确认: %s",
+                    chain_after, TRADER_CHAIN_AFTER_RETRY_DELAY_SEC, token_address[:16] + "..",
+                )
+                await asyncio.sleep(TRADER_CHAIN_AFTER_RETRY_DELAY_SEC)
+                chain_after_2 = await self._fetch_own_token_balance(token_address)
+                if chain_after_2 is not None and chain_after_2 < 1e-9:
+                    logger.info("✅ 二次确认链上已归零，跟卖已成交，同步: %s", token_address[:16] + "..")
+                    self._sync_zero_and_close_position(token_address, pos)
+                elif chain_after_2 is not None and chain_after_2 < chain_after - sell_amount_ui * 0.5:
+                    logger.info(
+                        "✅ 二次确认余额 %.2f -> %.2f，跟卖已成交，同步: %s",
+                        chain_after, chain_after_2, token_address[:16] + "..",
+                    )
+                    est_sol = sell_amount_ui * current_price
+                    pos.total_tokens -= sell_amount_ui
+                    share.token_amount -= sell_amount_ui
+                    if is_dust or share.token_amount <= 0:
+                        if hunter_addr in pos.shares:
+                            del pos.shares[hunter_addr]
+                    ts_now = time.time()
+                    cost_this = sell_amount_ui * pos.average_price
+                    pos.trade_records.append({
+                        "ts": ts_now, "type": "sell", "sol_spent": 0.0, "sol_received": est_sol,
+                        "token_amount": sell_amount_ui, "note": "跟随卖出(验证超时按链上确认)", "pnl_sol": est_sol - cost_this,
+                    })
+                    if self.on_trade_recorded:
+                        self.on_trade_recorded({
+                            "date": time.strftime("%Y-%m-%d", time.localtime(ts_now)),
+                            "ts": ts_now, "token": token_address, "type": "sell",
+                            "sol_spent": 0.0, "sol_received": est_sol, "token_amount": sell_amount_ui,
+                            "price": pos.average_price, "hunter_addr": hunter_addr,
+                            "pnl_sol": est_sol - cost_this, "note": "跟随卖出(验证超时按链上确认)",
+                        })
+                    if pos.total_tokens <= 0:
+                        self._emit_position_closed(token_address, pos)
+                        del self.positions[token_address]
+                    self._save_state_in_background()
+                else:
+                    logger.warning("❌ 跟随卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount_ui)
             return
 
         cost_this_sell = sell_amount_ui * pos.average_price
@@ -1010,7 +1050,17 @@ class SolanaTrader:
                     )
                     self._sync_zero_and_close_position(token_address, pos)
                 else:
-                    logger.warning("❌ 止损卖出失败 (无 tx_sig): %s", token_address)
+                    logger.info(
+                        "⏳ 止损验证超时但链上余额 %.2f > 0，%ds 后二次确认: %s",
+                        chain_after, TRADER_CHAIN_AFTER_RETRY_DELAY_SEC, token_address[:16] + "..",
+                    )
+                    await asyncio.sleep(TRADER_CHAIN_AFTER_RETRY_DELAY_SEC)
+                    chain_after_2 = await self._fetch_own_token_balance(token_address)
+                    if chain_after_2 is not None and chain_after_2 < 1e-9:
+                        logger.info("✅ 二次确认链上已归零，止损已成交，同步: %s", token_address[:16] + "..")
+                        self._sync_zero_and_close_position(token_address, pos)
+                    else:
+                        logger.warning("❌ 止损卖出失败 (无 tx_sig): %s", token_address)
                 self._save_state_in_background()
                 return
 
@@ -1125,7 +1175,52 @@ class SolanaTrader:
                         )
                         self._sync_zero_and_close_position(token_address, pos)
                     else:
-                        logger.warning("❌ 止盈卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount)
+                        # chain_after > 0：可能是 RPC 延迟未更新，延迟再查一次，避免误判失败导致重复卖出
+                        logger.info(
+                            "⏳ 止盈验证超时但链上余额 %.2f > 0，%ds 后二次确认（防 RPC 延迟误判）: %s",
+                            chain_after, TRADER_CHAIN_AFTER_RETRY_DELAY_SEC, token_address[:16] + "..",
+                        )
+                        await asyncio.sleep(TRADER_CHAIN_AFTER_RETRY_DELAY_SEC)
+                        chain_after_2 = await self._fetch_own_token_balance(token_address)
+                        if chain_after_2 is not None and chain_after_2 < 1e-9:
+                            logger.info(
+                                "✅ 二次确认链上已归零，交易已成交，同步状态: %s",
+                                token_address[:16] + "..",
+                            )
+                            self._sync_zero_and_close_position(token_address, pos)
+                        elif chain_after_2 is not None and chain_after_2 < chain_after - sell_amount * 0.5:
+                            logger.info(
+                                "✅ 二次确认余额下降 %.2f -> %.2f，止盈已成交，同步状态: %s",
+                                chain_after, chain_after_2, token_address[:16] + "..",
+                            )
+                            sell_pct_actual = sell_amount / pos.total_tokens if pos.total_tokens > 0 else 1.0
+                            est_sol = sell_amount * current_price_ui
+                            cost = sell_amount * pos.average_price
+                            for share in pos.shares.values():
+                                share.token_amount *= (1.0 - sell_pct_actual)
+                            pos.total_tokens = chain_after_2
+                            pos.tp_hit_levels.add(level)
+                            ts_now = time.time()
+                            pos.trade_records.append({
+                                "ts": ts_now, "type": "sell", "sol_spent": 0.0, "sol_received": est_sol,
+                                "token_amount": sell_amount, "note": f"止盈{sell_pct_actual*100:.0f}%(验证超时按链上确认)",
+                                "pnl_sol": est_sol - cost,
+                            })
+                            if self.on_trade_recorded:
+                                lead = list(pos.shares.keys())[0] if pos.shares else ""
+                                self.on_trade_recorded({
+                                    "date": time.strftime("%Y-%m-%d", time.localtime(ts_now)),
+                                    "ts": ts_now, "token": token_address, "type": "sell",
+                                    "sol_spent": 0.0, "sol_received": est_sol, "token_amount": sell_amount,
+                                    "price": pos.average_price, "hunter_addr": lead,
+                                    "pnl_sol": est_sol - cost,
+                                    "note": f"止盈{sell_pct_actual*100:.0f}%(验证超时按链上确认)",
+                                })
+                            if pos.total_tokens <= 0:
+                                self._emit_position_closed(token_address, pos)
+                                del self.positions[token_address]
+                        else:
+                            logger.warning("❌ 止盈卖出失败 (无 tx_sig): %s 数量 %.2f", token_address, sell_amount)
                     self._save_state_in_background()
                     return
 
