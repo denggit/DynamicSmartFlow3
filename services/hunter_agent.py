@@ -623,11 +623,22 @@ class HunterAgentController:
                 return 0.0
             total_ui = 0.0
             for acc in result["value"]:
+                # Alchemy/Helius: result.value[].account.data.parsed.info.tokenAmount
                 info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
                 tamt = info.get("tokenAmount") or {}
-                ui = tamt.get("uiAmount")
-                if ui is not None:
-                    total_ui += float(ui)
+                ui_str = tamt.get("uiAmountString")
+                if ui_str is not None:
+                    try:
+                        total_ui += float(ui_str)
+                    except (ValueError, TypeError):
+                        pass
+                elif tamt.get("amount") is not None and tamt.get("decimals") is not None:
+                    try:
+                        total_ui += int(tamt["amount"]) / (10 ** int(tamt["decimals"]))
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        pass
+                elif tamt.get("uiAmount") is not None:
+                    total_ui += float(tamt["uiAmount"])
             return total_ui if total_ui > 0 else 0.0
         except Exception:
             logger.exception("获取余额失败")
