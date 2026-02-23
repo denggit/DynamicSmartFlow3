@@ -27,7 +27,9 @@ from solders.transaction import VersionedTransaction
 
 from config.settings import (
     get_tier_config, TAKE_PROFIT_LEVELS,
-    MIN_SHARE_VALUE_SOL, DUST_TOKEN_AMOUNT_UI, MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
+    MIN_SHARE_VALUE_SOL, DUST_TOKEN_AMOUNT_UI, TOKEN_AMOUNT_FLOOR_DECIMALS,
+    MIN_SELL_RATIO, FOLLOW_SELL_THRESHOLD, SELL_BUFFER,
+    FRESH_POSITION_RPC_GRACE_SEC, FRESH_POSITION_RETRY_DELAY_SEC,
     SOLANA_PRIVATE_KEY_BASE58,
     JUP_QUOTE_API, JUP_SWAP_API, SLIPPAGE_BPS, SELL_SLIPPAGE_BPS_RETRIES, SELL_SLIPPAGE_BPS_STOP_LOSS, jup_key_pool,
     TX_VERIFY_MAX_WAIT_SEC, TX_VERIFY_RETRY_DELAY_SEC, TX_VERIFY_RETRY_MAX_WAIT_SEC,
@@ -55,6 +57,17 @@ logger = get_logger(__name__)
 
 # 防止多线程并发写 trader_state.json 导致文件损坏
 _STATE_FILE_LOCK = threading.Lock()
+
+
+def _floor_token_amount(amount: float, decimals: int = TOKEN_AMOUNT_FLOOR_DECIMALS) -> float:
+    """
+    持仓数量向下取整，避免 round 进位导致记录 > 链上，卖出时超量失败。
+    例：链上 4231.889572，若 round 则 4231.89 > 实际，卖出会失败；floor 后 4231.889572。
+    """
+    if amount <= 0 or decimals <= 0:
+        return amount
+    mult = 10 ** decimals
+    return math.floor(amount * mult) / mult
 
 
 def _is_rate_limit_error(e: Exception) -> bool:
@@ -169,7 +182,7 @@ class SolanaTrader:
     async def _fetch_own_token_balance(self, token_mint: str) -> Optional[float]:
         """
         获取我方钱包在链上的 Token 余额（UI 单位）。
-        通过 AlchemyClient.get_token_accounts_by_owner 调用，429 时由 Client 内部切换 Key 重试。
+        优先用 uiAmountString 避免 uiAmount 的 JSON 精度丢失；返回时 floor 避免记录 > 链上。
         """
         if not self.keypair:
             return None
@@ -178,18 +191,24 @@ class SolanaTrader:
             owner_b58, token_mint, http_client=self.http_client, timeout=TRADER_RPC_TIMEOUT
         )
         if result is None:
-            return None  # 请求失败
+            return None
         if not result.get("value"):
-            return 0.0  # 无持仓
+            return 0.0
         total_ui = 0.0
         for acc in result["value"]:
             info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
             tamt = info.get("tokenAmount") or {}
-            ui = tamt.get("uiAmount")
-            if ui is not None:
-                total_ui += float(ui)
-        # 余额为 0 时返回 0.0，不返回 None；否则会被误判为「RPC 失败」导致对账重试
-        return total_ui
+            ui_str = tamt.get("uiAmountString")
+            if ui_str is not None:
+                try:
+                    total_ui += float(ui_str)
+                except (ValueError, TypeError):
+                    ui = tamt.get("uiAmount")
+                    if ui is not None:
+                        total_ui += float(ui)
+            elif tamt.get("uiAmount") is not None:
+                total_ui += float(tamt["uiAmount"])
+        return _floor_token_amount(total_ui) if total_ui > 0 else total_ui
 
     async def _fetch_own_token_balance_raw(self, token_mint: str) -> Optional[int]:
         """
@@ -259,11 +278,47 @@ class SolanaTrader:
         pos = self.positions.get(token_address)
         if chain_bal is None:
             if remove_if_chain_unknown and pos:
+                # 新建仓位：查询失败可能是 RPC 未索引，延迟再试一次
+                age = time.time() - (pos.entry_time or 0)
+                if age < FRESH_POSITION_RPC_GRACE_SEC:
+                    logger.info(
+                        "⏳ 仓位建立仅 %.0fs，链上查询失败可能为 RPC 未索引，%ds 后重试: %s",
+                        age, FRESH_POSITION_RETRY_DELAY_SEC, token_address[:16] + "..",
+                    )
+                    await asyncio.sleep(FRESH_POSITION_RETRY_DELAY_SEC)
+                    chain_bal = await self._fetch_own_token_balance(token_address)
+                    if chain_bal is not None and chain_bal >= 1e-9:
+                        logger.warning(
+                            "⚠️ 重试后链上有持仓 %.2f，此前查询失败为 RPC 延迟，不删除: %s",
+                            chain_bal, token_address[:16] + "..",
+                        )
+                        return
+                    if chain_bal is None:
+                        logger.warning("重试后仍查询失败，保守保持持仓: %s", token_address[:16] + "..")
+                        return
                 logger.warning("链上余额查询失败，按猎手归零跳过策略强制移除过时持仓: %s", token_address[:16] + "..")
                 self._sync_zero_and_close_position(token_address, pos)
             return
         if chain_bal < 1e-9:  # 链上已归零
             if pos:
+                # 新建仓位 RPC 延迟保护：开仓后短时间内 chain_bal=0 可能是 RPC 未索引，延迟二次确认
+                age = time.time() - (pos.entry_time or 0)
+                if age < FRESH_POSITION_RPC_GRACE_SEC:
+                    logger.info(
+                        "⏳ 仓位建立仅 %.0fs，chain_bal=0 可能为 RPC 未索引，%ds 后二次确认: %s",
+                        age, FRESH_POSITION_RETRY_DELAY_SEC, token_address[:16] + "..",
+                    )
+                    await asyncio.sleep(FRESH_POSITION_RETRY_DELAY_SEC)
+                    chain_bal = await self._fetch_own_token_balance(token_address)
+                    if chain_bal is not None and chain_bal >= 1e-9:
+                        logger.warning(
+                            "⚠️ 二次确认链上有持仓 %.2f，此前 chain_bal=0 为 RPC 延迟，不删除: %s",
+                            chain_bal, token_address[:16] + "..",
+                        )
+                        return
+                    if chain_bal is None:
+                        logger.warning("二次确认查询失败，保守保持持仓: %s", token_address[:16] + "..")
+                        return
                 logger.info("链上已归零，同步移除过时持仓记录: %s", token_address[:16] + "..")
                 self._sync_zero_and_close_position(token_address, pos)
             return
@@ -598,16 +653,36 @@ class SolanaTrader:
                 )
             return definitely_no_buy
 
-        # 3. 转换 UI Amount
+        # 3. 以链上为准重置持仓与均价：开仓后查询链上余额
         token_amount_ui = token_amount_raw / (10 ** decimals)
+        chain_bal = await self._fetch_own_token_balance(token_address)
+        if chain_bal is not None and chain_bal >= 1e-9:
+            token_amount_ui = chain_bal
+            logger.debug("开仓以链上为准: %.2f tokens", token_amount_ui)
+        elif chain_bal is not None and chain_bal < 1e-9:
+            await asyncio.sleep(5)
+            chain_bal_retry = await self._fetch_own_token_balance(token_address)
+            if chain_bal_retry is not None and chain_bal_retry >= 1e-9:
+                token_amount_ui = chain_bal_retry
+                logger.info("开仓链上初次为 0，5s 重试后查到 %.2f，以链上为准", token_amount_ui)
+            else:
+                logger.warning(
+                    "开仓后链上未查到持仓(RPC 延迟)，使用 Jupiter 返回值 %.2f，启动对账将校正: %s",
+                    token_amount_ui, token_address[:16] + "..",
+                )
+        else:
+            logger.warning(
+                "开仓后链上查询失败(429等)，使用 Jupiter 返回值 %.2f，启动对账将校正: %s",
+                token_amount_ui, token_address[:16] + "..",
+            )
 
-        # 计算均价
+        # 4. 计算均价：成本(buy_sol)/持仓量(token_amount_ui)，单个 token 成本用于止盈止损
         if token_amount_ui > 0:
             actual_price = buy_sol / token_amount_ui
         else:
             actual_price = current_price_ui
 
-        # 4. 建仓 (传入 decimals, lead_hunter_score, entry_liquidity_usd)，减半仓时禁止加仓
+        # 5. 建仓 (传入 decimals, lead_hunter_score, entry_liquidity_usd)，减半仓时禁止加仓
         pos = Position(
             token_address,
             actual_price,
@@ -617,7 +692,7 @@ class SolanaTrader:
         )
         pos.no_addon = halve_position
         pos.total_cost_sol = buy_sol
-        pos.total_tokens = token_amount_ui
+        pos.total_tokens = _floor_token_amount(token_amount_ui)
         pos.entry_time = time.time()
         pos.trade_records.append({
             "ts": pos.entry_time,
@@ -704,31 +779,74 @@ class SolanaTrader:
                 logger.warning("❌ 加仓失败: %s | Quote/Swap 未通过，从未广播", token_address[:16] + "..")
             return
 
-        # [关键修复] UI Amount 转换
         token_got_ui = token_got_raw / (10 ** pos.decimals)
 
-        # 更新状态与均价 (一次计算即可)
-        new_total_tokens = pos.total_tokens + token_got_ui
-        pos.average_price = (pos.total_tokens * pos.average_price + add_sol) / new_total_tokens
-        pos.total_cost_sol += add_sol
-        pos.total_tokens = new_total_tokens
+        # 以链上为准重置持仓与均价：加仓后查询链上余额，(总成本/链上总量)=均价
+        old_total = pos.total_tokens
+        shares_updated_from_chain = False
+        chain_bal = await self._fetch_own_token_balance(token_address)
+        if chain_bal is not None and chain_bal >= 1e-9:
+            pos.total_cost_sol += add_sol
+            pos.total_tokens = _floor_token_amount(chain_bal)
+            pos.average_price = pos.total_cost_sol / chain_bal if chain_bal > 0 else pos.average_price
+            add_amount_chain = chain_bal - old_total
+            if hunter_addr in pos.shares:
+                pos.shares[hunter_addr].token_amount += add_amount_chain
+            else:
+                pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), add_amount_chain)
+            shares_updated_from_chain = True
+            logger.debug("加仓以链上为准: %.2f tokens，均价 %.6f", chain_bal, pos.average_price)
+        elif chain_bal is not None and chain_bal < 1e-9:
+            await asyncio.sleep(5)
+            chain_bal_retry = await self._fetch_own_token_balance(token_address)
+            if chain_bal_retry is not None and chain_bal_retry >= 1e-9:
+                pos.total_cost_sol += add_sol
+                pos.total_tokens = _floor_token_amount(chain_bal_retry)
+                pos.average_price = pos.total_cost_sol / chain_bal_retry if chain_bal_retry > 0 else pos.average_price
+                add_amount_chain = chain_bal_retry - old_total
+                if hunter_addr in pos.shares:
+                    pos.shares[hunter_addr].token_amount += add_amount_chain
+                else:
+                    pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), add_amount_chain)
+                shares_updated_from_chain = True
+                logger.info("加仓链上初次为 0，5s 重试后查到 %.2f，以链上为准", chain_bal_retry)
+            else:
+                new_total_tokens = old_total + token_got_ui
+                pos.average_price = (pos.total_tokens * pos.average_price + add_sol) / new_total_tokens
+                pos.total_cost_sol += add_sol
+                pos.total_tokens = _floor_token_amount(new_total_tokens)
+                logger.warning(
+                    "加仓后链上未查到，使用 Jupiter 返回值，均价 %.6f，启动对账将校正: %s",
+                    pos.average_price, token_address[:16] + "..",
+                )
+        else:
+            new_total_tokens = old_total + token_got_ui
+            pos.average_price = (pos.total_tokens * pos.average_price + add_sol) / new_total_tokens
+            pos.total_cost_sol += add_sol
+            pos.total_tokens = _floor_token_amount(new_total_tokens)
+            logger.warning(
+                "加仓后链上查询失败(429等)，使用 Jupiter 返回值，启动对账将校正: %s",
+                token_address[:16] + "..",
+            )
 
+        actual_add_tokens = pos.total_tokens - old_total
         pos.trade_records.append({
             "ts": time.time(),
             "type": "buy",
             "sol_spent": add_sol,
             "sol_received": 0.0,
-            "token_amount": token_got_ui,
+            "token_amount": actual_add_tokens,
             "note": "加仓",
             "pnl_sol": None,
         })
-        # 份额分配（只跟单猎手）
-        if hunter_addr in pos.shares:
-            pos.shares[hunter_addr].token_amount += token_got_ui
-        else:
-            pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), token_got_ui)
-            current_hunters_info = [{"address": h, "score": s.score} for h, s in pos.shares.items()]
-            self._rebalance_shares_logic(pos, current_hunters_info)
+        # 份额分配：链上路径已更新，否则用 Jupiter 返回值更新
+        if not shares_updated_from_chain:
+            if hunter_addr in pos.shares:
+                pos.shares[hunter_addr].token_amount += token_got_ui
+            else:
+                pos.shares[hunter_addr] = VirtualShare(hunter_addr, trigger_hunter.get('score', 0), token_got_ui)
+                current_hunters_info = [{"address": h, "score": s.score} for h, s in pos.shares.items()]
+                self._rebalance_shares_logic(pos, current_hunters_info)
         if self.on_trade_recorded:
             self.on_trade_recorded({
                 "date": time.strftime("%Y-%m-%d", time.localtime()),
@@ -737,13 +855,17 @@ class SolanaTrader:
                 "type": "buy",
                 "sol_spent": add_sol,
                 "sol_received": 0.0,
-                "token_amount": token_got_ui,
-                "price": current_price,
+                "token_amount": actual_add_tokens,
+                "price": pos.average_price,
                 "hunter_addr": hunter_addr,
                 "pnl_sol": None,
                 "note": "加仓",
             })
         self._save_state_in_background()
+        logger.info(
+            "✅ 加仓成功 | %s | 链上 %.2f，均价 %.6f SOL",
+            token_address[:16] + "..", pos.total_tokens, pos.average_price,
+        )
 
     async def execute_follow_sell(self, token_address: str, hunter_addr: str, sell_ratio: float, current_price: float):
         """跟随卖出逻辑。文档: 猎手卖出<5%不跟，跟随时我方至少卖该份额的 MIN_SELL_RATIO。"""
@@ -800,11 +922,11 @@ class SolanaTrader:
             # 使用 chain_bal2（二次校验成功）进行状态同步，避免 chain_bal 为 None 时 TypeError
             if chain_bal2 < pos.total_tokens * 0.99:
                 old_total = pos.total_tokens
-                pos.total_tokens = chain_bal2
+                pos.total_tokens = _floor_token_amount(chain_bal2)
                 if old_total > 0:
-                    ratio = chain_bal2 / old_total
+                    ratio = pos.total_tokens / old_total
                     for s in pos.shares.values():
-                        s.token_amount *= ratio
+                        s.token_amount = _floor_token_amount(s.token_amount * ratio)
         else:
             # 查余额失败，兜底 99.9%
             sell_amount_ui = min(sell_amount_ui, share.token_amount * SELL_BUFFER)
@@ -871,8 +993,8 @@ class SolanaTrader:
                         chain_after, chain_after_2, token_address[:16] + "..",
                     )
                     est_sol = sell_amount_ui * current_price
-                    pos.total_tokens -= sell_amount_ui
-                    share.token_amount -= sell_amount_ui
+                    pos.total_tokens = _floor_token_amount(pos.total_tokens - sell_amount_ui)
+                    share.token_amount = _floor_token_amount(share.token_amount - sell_amount_ui)
                     if is_dust or share.token_amount <= 0:
                         if hunter_addr in pos.shares:
                             del pos.shares[hunter_addr]
@@ -924,8 +1046,8 @@ class SolanaTrader:
                 "pnl_sol": pnl_sol,
                 "note": "跟随卖出",
             })
-        pos.total_tokens -= sell_amount_ui
-        share.token_amount -= sell_amount_ui
+        pos.total_tokens = _floor_token_amount(pos.total_tokens - sell_amount_ui)
+        share.token_amount = _floor_token_amount(share.token_amount - sell_amount_ui)
         if is_dust or share.token_amount <= 0:
             if hunter_addr in pos.shares:
                 del pos.shares[hunter_addr]
@@ -970,16 +1092,17 @@ class SolanaTrader:
 
         pnl_pct = (current_price_ui - pos.average_price) / pos.average_price
 
-        # DexScreener 价格可能因 base/quote 解析错误虚高，当 pnl>200% 时用 Jupiter 校验真实可卖价
-        if pnl_pct > 2.0:
+        # DexScreener 价格可能因 base/quote 解析、低流动性、插针等虚高。达到首档止盈门槛(100%)即用 Jupiter Quote 校验真实可卖价，避免误触发
+        if pnl_pct >= 1.0:
             jupiter_implied_pnl = await self._get_jupiter_implied_pnl(
                 token_address, pos.average_price, pos.decimals
             )
-            if jupiter_implied_pnl is not None and jupiter_implied_pnl < 0.5:
-                logger.warning(
-                    "止盈跳过: DexScreener 显示 +%.0f%% 但 Jupiter 校验仅 %.0f%%，以 Jupiter 为准",
-                    pnl_pct * 100, jupiter_implied_pnl * 100
-                )
+            if jupiter_implied_pnl is not None:
+                if abs(jupiter_implied_pnl - pnl_pct) > 0.2:
+                    logger.warning(
+                        "止盈验价: DexScreener +%.0f%% vs Jupiter 真实可卖 +%.0f%%，以 Jupiter 为准",
+                        pnl_pct * 100, jupiter_implied_pnl * 100
+                    )
                 pnl_pct = jupiter_implied_pnl
 
         tier = get_tier_config(pos.lead_hunter_score) or {}
@@ -1182,11 +1305,68 @@ class SolanaTrader:
                         )
                         self._sync_zero_and_close_position(token_address, pos)
                     elif chain_after is None:
-                        logger.warning(
-                            "⚠️ 无法查询链上余额(429等)，假定已成交并同步状态，避免重复卖出: %s",
-                            token_address[:16] + "..",
-                        )
-                        self._sync_zero_and_close_position(token_address, pos)
+                        # 关键：本次若是分批止盈（非全仓），绝对不能 _sync_zero_and_close_position，
+                        # 否则会删除 position 而链上还有剩余持仓，形成孤儿持仓；下次共振买入时 reconcile
+                        # 会把孤儿并入 total_tokens 但 average_price 不更新，导致 pnl 虚高/虚低误触止盈。
+                        is_full_sell_attempt = sell_amount >= pos.total_tokens * 0.95
+                        if is_full_sell_attempt:
+                            logger.warning(
+                                "⚠️ 无法查询链上余额(429等)，假定已成交并同步状态，避免重复卖出: %s",
+                                token_address[:16] + "..",
+                            )
+                            self._sync_zero_and_close_position(token_address, pos)
+                        else:
+                            logger.warning(
+                                "⚠️ 分批止盈验证超时且无法查链上(429)，不能假定全仓已成交！%ds 后重试: %s",
+                                TRADER_CHAIN_AFTER_RETRY_DELAY_SEC, token_address[:16] + "..",
+                            )
+                            await asyncio.sleep(TRADER_CHAIN_AFTER_RETRY_DELAY_SEC)
+                            chain_after_retry = await self._fetch_own_token_balance(token_address)
+                            if chain_after_retry is not None and chain_after_retry < 1e-9:
+                                logger.info("✅ 重试后链上已归零，同步: %s", token_address[:16] + "..")
+                                self._sync_zero_and_close_position(token_address, pos)
+                            elif chain_after_retry is not None and chain_after_retry < pos.total_tokens - sell_amount * 0.5:
+                                sell_pct_actual = sell_amount / pos.total_tokens if pos.total_tokens > 0 else 1.0
+                                for share in pos.shares.values():
+                                    share.token_amount *= (1.0 - sell_pct_actual)
+                                sum_shares = sum(s.token_amount for s in pos.shares.values())
+                                if sum_shares > 0 and abs(sum_shares - chain_after_retry) > 1e-9:
+                                    ratio = chain_after_retry / sum_shares
+                                    for s in pos.shares.values():
+                                        s.token_amount = _floor_token_amount(s.token_amount * ratio)
+                                pos.total_tokens = _floor_token_amount(chain_after_retry)
+                                pos.tp_hit_levels.add(level)
+                                est_sol = sell_amount * current_price_ui
+                                cost = sell_amount * pos.average_price
+                                add_manual_verify_token(token_address)
+                                logger.info(
+                                    "⚠️ 重试后余额下降，假定分批止盈已成交，按链上 %.2f 更新。需手动核对: %s",
+                                    chain_after_retry, token_address[:16] + "..",
+                                )
+                                ts_now = time.time()
+                                pos.trade_records.append({
+                                    "ts": ts_now, "type": "sell", "sol_spent": 0.0, "sol_received": est_sol,
+                                    "token_amount": sell_amount, "note": "止盈(验证超时按链上确认,待手动核对)",
+                                    "pnl_sol": est_sol - cost,
+                                })
+                                if self.on_trade_recorded:
+                                    lead = list(pos.shares.keys())[0] if pos.shares else ""
+                                    self.on_trade_recorded({
+                                        "date": time.strftime("%Y-%m-%d", time.localtime(ts_now)),
+                                        "ts": ts_now, "token": token_address, "type": "sell",
+                                        "sol_spent": 0.0, "sol_received": est_sol, "token_amount": sell_amount,
+                                        "price": pos.average_price, "hunter_addr": lead,
+                                        "pnl_sol": est_sol - cost,
+                                        "note": "止盈(验证超时按链上确认,待手动核对)",
+                                    })
+                                if pos.total_tokens <= 0 or pos.total_tokens * current_price_ui < MIN_SHARE_VALUE_SOL:
+                                    self._sync_zero_and_close_position(token_address, pos)
+                            else:
+                                add_manual_verify_token(token_address)
+                                logger.warning(
+                                    "❌ 分批止盈验证超时且重试后仍无法确认链上，加入需手动核对，避免误删持仓: %s",
+                                    token_address[:16] + "..",
+                                )
                     else:
                         # chain_after > 0：可能是 RPC 延迟未更新，延迟再查一次，避免误判失败导致重复卖出
                         logger.info(
@@ -1210,14 +1390,13 @@ class SolanaTrader:
                             est_sol = sell_amount * current_price_ui
                             cost = sell_amount * pos.average_price
                             for share in pos.shares.values():
-                                share.token_amount *= (1.0 - sell_pct_actual)
-                            # 归一化 shares 使 sum(shares) == chain_after_2，避免浮点误差导致不一致
+                                share.token_amount = _floor_token_amount(share.token_amount * (1.0 - sell_pct_actual))
                             sum_shares = sum(s.token_amount for s in pos.shares.values())
                             if sum_shares > 0 and abs(sum_shares - chain_after_2) > 1e-9:
                                 ratio = chain_after_2 / sum_shares
                                 for s in pos.shares.values():
-                                    s.token_amount *= ratio
-                            pos.total_tokens = chain_after_2
+                                    s.token_amount = _floor_token_amount(s.token_amount * ratio)
+                            pos.total_tokens = _floor_token_amount(chain_after_2)
                             pos.tp_hit_levels.add(level)
                             ts_now = time.time()
                             pos.trade_records.append({
@@ -1273,8 +1452,8 @@ class SolanaTrader:
                             "note": f"止盈{sell_pct_actual * 100:.0f}%",
                         })
                     for share in pos.shares.values():
-                        share.token_amount *= (1.0 - sell_pct_actual)
-                    pos.total_tokens -= sell_amount
+                        share.token_amount = _floor_token_amount(share.token_amount * (1.0 - sell_pct_actual))
+                    pos.total_tokens = _floor_token_amount(pos.total_tokens - sell_amount)
                     pos.tp_hit_levels.add(level)
                     if pos.total_tokens <= 0:
                         self._emit_position_closed(token_address, pos)
@@ -1769,20 +1948,20 @@ class SolanaTrader:
     # ==========================================
 
     def _position_to_dict(self, pos: Position) -> Dict[str, Any]:
-        """将 Position 转为可 JSON 序列化的 dict。"""
+        """将 Position 转为可 JSON 序列化的 dict。持久化时 floor 持仓数量，避免进位导致记录 > 链上。"""
         return {
             "token_address": pos.token_address,
             "entry_time": pos.entry_time,
             "average_price": pos.average_price,
             "decimals": pos.decimals,
-            "total_tokens": pos.total_tokens,
+            "total_tokens": _floor_token_amount(pos.total_tokens),
             "total_cost_sol": pos.total_cost_sol,
             "lead_hunter_score": pos.lead_hunter_score,
             "no_addon": getattr(pos, "no_addon", False),
             "entry_liquidity_usd": getattr(pos, "entry_liquidity_usd", 0.0),
             "tp_hit_levels": list(pos.tp_hit_levels),
             "shares": {
-                addr: {"hunter": s.hunter, "score": s.score, "token_amount": s.token_amount}
+                addr: {"hunter": s.hunter, "score": s.score, "token_amount": _floor_token_amount(s.token_amount)}
                 for addr, s in pos.shares.items()
             },
             "trade_records": list(pos.trade_records),
@@ -1799,7 +1978,7 @@ class SolanaTrader:
             entry_liquidity_usd=float(d.get("entry_liquidity_usd", 0)),
         )
         pos.entry_time = float(d.get("entry_time", 0))
-        pos.total_tokens = float(d.get("total_tokens", 0))
+        pos.total_tokens = _floor_token_amount(float(d.get("total_tokens", 0)))
         pos.total_cost_sol = float(d.get("total_cost_sol", 0))
         pos.lead_hunter_score = float(d.get("lead_hunter_score", 0))
         pos.no_addon = bool(d.get("no_addon", False))
@@ -1808,7 +1987,7 @@ class SolanaTrader:
             pos.shares[addr] = VirtualShare(
                 s.get("hunter", addr),
                 float(s.get("score", 0)),
-                float(s.get("token_amount", 0)),
+                _floor_token_amount(float(s.get("token_amount", 0))),
             )
         pos.trade_records = list(d.get("trade_records") or [])
         return pos
@@ -1927,15 +2106,23 @@ class SolanaTrader:
                 old_total = pos.total_tokens
                 ratio = chain_bal / pos.total_tokens if pos.total_tokens > 0 else 1.0
                 for s in pos.shares.values():
-                    s.token_amount *= ratio
-                pos.total_tokens = chain_bal
+                    s.token_amount = _floor_token_amount(s.token_amount * ratio)
+                pos.total_tokens = _floor_token_amount(chain_bal)
                 self._save_state_safe()
-                logger.info(
-                    "启动对账: %s 以链上为准更新持仓 %.2f -> %.2f",
-                    token_address[:16] + "..",
-                    old_total,
-                    chain_bal,
-                )
+                # 链上显著多于内部（>1.5x）可能是「孤儿持仓」合并：前次分批止盈误删 position 后链上残留，
+                # 本次共振重新买入 reconcile 合并。average_price 未更新，pnl 计算可能失真，需警惕
+                if ratio > 1.5:
+                    logger.warning(
+                        "⚠️ 启动对账: %s 链上 %.2f >> 内部 %.2f (ratio %.1fx)，可能混入孤儿持仓，average_price 未重算，止盈/止损请留意",
+                        token_address[:16] + "..", chain_bal, old_total, ratio,
+                    )
+                else:
+                    logger.info(
+                        "启动对账: %s 以链上为准更新持仓 %.2f -> %.2f",
+                        token_address[:16] + "..",
+                        old_total,
+                        chain_bal,
+                    )
         return removed
 
     def get_active_tokens(self) -> List[str]:

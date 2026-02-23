@@ -42,6 +42,11 @@ SYNC_POSITIONS_INTERVAL_SEC = 30
 # 漏订阅兜底触发阈值：余额下降比例须 ≥ 5% 才认为是真实卖出（1% 易受 RPC 抖动/缓存误触发）
 SYNC_MIN_DELTA_RATIO = 0.05
 SYNC_PROTECTION_AFTER_START_SEC = 60
+# 共振场景：start_tracking 时猎手余额为 0，延迟后重试（RPC 可能尚未索引猎手刚发生的买入）
+HUNTER_ZERO_RETRY_DELAY_SEC = int(os.getenv("HUNTER_ZERO_RETRY_DELAY_SEC", "8"))
+# 新建仓位 RPC 延迟保护：仓位建立后此秒数内若 chain_bal=0，先延迟再二次确认，避免 RPC 未索引误删
+FRESH_POSITION_RPC_GRACE_SEC = int(os.getenv("FRESH_POSITION_RPC_GRACE_SEC", "45"))
+FRESH_POSITION_RETRY_DELAY_SEC = int(os.getenv("FRESH_POSITION_RETRY_DELAY_SEC", "10"))
 NEW_HUNTER_ADD_WINDOW_SEC = 600
 
 # trader

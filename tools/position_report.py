@@ -144,7 +144,7 @@ def generate_report(data_dir: Path, model_label: str) -> str:
             if len(hunter_addrs) > 3:
                 hunter_str += f" 等{len(hunter_addrs)}人"
             lines.append(f"  {token_addr}\n")
-            lines.append(f"    成本: {cost:.4f} SOL | 数量: {tokens:,.2f} | 均价: {price:.8f} SOL\n")
+            lines.append(f"    成本: {cost:.4f} SOL | 数量: {tokens:,.6f} | 均价: {price:.8f} SOL\n")
             lines.append(f"    猎手: {hunter_str}\n")
         lines.append(f"\n持仓合计成本: {total_cost_sol:.4f} SOL\n")
 

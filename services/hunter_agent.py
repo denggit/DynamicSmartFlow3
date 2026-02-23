@@ -24,6 +24,7 @@ from config.settings import (
     SYNC_POSITIONS_INTERVAL_SEC,
     SYNC_MIN_DELTA_RATIO,
     SYNC_PROTECTION_AFTER_START_SEC,
+    HUNTER_ZERO_RETRY_DELAY_SEC,
     NEW_HUNTER_ADD_WINDOW_SEC,
     USDC_PER_SOL,
     AGENT_WS_RECV_TIMEOUT,
@@ -161,6 +162,18 @@ class HunterAgentController:
         for hunter in hunters:
             balance = await self._fetch_token_balance(hunter, token_address)
             mission.add_hunter(hunter, balance)
+
+        # 2.5 共振场景：猎手刚买入，RPC 可能尚未索引，首次全为 0 时延迟重试一次
+        if all(mission.hunter_states.get(h, 0) <= 0 for h in hunters):
+            logger.info(
+                "⏳ 猎手余额初查均为 0（可能 RPC 未索引），%ds 后重试: %s",
+                HUNTER_ZERO_RETRY_DELAY_SEC,
+                token_address[:12] + "..",
+            )
+            await asyncio.sleep(HUNTER_ZERO_RETRY_DELAY_SEC)
+            for hunter in hunters:
+                balance = await self._fetch_token_balance(hunter, token_address)
+                mission.hunter_states[hunter] = balance
 
         # 3. 若所有猎手持仓均已归零，无需监控（猎手已卖光，无跟卖信号）
         if all(mission.hunter_states.get(h, 0) <= 0 for h in hunters):

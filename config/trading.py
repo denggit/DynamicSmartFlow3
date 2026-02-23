@@ -23,9 +23,11 @@ PRIORITY_FEE_SETTINGS = "auto"
 def get_tier_config(score: float) -> dict:
     """根据猎手分数返回 entry/add/max/stop_loss。"""
     if score >= 90:
-        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.15, "stop_loss_pct": 0.65}
+        return {"entry_sol": 0.06, "add_sol": 0.06, "max_sol": 0.36, "stop_loss_pct": 0.65}
     if score >= 80:
-        return {"entry_sol": 0.04, "add_sol": 0.04, "max_sol": 0.12, "stop_loss_pct": 0.65}
+        return {"entry_sol": 0.05, "add_sol": 0.05, "max_sol": 0.25, "stop_loss_pct": 0.65}
+    if score >= 70:
+        return {"entry_sol": 0.04, "add_sol": 0.04, "max_sol": 0.16, "stop_loss_pct": 0.65}
     if score >= 60:
         return {"entry_sol": 0.03, "add_sol": 0.03, "max_sol": 0.09, "stop_loss_pct": 0.65}
     return {"entry_sol": 0.03, "add_sol": 0.00, "max_sol": 0.03, "stop_loss_pct": 0.65}
@@ -45,6 +47,8 @@ TAKE_PROFIT_LEVELS = [
 MIN_SHARE_VALUE_SOL = 0.0001
 # 粉尘余额阈值（UI 数量）：低于此值的持仓不再尝试卖出，Jupiter 通常无路由
 DUST_TOKEN_AMOUNT_UI = 1e-5
+# 持仓数量 floor 精度：存储时向下取整，避免 round 进位导致记录 > 链上，卖出超量失败
+TOKEN_AMOUNT_FLOOR_DECIMALS = 6
 MIN_SELL_RATIO = 0.3
 FOLLOW_SELL_THRESHOLD = 0.05
 
