@@ -706,13 +706,14 @@ class SolanaTrader:
 
         # 3. 以链上为准重置持仓与均价：开仓后查询链上余额
         token_amount_ui = token_amount_raw / (10 ** decimals)
-        chain_bal = await self._fetch_own_token_balance(token_address)
+        logger.debug("🔧 [精度修正] 开仓查询链上余额使用 decimals=%d", decimals)
+        chain_bal = await self._fetch_own_token_balance(token_address, decimals)
         if chain_bal is not None and chain_bal >= 1e-9:
             token_amount_ui = chain_bal
             logger.debug("开仓以链上为准: %.2f tokens", token_amount_ui)
         elif chain_bal is not None and chain_bal < 1e-9:
             await asyncio.sleep(5)
-            chain_bal_retry = await self._fetch_own_token_balance(token_address)
+            chain_bal_retry = await self._fetch_own_token_balance(token_address, decimals)
             if chain_bal_retry is not None and chain_bal_retry >= 1e-9:
                 token_amount_ui = chain_bal_retry
                 logger.info("开仓链上初次为 0，5s 重试后查到 %.2f，以链上为准", token_amount_ui)
@@ -730,7 +731,7 @@ class SolanaTrader:
         # 3.5 持仓为 0 时二次链上确认：RPC 延迟可能导致误记录 0，延迟后重试避免开仓即被止盈误关
         if token_amount_ui < 1e-9:
             await asyncio.sleep(8)
-            chain_final = await self._fetch_own_token_balance(token_address)
+            chain_final = await self._fetch_own_token_balance(token_address, decimals)
             if chain_final is not None and chain_final >= 1e-9:
                 token_amount_ui = chain_final
                 logger.info("开仓持仓 0 二次确认链上查到 %.2f，以链上为准: %s", token_amount_ui, token_address[:16] + "..")
@@ -751,7 +752,8 @@ class SolanaTrader:
         )
         pos.no_addon = halve_position
         pos.total_cost_sol = buy_sol
-        pos.total_tokens = _floor_token_amount(token_amount_ui)
+        logger.debug("🔧 [精度修正] 开仓 floor_token_amount 使用 decimals=%d，结果=%.6f", decimals, _floor_token_amount(token_amount_ui, decimals))
+        pos.total_tokens = _floor_token_amount(token_amount_ui, decimals)
         pos.entry_time = time.time()
         pos.trade_records.append({
             "ts": pos.entry_time,
@@ -840,14 +842,15 @@ class SolanaTrader:
         # 以链上为准重置持仓与均价：加仓后查询链上余额，(总成本/链上总量)=均价。
         # 若 chain_bal < old_total（RPC 可能未索引本笔加仓），不得覆盖为更小值，否则止损会误卖部分仓位。
         old_total = pos.total_tokens
+        logger.debug("🔧 [精度修正] 加仓查询链上余额使用 decimals=%d", pos.decimals)
         shares_updated_from_chain = False
-        chain_bal = await self._fetch_own_token_balance(token_address)
+        chain_bal = await self._fetch_own_token_balance(token_address, pos.decimals)
         if chain_bal is not None and chain_bal >= 1e-9:
             # RPC 延迟：chain 可能尚未包含本笔加仓，若 chain <= old_total 则用 old_total + Jupiter 返回值
             if chain_bal <= old_total + 1e-6:
                 new_total_tokens = old_total + token_got_ui
                 pos.total_cost_sol += add_sol
-                pos.total_tokens = _floor_token_amount(new_total_tokens)
+                pos.total_tokens = _floor_token_amount(new_total_tokens, pos.decimals)
                 pos.average_price = pos.total_cost_sol / new_total_tokens if new_total_tokens > 0 else pos.average_price
                 if hunter_addr in pos.shares:
                     pos.shares[hunter_addr].token_amount += token_got_ui
@@ -860,7 +863,7 @@ class SolanaTrader:
                 )
             else:
                 pos.total_cost_sol += add_sol
-                pos.total_tokens = _floor_token_amount(chain_bal)
+                pos.total_tokens = _floor_token_amount(chain_bal, pos.decimals)
                 pos.average_price = pos.total_cost_sol / chain_bal if chain_bal > 0 else pos.average_price
                 add_amount_chain = chain_bal - old_total
                 if hunter_addr in pos.shares:
@@ -871,10 +874,10 @@ class SolanaTrader:
                 logger.debug("加仓以链上为准: %.2f tokens，均价 %.6f", chain_bal, pos.average_price)
         elif chain_bal is not None and chain_bal < 1e-9:
             await asyncio.sleep(5)
-            chain_bal_retry = await self._fetch_own_token_balance(token_address)
+            chain_bal_retry = await self._fetch_own_token_balance(token_address, pos.decimals)
             if chain_bal_retry is not None and chain_bal_retry >= 1e-9:
                 pos.total_cost_sol += add_sol
-                pos.total_tokens = _floor_token_amount(chain_bal_retry)
+                pos.total_tokens = _floor_token_amount(chain_bal_retry, pos.decimals)
                 pos.average_price = pos.total_cost_sol / chain_bal_retry if chain_bal_retry > 0 else pos.average_price
                 add_amount_chain = chain_bal_retry - old_total
                 if hunter_addr in pos.shares:
@@ -887,7 +890,7 @@ class SolanaTrader:
                 new_total_tokens = old_total + token_got_ui
                 pos.average_price = (pos.total_tokens * pos.average_price + add_sol) / new_total_tokens
                 pos.total_cost_sol += add_sol
-                pos.total_tokens = _floor_token_amount(new_total_tokens)
+                pos.total_tokens = _floor_token_amount(new_total_tokens, pos.decimals)
                 logger.warning(
                     "加仓后链上未查到，使用 Jupiter 返回值，均价 %.6f，启动对账将校正: %s",
                     pos.average_price, token_address[:16] + "..",
@@ -896,7 +899,7 @@ class SolanaTrader:
             new_total_tokens = old_total + token_got_ui
             pos.average_price = (pos.total_tokens * pos.average_price + add_sol) / new_total_tokens
             pos.total_cost_sol += add_sol
-            pos.total_tokens = _floor_token_amount(new_total_tokens)
+            pos.total_tokens = _floor_token_amount(new_total_tokens, pos.decimals)
             logger.warning(
                 "加仓后链上查询失败(429等)，使用 Jupiter 返回值，启动对账将校正: %s",
                 token_address[:16] + "..",

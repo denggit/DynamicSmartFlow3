@@ -97,8 +97,10 @@ class HunterAgentController:
 
         # 新增猎手加仓节流：1 分钟内同一 token 只发一次 HUNTER_BUY，避免多人同时入场重复跟仓
         self._last_new_hunter_signal_at: Dict[str, float] = {}
+        # 同一猎手同一代币买入信号防重：30秒内不重复发买入信号，避免重复跟仓
+        self._last_buy_signal_at: Dict[str, float] = {}  # key="hunter:token" -> timestamp
         # 同一 tx (hunter, token, sig) 短时去重，避免 Monitor 重推或重复解析导致误加仓
-        self._recent_analyzed_tx: Dict[str, float] = {}  # key="h:token:sig" -> timestamp
+        self._recent_analyzed_tx: Dict[str, float] = {}  # key="hunter:token:sig" -> timestamp
         self._recent_analyzed_ttl = 120  # 秒
 
     async def start(self):
@@ -118,6 +120,10 @@ class HunterAgentController:
         若该 tx 在队列中延迟到 13:33 才被消费，若用 time.time() 会误以为「刚加仓」。
         """
         tx_time = _get_tx_timestamp(tx) or time.time()
+        # 防重修改点5：添加调试日志，跟踪交易处理流程
+        sig = tx.get("signature", "unknown")[:16] if tx.get("signature") else "unknown"
+        trade_logger.debug("🔧 [防重修复] on_tx_from_monitor 收到交易 %s，猎手数量: %d，时间戳: %s",
+                         sig, len(active_hunters), tx_time if tx_time > 0 else "invalid")
         parser_cache = {}
         usdc_price_sol = 1.0 / USDC_PER_SOL if USDC_PER_SOL > 0 else 0.01
         for hunter in active_hunters:
@@ -159,6 +165,10 @@ class HunterAgentController:
             return
 
         logger.info(f"🆕 收到监控指令: {token_address} | 初始猎手: {len(hunters)} 人")
+        logger.debug("🔧 [防重修复] start_tracking: token=%s, hunters=%s, creation_time=%s, delay=%s",
+                    token_address[:12] + "..",
+                    ", ".join([h[:8] + ".." for h in hunters[:3]]) + (f"... ({len(hunters)} total)" if len(hunters) > 3 else ""),
+                    creation_time or time.time(), delay_before_fetch_sec)
 
         mission = TokenMission(token_address, creation_time or time.time())
         self.active_missions[token_address] = mission
@@ -240,13 +250,17 @@ class HunterAgentController:
         self.hunter_map[hunter].add(token_address)
         trade_logger.info(f"🆕 [Agent] 新增猎手入场 {hunter[:6]} -> {token_address[:6]} | 买入: {delta_ui:.2f}")
 
+        # 防重修改点4：新增猎手加仓节流，同一token 60秒内只发一次买入信号
         last_at = self._last_new_hunter_signal_at.get(token_address, 0)
         if now - last_at < 60:
-            trade_logger.info("🔄 [Agent] 1 分钟内已有新猎手加仓信号，本次仅加入监控不重复跟仓")
+            trade_logger.info("🔧 [防重修复] 1 分钟内已有新猎手加仓信号，跳过重复跟仓 %s -> %s (delta=%.2f)",
+                             hunter[:8], token_address[:6], delta_ui)
             return
 
         if self.signal_callback:
             self._last_new_hunter_signal_at[token_address] = now
+            trade_logger.info("🔧 [防重修复] 记录新猎手买入信号时间 %s -> %s (delta=%.2f)",
+                             hunter[:8], token_address[:6], delta_ui)
             signal = {
                 "type": "HUNTER_BUY",
                 "token": token_address,
@@ -288,6 +302,12 @@ class HunterAgentController:
                     if not self.hunter_map[hunter]:
                         del self.hunter_map[hunter]
             self._last_new_hunter_signal_at.pop(token_address, None)
+            # 清理 _last_buy_signal_at 中与该 token 相关的记录
+            to_delete = [key for key in self._last_buy_signal_at.keys() if key.endswith(f":{token_address}")]
+            for key in to_delete:
+                del self._last_buy_signal_at[key]
+            if to_delete:
+                logger.debug("🔧 [防重修复] 清理 _last_buy_signal_at 记录: %d 条", len(to_delete))
 
     async def sync_positions_loop(self):
         """
@@ -529,14 +549,15 @@ class HunterAgentController:
             return
 
         # 同 tx 短时去重：避免 Monitor 重推或同一笔 tx 被重复解析导致误加仓
+        # 防重修改点2：使用完整地址和签名作为去重键，避免哈希碰撞
         sig = (tx or {}).get("signature")
         if isinstance(sig, list):
             sig = sig[0] if sig else None
         if sig:
-            key = f"{hunter[:8]}:{token[:8]}:{str(sig)[:32]}"
+            key = f"{hunter}:{token}:{sig}"
             now = time.time()
             if key in self._recent_analyzed_tx and (now - self._recent_analyzed_tx[key]) < self._recent_analyzed_ttl:
-                trade_logger.debug("⏭️ [Agent] 跳过重复 tx %s %s sig=%s", hunter[:8], token[:6], str(sig)[:16])
+                trade_logger.debug("🔧 [防重修复] 跳过重复 tx %s %s sig=%s", hunter[:8], token[:6], str(sig)[:16])
                 return
             self._recent_analyzed_tx[key] = now
             for k in list(self._recent_analyzed_tx.keys()):
@@ -544,10 +565,11 @@ class HunterAgentController:
                     del self._recent_analyzed_tx[k]
 
         # 基线前交易：发生在 start_tracking 之前的 tx，已含在初始 snapshot 中，跳过
-        if timestamp > 0 and timestamp < mission.start_time:
+        # 防重修改点1：加强过滤，timestamp <= 0 也视为基线前交易（可能为无效时间戳）
+        if timestamp <= 0 or timestamp < mission.start_time:
             trade_logger.debug(
-                "⏭️ [Agent] 忽略基线前交易 %s %s delta=%.2f (tx_time=%.0f < start=%.0f)",
-                hunter[:8], token[:6], delta, timestamp, mission.start_time
+                "🔧 [防重修复] 忽略基线前/无效时间戳交易 %s %s delta=%.2f (tx_time=%.0f, start=%.0f, valid=%s)",
+                hunter[:8], token[:6], delta, timestamp, mission.start_time, timestamp > 0
             )
             return
 
@@ -588,6 +610,16 @@ class HunterAgentController:
         elif delta > 0:
             # 估算买入金额 (SOL)
             # 需要解析 nativeSol 变化，这里简化处理，只通知仓位增加
+
+            # 防重修改点3：同一猎手同一代币30秒内不重复发买入信号
+            buy_key = f"{hunter}:{token}"
+            now = time.time()
+            last_buy_time = self._last_buy_signal_at.get(buy_key, 0)
+            if now - last_buy_time < 30:  # 30秒防重窗口
+                trade_logger.info("🔧 [防重修复] 30秒内已有买入信号，跳过重复买入 %s %s delta=%.2f",
+                                 hunter[:8], token[:6], delta)
+                return
+            self._last_buy_signal_at[buy_key] = now
 
             # 计算加仓比例 (相对于之前的持仓)
             if old_bal > 0:
