@@ -13,7 +13,8 @@ JUP_SWAP_API = "https://api.jup.ag/swap/v1/swap"
 # 买入：最大滑点 3%，防止追高
 BUY_MAX_SLIPPAGE_BPS = 300  # 3%
 # 卖出：按档位重试，Jupiter 在每档上限内自动优化
-SELL_SLIPPAGE_BPS_RETRIES = [500, 1000, 2000]   # 5%, 10%, 20%
+# 增加滑点以应对流动性差的代币：10%, 20%, 50%
+SELL_SLIPPAGE_BPS_RETRIES = [1000, 2000, 5000]   # 10%, 20%, 50%
 SELL_SLIPPAGE_BPS_STOP_LOSS = 2000  # 止损清仓时用 20% 滑点，确保能成交
 # 兼容旧引用（加仓等复用买入逻辑）
 SLIPPAGE_BPS = BUY_MAX_SLIPPAGE_BPS
@@ -37,7 +38,7 @@ def get_tier_config(score: float) -> dict:
 HUNTER_ADD_THRESHOLD_SOL_MIN = 0.49
 HUNTER_ADD_THRESHOLD_SOL_MAX = 5.0
 MAX_ENTRY_PUMP_MULTIPLIER = 4.0
-SELL_BUFFER = 0.999
+SELL_BUFFER = 0.998
 
 TAKE_PROFIT_LEVELS = [
     (1.0, 0.50),
@@ -48,7 +49,7 @@ TAKE_PROFIT_LEVELS = [
 # 卖出价值下限：低于此值认为无意义（网费约 0.000011 SOL，0.0001 以下卖出可能净亏）
 MIN_SHARE_VALUE_SOL = 0.0001
 # 粉尘余额阈值（UI 数量）：低于此值的持仓不再尝试卖出，Jupiter 通常无路由
-DUST_TOKEN_AMOUNT_UI = 1e-5
+DUST_TOKEN_AMOUNT_UI = 1e-4
 # 持仓数量 floor 精度：存储时向下取整，避免 round 进位导致记录 > 链上，卖出超量失败
 TOKEN_AMOUNT_FLOOR_DECIMALS = 6
 # 卖出失败时减量重试：如 6400.40 失败则试 6400.39，应对精度导致超量失败

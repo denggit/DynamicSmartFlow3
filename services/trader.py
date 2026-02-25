@@ -64,20 +64,26 @@ def _floor_token_amount(amount: float, decimals: int = TOKEN_AMOUNT_FLOOR_DECIMA
     """
     持仓数量向下取整，避免 round 进位导致记录 > 链上，卖出时超量失败。
     例：链上 4231.889572，若 round 则 4231.89 > 实际，卖出会失败；floor 后 4231.889572。
+    添加微小epsilon避免浮点误差导致floor结果偏高。
     """
     if amount <= 0 or decimals <= 0:
         return amount
     mult = 10 ** decimals
-    return math.floor(amount * mult) / mult
+    # 添加微小epsilon(1e-12)避免浮点误差导致amount*mult略高于实际值
+    return math.floor(amount * mult + 1e-12) / mult
 
 
-def _safe_sell_amount_from_chain(chain_bal: float) -> float:
+def _safe_sell_amount_from_chain(chain_bal: float, decimals: Optional[int] = None) -> float:
     """
-    将链上余额转为安全卖出量：乘以 SELL_BUFFER(0.999) 并 floor，避免 RPC 四舍五入导致
+    将链上余额转为安全卖出量：乘以 SELL_BUFFER(0.998) 并 floor，避免 RPC 四舍五入导致
     查询 25052.62 而实际 25052.60 时尝试超量卖出失败。
     所有以 chain_bal 作为卖出数量（或上限）的地方均应使用此函数。
+    如果提供decimals，则使用该精度进行floor；否则使用默认精度。
     """
-    return _floor_token_amount(chain_bal * SELL_BUFFER)
+    if decimals is not None:
+        return _floor_token_amount(chain_bal * SELL_BUFFER, decimals)
+    else:
+        return _floor_token_amount(chain_bal * SELL_BUFFER)
 
 
 def _is_rate_limit_error(e: Exception) -> bool:
@@ -190,13 +196,14 @@ class SolanaTrader:
         await self.rpc_client.close()
         await self.http_client.aclose()
 
-    async def _fetch_own_token_balance(self, token_mint: str) -> Optional[float]:
+    async def _fetch_own_token_balance(self, token_mint: str, token_decimals: Optional[int] = None) -> Optional[float]:
         """
         获取我方钱包在链上的 Token 余额（UI 单位）。
         Alchemy getTokenAccountsByOwner 返回结构：result.value[].account.data.parsed.info.tokenAmount，
         其中 tokenAmount 含 amount(原始)、decimals、uiAmount(浮点可能丢精度)、uiAmountString(完整精度)。
         优先用 uiAmountString，否则用 amount+decimals 精确计算，避免 uiAmount 的 JSON 精度丢失。
         返回时 floor 避免记录 > 链上，防止卖出时超量失败。
+        如果提供 token_decimals，则使用该精度进行floor；否则尝试从响应中获取decimals；最后使用默认精度。
         """
         if not self.keypair:
             return None
@@ -209,6 +216,7 @@ class SolanaTrader:
         if not result.get("value"):
             return 0.0
         total_ui = 0.0
+        detected_decimals = None
         for acc in result["value"]:
             # result.value[].account.data.parsed.info.tokenAmount
             info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
@@ -225,13 +233,21 @@ class SolanaTrader:
                 if amt_str is not None and dec is not None:
                     try:
                         add_ui = int(amt_str) / (10 ** int(dec))
+                        # 记录decimals（如果尚未获取且未提供外部decimals）
+                        if token_decimals is None and detected_decimals is None:
+                            detected_decimals = int(dec)
                     except (ValueError, TypeError, ZeroDivisionError):
                         pass
             if add_ui is None and tamt.get("uiAmount") is not None:
                 add_ui = float(tamt["uiAmount"])
             if add_ui is not None:
                 total_ui += add_ui
-        return _floor_token_amount(total_ui) if total_ui > 0 else total_ui
+        # 确定使用的decimals：优先使用参数，其次使用检测到的，最后使用默认值
+        decimals_to_use = token_decimals if token_decimals is not None else detected_decimals
+        if decimals_to_use is not None:
+            return _floor_token_amount(total_ui, decimals_to_use) if total_ui > 0 else total_ui
+        else:
+            return _floor_token_amount(total_ui) if total_ui > 0 else total_ui
 
     async def _fetch_own_token_balance_raw(self, token_mint: str) -> Optional[int]:
         """
@@ -928,6 +944,10 @@ class SolanaTrader:
         """跟随卖出逻辑。文档: 猎手卖出<5%不跟，跟随时我方至少卖该份额的 MIN_SELL_RATIO。"""
         if not self.keypair:
             return
+        # 防止重复卖出：如果token已经在跟卖过程中，直接跳过
+        if token_address in self._tokens_in_follow_sell:
+            logger.debug("⏭️ 跳过重复跟卖: %s 已在跟卖过程中", token_address[:16] + "..")
+            return
         pos = self.positions.get(token_address)
         if not pos:
             return
@@ -947,7 +967,7 @@ class SolanaTrader:
             return
 
         # 入口提前校验：链上已归零则立即同步并返回，避免内部状态滞后导致无限尝试卖出
-        chain_bal_early = await self._fetch_own_token_balance(token_address)
+        chain_bal_early = await self._fetch_own_token_balance(token_address, pos.decimals)
         if chain_bal_early is not None and chain_bal_early < 1e-9:
             logger.info(
                 "✅ [跟卖入口] 链上已归零，同步状态: %s",
@@ -964,27 +984,40 @@ class SolanaTrader:
 
         actual_ratio = max(sell_ratio, MIN_SELL_RATIO)
         sell_amount_ui = share.token_amount * actual_ratio
+        logger.debug("📊 [卖出计算] token=%s, 猎手卖出比例=%.1f%%, MIN_SELL_RATIO=%.1f%%, 实际使用比例=%.1f%%",
+                    token_address[:16] + "..", sell_ratio * 100, MIN_SELL_RATIO * 100, actual_ratio * 100)
+        logger.debug("📊 [卖出计算] share.token_amount=%.6f, 计算 sell_amount_ui=%.6f",
+                    share.token_amount, sell_amount_ui)
 
         remaining = share.token_amount - sell_amount_ui
         is_dust = False
         if (remaining * current_price) < MIN_SHARE_VALUE_SOL:
+            logger.debug("📊 [卖出计算] 剩余价值 %.6f SOL < MIN_SHARE_VALUE_SOL %.6f，视为粉尘全卖",
+                        remaining * current_price, MIN_SHARE_VALUE_SOL)
             sell_amount_ui = share.token_amount
             is_dust = True
 
         sell_amount_ui = min(sell_amount_ui, share.token_amount)
+        logger.debug("📊 [卖出计算] 最终 sell_amount_ui=%.6f, is_dust=%s", sell_amount_ui, is_dust)
 
         # 链上余额为准：以链上为准且 floor，避免 6400.40>6400.396606 导致 Jupiter 卖出超量失败。
         # 使用 _safe_sell_amount_from_chain 乘以 0.999 避免 RPC 四舍五入导致链上 25052.60 查得 25052.62 超量失败。
         chain_bal = chain_bal_early
+        logger.debug("📊 [余额检查] 初始链上余额=%.6f, 计划卖出=%.6f", chain_bal if chain_bal is not None else -1, sell_amount_ui)
         if chain_bal is not None and sell_amount_ui > chain_bal:
             logger.warning(
                 "⚠️ 状态与链上不一致: 计划卖 %.6f 但链上仅 %.6f，以链上为准",
                 sell_amount_ui, chain_bal
             )
-            sell_amount_ui = min(sell_amount_ui, _safe_sell_amount_from_chain(chain_bal))
-        chain_bal2 = await self._fetch_own_token_balance(token_address)
+            safe_amount = _safe_sell_amount_from_chain(chain_bal, pos.decimals)
+            logger.debug("📊 [余额检查] 安全卖出量(chain_bal*SELL_BUFFER)=%.6f", safe_amount)
+            sell_amount_ui = min(sell_amount_ui, safe_amount)
+        chain_bal2 = await self._fetch_own_token_balance(token_address, pos.decimals)
+        logger.debug("📊 [余额检查] 二次查询链上余额=%.6f", chain_bal2 if chain_bal2 is not None else -1)
         if chain_bal2 is not None and sell_amount_ui > chain_bal2:
-            sell_amount_ui = min(sell_amount_ui, _safe_sell_amount_from_chain(chain_bal2))
+            safe_amount2 = _safe_sell_amount_from_chain(chain_bal2, pos.decimals)
+            logger.debug("📊 [余额检查] 二次安全卖出量=%.6f", safe_amount2)
+            sell_amount_ui = min(sell_amount_ui, safe_amount2)
             logger.debug("二次校验链上余额 %.6f，最终卖出 %.6f", chain_bal2, sell_amount_ui)
             # 使用 chain_bal2（二次校验成功）进行状态同步，避免 chain_bal 为 None 时 TypeError
             if chain_bal2 < pos.total_tokens * 0.99:
@@ -996,17 +1029,22 @@ class SolanaTrader:
                         s.token_amount = _floor_token_amount(s.token_amount * ratio)
         else:
             # 查余额失败，兜底 99.9% 并 floor，避免超量
+            logger.debug("📊 [余额检查] 余额查询失败，使用兜底: share.token_amount=%.6f, SELL_BUFFER=%.3f",
+                        share.token_amount, SELL_BUFFER)
             sell_amount_ui = _floor_token_amount(min(sell_amount_ui, share.token_amount * SELL_BUFFER))
+            logger.debug("📊 [余额检查] 兜底后卖出量=%.6f", sell_amount_ui)
         if sell_amount_ui <= 0:
             logger.warning("链上无持仓或余额为 0，同步状态并停止监控")
             self._sync_zero_and_close_position(token_address, pos)
             return
         sell_value_sol = sell_amount_ui * current_price
+        logger.debug("📊 [卖出价值] sell_amount_ui=%.6f, current_price=%.6f, sell_value_sol=%.6f, MIN_SHARE_VALUE_SOL=%.6f",
+                    sell_amount_ui, current_price, sell_value_sol, MIN_SHARE_VALUE_SOL)
         if sell_value_sol < MIN_SHARE_VALUE_SOL:
             # 卖出价值过小：若链上已归零，必须 sync 避免重复触发（复用已有结果，仅双 None 时再查一次）
             chain_recheck = chain_bal2 if chain_bal2 is not None else chain_bal
             if chain_recheck is None:
-                chain_recheck = await self._fetch_own_token_balance(token_address)
+                chain_recheck = await self._fetch_own_token_balance(token_address, pos.decimals)
             if chain_recheck is not None and chain_recheck < 1e-9:
                 logger.info(
                     "✅ 跟随卖出跳过(链上已归零): 同步状态: %s",
@@ -1031,7 +1069,7 @@ class SolanaTrader:
         )
 
         if not tx_sig:
-            chain_after = await self._fetch_own_token_balance(token_address)
+            chain_after = await self._fetch_own_token_balance(token_address, pos.decimals)
             if chain_after is not None and chain_after < 1e-9:
                 logger.info(
                     "✅ 链上持仓已归零（交易或已成交，RPC 验证可能超时误判），同步状态并停止监控: %s",
@@ -1050,7 +1088,7 @@ class SolanaTrader:
                     chain_after, TRADER_CHAIN_AFTER_RETRY_DELAY_SEC, token_address[:16] + "..",
                 )
                 await asyncio.sleep(TRADER_CHAIN_AFTER_RETRY_DELAY_SEC)
-                chain_after_2 = await self._fetch_own_token_balance(token_address)
+                chain_after_2 = await self._fetch_own_token_balance(token_address, pos.decimals)
                 if chain_after_2 is not None and chain_after_2 < 1e-9:
                     logger.info("✅ 二次确认链上已归零，跟卖已成交，同步: %s", token_address[:16] + "..")
                     self._sync_zero_and_close_position(token_address, pos)
@@ -1086,7 +1124,7 @@ class SolanaTrader:
                     self._save_state_in_background()
                 else:
                     # 卖出失败且链上仍有余额：可能为 RPC 四舍五入导致超量(如查得 25052.62 实际 25052.60)，用 chain*0.999 重试一次
-                    retry_amount = _safe_sell_amount_from_chain(chain_after_2) if chain_after_2 and chain_after_2 >= 1e-9 else 0
+                    retry_amount = _safe_sell_amount_from_chain(chain_after_2, pos.decimals) if chain_after_2 and chain_after_2 >= 1e-9 else 0
                     if retry_amount >= 1e-9:
                         logger.info(
                             "🔄 跟卖失败，链上余额 %.2f 乘 0.999 后重试一次: %s",
@@ -1618,13 +1656,17 @@ class SolanaTrader:
         重试前检查链上余额，避免前次交易已成功但验证超时导致重复卖出（6024 超卖错误）。
         """
         slippage_list = slippage_bps_list or SELL_SLIPPAGE_BPS_RETRIES or [SLIPPAGE_BPS]
+        logger.debug("🔧 [_jupiter_sell_with_retry] 输入: input_mint=%s, amount_in_ui=%.6f, token_decimals=%d, 滑点列表=%s",
+                    input_mint[:16] + "..", amount_in_ui, token_decimals, slippage_list)
         current_amount = amount_in_ui
         for i, bps in enumerate(slippage_list):
+            logger.debug("🔧 [_jupiter_sell_with_retry] 尝试 %d/%d: 滑点=%d bps (%.1f%%), current_amount=%.6f",
+                        i+1, len(slippage_list), bps, bps/100, current_amount)
             if current_amount <= 0:
                 logger.info("链上持仓已为 0，无需继续卖出重试")
                 return None, 0.0
             # 任一轮尝试前：确认链上余额>0，卖出额度<=链上余额，剩余为粉尘则清仓（与批量卖出一致）
-            chain_bal_pre = await self._fetch_own_token_balance(input_mint)
+            chain_bal_pre = await self._fetch_own_token_balance(input_mint, token_decimals)
             if chain_bal_pre is None:
                 if i >= 1:
                     logger.warning(
@@ -1636,7 +1678,7 @@ class SolanaTrader:
                 if chain_bal_pre < 1e-9:
                     logger.info("链上持仓已归零，跳过卖出（避免无效广播）")
                     return None, 0.0
-                safe_cap = _safe_sell_amount_from_chain(chain_bal_pre)
+                safe_cap = _safe_sell_amount_from_chain(chain_bal_pre, token_decimals)
                 current_amount = min(current_amount, safe_cap)
                 remaining = chain_bal_pre - current_amount
                 if 0 < remaining < DUST_TOKEN_AMOUNT_UI:
@@ -1673,7 +1715,7 @@ class SolanaTrader:
         decrement = SELL_RETRY_DECREMENT if amount_in_ui >= 0.1 else 0.000001
         retry_amount = _floor_token_amount(max(0, amount_in_ui - decrement))
         if retry_amount >= 1e-9 and retry_amount < amount_in_ui:
-            chain_retry = await self._fetch_own_token_balance(input_mint)
+            chain_retry = await self._fetch_own_token_balance(input_mint, token_decimals)
             if chain_retry is not None and chain_retry >= retry_amount:
                 logger.info(
                     "🔄 卖出失败，减量 %.6f -> %.6f 重试一次（应对精度超量）: %s",
@@ -1709,7 +1751,8 @@ class SolanaTrader:
                     amount_int = int(amount_in_ui * LAMPORTS_PER_SOL)
                 else:
                     # 卖出使用 floor，避免浮点转 int 时多出 1 raw unit 导致链上超卖失败
-                    amount_int = math.floor(amount_in_ui * (10 ** token_decimals))
+                    # 添加微小epsilon避免浮点误差导致结果偏高
+                    amount_int = math.floor(amount_in_ui * (10 ** token_decimals) + 1e-12)
 
                 # 与 SmartFlow3 一致：添加 onlyDirectRoutes / asLegacyTransaction 以提高路由兼容性
                 quote_params = {
@@ -1800,12 +1843,13 @@ class SolanaTrader:
                     if verified:
                         logger.info("⚠️ 二次验证成功，交易已确认（初检可能受 RPC 限流影响）: %s", sig_str)
                     else:
-                        # 兜底（仅买入）：RPC 验证超时/失败时（含 Key 超额 429 查不到链上状态），
+                        # 兜底：RPC 验证超时/失败时（含 Key 超额 429 查不到链上状态），
                         # 等待限流恢复后多次重试查余额，避免「查不到就说失败」导致漏跟卖
                         if not is_sell:
+                            # 买入交易：检查 output_mint（买入的代币）余额是否到账
                             min_expected = int(out_amount_raw * 0.99)
                             logger.info(
-                                "⏳ 验证失败，%ds 后开始链上余额兜底（Key 超额 429 时需等待限流恢复）: %s",
+                                "⏳ [买入]验证失败，%ds 后开始链上余额兜底（Key 超额 429 时需等待限流恢复）: %s",
                                 TX_VERIFY_RECONCILIATION_DELAY_SEC, sig_str,
                             )
                             await asyncio.sleep(TX_VERIFY_RECONCILIATION_DELAY_SEC)
@@ -1829,6 +1873,43 @@ class SolanaTrader:
                                     backoff = 10 + recon_attempt * 5
                                     logger.info(
                                         "⏳ 余额兜底第 %d/%d 次未查到，%ds 后切换 Key 重试",
+                                        recon_attempt + 1, TX_VERIFY_RECONCILIATION_RETRIES, backoff,
+                                    )
+                                    await asyncio.sleep(backoff)
+                        else:
+                            # 卖出交易：检查 input_mint（卖出的代币）余额是否减少
+                            # 预期余额减少至少 amount_int * 0.9（考虑滑点和可能的残留）
+                            min_reduction = int(amount_int * 0.9)
+                            logger.info(
+                                "⏳ [卖出]验证失败，%ds 后开始链上余额兜底（Key 超额 429 时需等待限流恢复）: %s",
+                                TX_VERIFY_RECONCILIATION_DELAY_SEC, sig_str,
+                            )
+                            await asyncio.sleep(TX_VERIFY_RECONCILIATION_DELAY_SEC)
+                            for recon_attempt in range(TX_VERIFY_RECONCILIATION_RETRIES):
+                                # 获取卖出前的余额？没有存储，使用当前余额
+                                # 简化：检查当前余额是否明显小于卖出量（表示已卖出）
+                                # 或者检查余额是否接近0（对于清仓卖出）
+                                current_raw = await self._fetch_own_token_balance_raw(input_mint)
+                                if current_raw is None and helius_client.size >= 1:
+                                    current_raw = await self._fetch_own_token_balance_raw_helius(input_mint)
+                                if current_raw is not None:
+                                    # 如果当前余额很少（小于卖出量的10%），认为卖出成功
+                                    if current_raw < amount_int * 0.1:
+                                        logger.warning(
+                                            "⚠️ 卖出验证超时但链上代币余额已大幅减少 (raw %s < %s)，以链上为准视为成功: %s",
+                                            current_raw, amount_int * 0.1, sig_str,
+                                        )
+                                        # 卖出成功，返回预估的SOL收入（使用quote的outAmount）
+                                        return sig_str, float(out_amount_raw) / LAMPORTS_PER_SOL, False
+                                    # 或者检查余额减少量（需要知道之前余额，但不知道）
+                                    # 这里使用简化逻辑：如果余额明显小于卖出量，认为成功
+                                if recon_attempt < TX_VERIFY_RECONCILIATION_RETRIES - 1:
+                                    if alchemy_client.size >= 1:
+                                        alchemy_client.mark_current_failed()
+                                        await self._recreate_rpc_client()
+                                    backoff = 10 + recon_attempt * 5
+                                    logger.info(
+                                        "⏳ 卖出余额兜底第 %d/%d 次未确认，%ds 后切换 Key 重试",
                                         recon_attempt + 1, TX_VERIFY_RECONCILIATION_RETRIES, backoff,
                                     )
                                     await asyncio.sleep(backoff)
