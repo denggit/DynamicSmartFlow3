@@ -68,6 +68,12 @@ class DexScanner:
         base_addr = (base.get("address") or "").strip()
         quote_addr = (quote.get("address") or "").strip()
         token_address = (token_address or "").strip()
+
+        # 统一转为小写比较，Solana地址不区分大小写
+        base_addr_lower = base_addr.lower()
+        quote_addr_lower = quote_addr.lower()
+        token_address_lower = token_address.lower()
+
         price_native = pair.get("priceNative")
         if price_native is None:
             return None
@@ -78,10 +84,20 @@ class DexScanner:
         if p <= 0:
             return None
         # 仅处理 token/SOL 或 SOL/token 的 pair
-        is_sol = lambda a: a == WSOL_MINT or "11111111111111111111" in (a or "")
-        if base_addr == token_address and is_sol(quote_addr):
+        # SOL 地址定义
+        NATIVE_SOL_MINT = "11111111111111111111111111111111"
+        def is_sol(addr: str) -> bool:
+            if not addr:
+                return False
+            addr_lower = addr.lower()
+            # 检查包装SOL或原生SOL
+            return (addr_lower == WSOL_MINT.lower() or
+                   addr_lower == NATIVE_SOL_MINT.lower() or
+                   NATIVE_SOL_MINT.lower() in addr_lower)
+
+        if base_addr_lower == token_address_lower and is_sol(quote_addr):
             return p  # 1 token = p SOL
-        if quote_addr == token_address and is_sol(base_addr):
+        if quote_addr_lower == token_address_lower and is_sol(base_addr):
             return 1.0 / p if p > 0 else None  # 1 SOL = p token → 1 token = 1/p SOL
         return None
 

@@ -1312,6 +1312,17 @@ class SolanaTrader:
         if pos.average_price <= 0:
             logger.warning("止盈跳过: 均价异常 %.6f", pos.average_price)
             return
+        if current_price_ui <= 0:
+            logger.warning("止盈跳过: 当前价格异常 %.6f", current_price_ui)
+            return
+
+        # 开仓后短时间内价格保护：避免API延迟导致价格获取错误
+        time_since_entry = time.time() - pos.entry_time
+        if time_since_entry < 30 and current_price_ui < pos.average_price * 0.01:
+            logger.warning("止盈跳过: 开仓后%.0f秒内价格异常下跌 (%.6f -> %.6f)，疑似API延迟: %s",
+                          time_since_entry, pos.average_price, current_price_ui,
+                          token_address[:16] + "..")
+            return
 
         # 链上与内部不一致时以链上为准同步，避免加仓 RPC 延迟/竞态导致 pos 严重偏小、止损误卖部分仓位
         if chain_bal_early is not None and chain_bal_early >= 1e-9:
@@ -1328,6 +1339,13 @@ class SolanaTrader:
         # 整仓价值为粉尘时的处理。重要：开仓成功但持仓 0 多为记录异常，应先以链上为准更新再判断
         total_value_sol = pos.total_tokens * current_price_ui
         if total_value_sol < MIN_SHARE_VALUE_SOL:
+            # 价格合理性检查：如果持仓数量较大但价格异常低，可能是价格获取错误，不执行清仓
+            if pos.total_tokens > 0.01 and pos.average_price > 0 and current_price_ui < pos.average_price * 0.001:
+                logger.error(
+                    "🚨 止盈入口: 价格异常下跌 (均价 %.6f -> 当前 %.6f)，持仓 %.2f，疑似价格获取错误，跳过清仓: %s",
+                    pos.average_price, current_price_ui, pos.total_tokens, token_address[:16] + "..",
+                )
+                return
             if chain_bal_early is not None and chain_bal_early >= 1e-9:
                 # 链上有持仓但内部为 0 或价值算成粉尘：先以链上为准更新持仓，不应直接卖出
                 old_total = pos.total_tokens
