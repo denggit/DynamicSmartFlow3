@@ -249,6 +249,81 @@ class SolanaTrader:
         else:
             return _floor_token_amount(total_ui) if total_ui > 0 else total_ui
 
+    async def _fetch_own_token_balances_batch(self, token_mints: list[str]) -> dict[str, float]:
+        """
+        批量查询多个代币的链上余额（UI单位）。
+        使用单次RPC调用getTokenAccountsByOwner（不带mint filter）获取所有代币账户，
+        然后提取目标mint的余额。
+        返回字典 {mint: balance}，余额为0或正浮点数，若查询失败或mint不存在则不包括。
+        """
+        if not self.keypair or not token_mints:
+            return {}
+        # 去重
+        unique_mints = list(set(token_mints))
+        if len(unique_mints) == 1:
+            # 单个代币：使用现有函数保持一致性
+            balance = await self._fetch_own_token_balance(unique_mints[0])
+            return {unique_mints[0]: balance} if balance is not None else {}
+
+        owner_b58 = str(self.keypair.pubkey())
+        result = await alchemy_client.get_token_accounts_by_owner(
+            owner_b58, mint=None, http_client=self.http_client, timeout=TRADER_RPC_TIMEOUT
+        )
+        if result is None:
+            logger.debug("🔧 [批量查询优化] 批量查询RPC返回None，回退到串行查询")
+            # RPC失败，回退到串行查询
+            balances = {}
+            for mint in unique_mints:
+                bal = await self._fetch_own_token_balance(mint)
+                if bal is not None:
+                    balances[mint] = bal
+            return balances
+
+        # 构建mint到余额的映射
+        mint_to_balance = {}
+        for acc in result.get("value") or []:
+            info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+            tamt = info.get("tokenAmount") or {}
+            mint = info.get("mint")
+            if not mint or mint not in unique_mints:
+                continue
+            # 解析余额
+            ui_str = tamt.get("uiAmountString")
+            if ui_str is not None:
+                try:
+                    ui_balance = float(ui_str)
+                except (ValueError, TypeError):
+                    ui_balance = None
+            else:
+                amt_str, dec = tamt.get("amount"), tamt.get("decimals")
+                if amt_str is not None and dec is not None:
+                    try:
+                        ui_balance = int(amt_str) / (10 ** int(dec))
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        ui_balance = None
+                else:
+                    ui_balance = tamt.get("uiAmount")
+            if ui_balance is not None:
+                # 使用与_fetch_own_token_balance相同的floor逻辑
+                decimals = tamt.get("decimals")
+                if decimals is not None:
+                    ui_balance = _floor_token_amount(ui_balance, int(decimals)) if ui_balance > 0 else ui_balance
+                else:
+                    ui_balance = _floor_token_amount(ui_balance) if ui_balance > 0 else ui_balance
+                mint_to_balance[mint] = ui_balance
+
+        # 确保所有请求的mint都有条目，缺失的表示余额为0
+        balances = {}
+        for mint in unique_mints:
+            if mint in mint_to_balance:
+                balances[mint] = mint_to_balance[mint]
+            else:
+                balances[mint] = 0.0
+
+        logger.debug("🔧 [批量查询优化] 批量查询 %d 个代币，成功获取 %d 个余额",
+                    len(unique_mints), len(mint_to_balance))
+        return balances
+
     async def _fetch_own_token_balance_raw(self, token_mint: str) -> Optional[int]:
         """
         获取我方钱包在链上的 Token 余额（raw 单位），用于交易验证失败时的兜底 reconciliation。
@@ -424,12 +499,20 @@ class SolanaTrader:
             return 0
         logger.warning("🚨 [紧急清仓] 开始清仓 %d 个持仓...", len(tokens))
         closed = 0
+        # 🔧 [批量查询优化] 批量查询所有代币链上余额，减少RPC调用
+        balances = await self._fetch_own_token_balances_batch(tokens)
+        logger.debug("🔧 [批量查询优化] 批量查询完成，获取到 %d/%d 个代币余额",
+                    len(balances), len(tokens))
+
         for token_address in tokens:
             pos = self.positions.get(token_address)
             if not pos:
                 continue
             try:
-                chain_bal = await self._fetch_own_token_balance(token_address)
+                chain_bal = balances.get(token_address)
+                if chain_bal is None:
+                    # 批量查询中缺失，回退到单独查询
+                    chain_bal = await self._fetch_own_token_balance(token_address)
                 sell_amount = _safe_sell_amount_from_chain(chain_bal) if chain_bal is not None and chain_bal > 0 else pos.total_tokens * SELL_BUFFER
                 if sell_amount is None or sell_amount <= 0:
                     self._sync_zero_and_close_position(token_address, pos)
@@ -2004,6 +2087,8 @@ class SolanaTrader:
         if max_wait_sec is None:
             max_wait_sec = TX_VERIFY_MAX_WAIT_SEC
         poll_interval = max(1, TRADER_VERIFY_POLL_INTERVAL_SEC)
+        logger.debug("🔧 [RPC验证优化] 开始验证交易 %s，最长等待 %d 秒，轮询间隔 %d 秒",
+                    sig_str[:16] + "..", max_wait_sec, poll_interval)
         # searchTransactionHistory: true 关键！否则只查 recent cache，交易超出一小段时间即返回 null
         verify_params = [[sig_str], {"searchTransactionHistory": True}]
 
@@ -2028,49 +2113,74 @@ class SolanaTrader:
             return err, conf
 
         try:
-            for _ in range(0, max_wait_sec, poll_interval):
+            start_time = time.time()
+            attempt = 0
+            while time.time() - start_time < max_wait_sec:
+                attempt += 1
+                # 动态轮询：前两次快速轮询，之后使用标准间隔
+                if attempt == 1:
+                    current_wait = 1.0
+                elif attempt == 2:
+                    current_wait = 2.0
+                else:
+                    current_wait = poll_interval
+
                 try:
                     resp = await alchemy_client.rpc_post(
                         "getSignatureStatuses", verify_params,
-                        http_client=self.http_client, timeout=10.0,
+                        http_client=self.http_client, timeout=15.0,  # 增加超时应对限流
                     )
                 except Exception as e:
                     if _is_rate_limit_error(e) and alchemy_client.size > 1:
-                        logger.warning("验证交易时 Alchemy 429，切换 Key 继续: %s", e)
+                        logger.warning("🔧 [RPC验证优化] 验证交易时 Alchemy 429（尝试 %d），切换 Key 继续: %s",
+                                      attempt, str(e)[:100])
                         await self._recreate_rpc_client()
                         alchemy_client.mark_current_failed()
-                        await asyncio.sleep(TRADER_VERIFY_RETRY_SLEEP_SEC)
+                        await asyncio.sleep(1)  # 切换后短暂等待，避免立即触发限流
                         continue
-                    logger.debug("验证交易确认异常", exc_info=True)
-                    await asyncio.sleep(poll_interval)
+                    logger.debug("🔧 [RPC验证优化] 验证交易异常（尝试 %d），%d 秒后重试: %s",
+                                attempt, current_wait, str(e)[:100])
+                    await asyncio.sleep(current_wait)
                     continue
+
                 if resp is None:
-                    await asyncio.sleep(poll_interval)
+                    logger.debug("🔧 [RPC验证优化] 验证交易返回 None（尝试 %d），%d 秒后重试", attempt, current_wait)
+                    await asyncio.sleep(current_wait)
                     continue
+
                 err, conf = _parse_verify_result(resp)
                 if err is None and conf is None:
-                    await asyncio.sleep(poll_interval)
+                    logger.debug("🔧 [RPC验证优化] 交易状态未确认（尝试 %d），%d 秒后重试", attempt, current_wait)
+                    await asyncio.sleep(current_wait)
                     continue
+
                 if err is not None:
-                    logger.warning("交易链上执行失败 err=%s", err)
+                    logger.warning("🔧 [RPC验证优化] 交易链上执行失败 err=%s (尝试 %d)", err, attempt)
                     return False
                 if conf in ("confirmed", "finalized"):
+                    elapsed = time.time() - start_time
+                    logger.info("✅ [RPC验证优化] 交易验证成功 %s (尝试 %d，耗时 %.1f 秒)",
+                               sig_str[:16] + "..", attempt, elapsed)
                     return True
-                await asyncio.sleep(poll_interval)
+
+                logger.debug("🔧 [RPC验证优化] 交易状态 %s (尝试 %d)，%d 秒后重试", conf, attempt, current_wait)
+                await asyncio.sleep(current_wait)
         except Exception:
-            logger.debug("验证交易确认异常", exc_info=True)
+            logger.debug("🔧 [RPC验证优化] 验证交易主循环异常", exc_info=True)
 
         # Alchemy 耗尽后：用 Helius 池内所有 Key 兜底（Helius 珍贵，仅此处兜底；部分 Key 可能 credit 耗尽，逐个试）
         try:
             if helius_client.size < 1:
+                logger.warning("🔧 [RPC验证优化] Helius 客户端不可用，验证失败")
                 return False
             helius_params = [[sig_str], {"commitment": "confirmed", "searchTransactionHistory": True}]
-            for _ in range(helius_client.size):
+            for i in range(helius_client.size):
+                logger.debug("🔧 [RPC验证优化] 尝试 Helius 兜底验证（Key %d/%d）", i+1, helius_client.size)
                 result = await helius_client.rpc_post(
                     "getSignatureStatuses",
                     helius_params,
                     http_client=self.http_client,
-                    timeout=8.0,
+                    timeout=12.0,  # 增加超时
                 )
                 if result and isinstance(result, dict):
                     vals = result.get("value") or []
@@ -2078,20 +2188,20 @@ class SolanaTrader:
                         st = vals[0]
                         if st and isinstance(st, dict):
                             if st.get("err") is not None:
-                                logger.warning("Helius 兜底验证: 交易链上失败 err=%s", st.get("err"))
+                                logger.warning("🔧 [RPC验证优化] Helius 兜底验证: 交易链上失败 err=%s", st.get("err"))
                                 return False
                             conf = st.get("confirmationStatus") or st.get("confirmation_status") or ""
                             if conf in ("confirmed", "finalized"):
-                                logger.info("✅ Helius 兜底验证成功: %s", sig_str[:16] + "..")
+                                logger.info("✅ [RPC验证优化] Helius 兜底验证成功: %s", sig_str[:16] + "..")
                                 return True
                 # 当前 Key 失败（429/超时等），切换下一 Key 再试
                 if helius_client.size > 1:
                     helius_client.mark_current_failed()
                     await asyncio.sleep(1)
         except Exception:
-            logger.debug("Helius 兜底验证异常", exc_info=True)
+            logger.debug("🔧 [RPC验证优化] Helius 兜底验证异常", exc_info=True)
         logger.warning(
-            "❌ 交易验证失败: Alchemy 与 Helius 均无法确认 %s，交易可能已成交请手动核对链上",
+            "❌ [RPC验证优化] 交易验证失败: Alchemy 与 Helius 均无法确认 %s，交易可能已成交请手动核对链上",
             sig_str[:16] + "..",
         )
         return False

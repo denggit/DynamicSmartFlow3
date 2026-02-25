@@ -87,7 +87,7 @@ class AlchemyClient:
     async def get_token_accounts_by_owner(
         self,
         owner: str,
-        mint: str,
+        mint: Optional[str] = None,
         *,
         http_client: Optional[httpx.AsyncClient] = None,
         timeout: float = 10.0,

@@ -165,15 +165,24 @@ class AlchemyRpc:
     async def get_token_accounts_by_owner(
         self,
         owner: str,
-        mint: str,
+        mint: Optional[str] = None,
         *,
         http_client: Optional[httpx.AsyncClient] = None,
         timeout: float = 10.0,
     ) -> Optional[Dict]:
-        """获取地址在某代币上的账户信息。"""
+        """
+        获取地址在代币上的账户信息。
+        :param owner: 钱包地址
+        :param mint: 代币mint地址，若为None则返回所有代币账户
+        :return: RPC响应结果
+        """
+        if mint:
+            filter_param = {"mint": mint}
+        else:
+            filter_param = {}
         params = [
             owner,
-            {"mint": mint},
+            filter_param,
             {"encoding": "jsonParsed"},
         ]
         return await self.rpc_post(

@@ -27,7 +27,7 @@ else:
 DAILY_REPORT_HOUR = max(0, min(23, DAILY_REPORT_HOUR))
 
 # RPC 限流
-ALCHEMY_MIN_INTERVAL_SEC = float(os.getenv("ALCHEMY_MIN_INTERVAL_SEC", "1.2"))
+ALCHEMY_MIN_INTERVAL_SEC = float(os.getenv("ALCHEMY_MIN_INTERVAL_SEC", "1.0"))
 HELIUS_MIN_INTERVAL_SEC = float(os.getenv("HELIUS_MIN_INTERVAL_SEC", "2"))
 
 # DexScreener 扫描器
